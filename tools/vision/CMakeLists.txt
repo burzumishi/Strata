@@ -19,6 +19,8 @@ option(STRATA_PORTABLE "build for other PCs: AVX2 baseline, static MSVC runtime"
 if(STRATA_VISION_HIP)
   set(GGML_HIP ON CACHE BOOL "" FORCE)
   set(GGML_CUDA OFF CACHE BOOL "" FORCE)
+  # ggml-hip is built static; the encoder links as a PIE (Ubuntu default), so its objects must be PIC
+  set(CMAKE_POSITION_INDEPENDENT_CODE ON)
   if(NOT DEFINED CMAKE_HIP_ARCHITECTURES OR CMAKE_HIP_ARCHITECTURES STREQUAL "")
     set(CMAKE_HIP_ARCHITECTURES gfx1151 CACHE STRING "HIP target architecture(s), e.g. gfx1151")
   endif()
