@@ -37,6 +37,20 @@ __device__ __forceinline__ int get_int_b2(const void* x, const int& i32) {
     return x32;
 }
 __device__ __forceinline__ int get_int_b4(const void* x, const int& i32) { return ((const int*) x)[i32]; }
+// MXFP4's 17-byte block leaves qs only byte-aligned (llama.cpp's get_int_b1)
+__device__ __forceinline__ int get_int_b1(const void* x, const int& i32) {
+    const uint8_t* x8 = (const uint8_t*) x;
+    int x32 = x8[4 * i32 + 0] << 0;
+    x32 |= x8[4 * i32 + 1] << 8;
+    x32 |= x8[4 * i32 + 2] << 16;
+    x32 |= x8[4 * i32 + 3] << 24;
+    return x32;
+}
+// E8M0 exponent -> float (llama.cpp's ggml_cuda_e8m0_to_fp32, the pre-CUDA-12.8 form; exact for every code)
+__device__ __forceinline__ float e8m0_to_fp32(uint8_t x) {
+    const uint32_t bits = x == 0 ? 0x00400000u : (uint32_t) x << 23;
+    return __uint_as_float(bits);
+}
 __device__ __forceinline__ uint32_t unpack_ksigns(const uint8_t v) {
     const uint32_t p = __popc(v) & 1;
     const uint32_t s = v ^ p << 7;
@@ -283,6 +297,24 @@ __device__ __forceinline__ float vec_dot_iq4_nl_q8_1(const void* __restrict__ vb
         sumi = ggml_cuda_dp4a(v.y, q8[l + 4], sumi);
     }
     const float d = __half2float(bq4->d) * __low2float(bq8_1->ds);
+    return d * sumi;
+}
+
+// MXFP4 (AtomicChat's Flash-Next down experts): IQ4_NL's layout with an E8M0 scale and the FP4 table, llama.cpp's
+// vec_dot_mxfp4_q8_1 (VDR 2) transcribed.
+__device__ __forceinline__ float vec_dot_mxfp4_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict__ bq8_1,
+                                                    const int& kbx, const int& iqs) {
+    const block_mxfp4* bq4 = (const block_mxfp4*) vbq + kbx;
+    const int* q8 = (const int*) bq8_1->qs + iqs;
+    int sumi = 0;
+#pragma unroll
+    for (int l = 0; l < 2; ++l) {
+        const int aux_q4 = get_int_b1(bq4->qs, iqs + l);
+        const int2 v = get_int_from_table_16(aux_q4, kvalues_mxfp4);
+        sumi = ggml_cuda_dp4a(v.x, q8[l + 0], sumi);
+        sumi = ggml_cuda_dp4a(v.y, q8[l + 4], sumi);
+    }
+    const float d = e8m0_to_fp32(bq4->e) * 0.5f * __low2float(bq8_1->ds);
     return d * sumi;
 }
 
@@ -578,6 +610,8 @@ template<> struct Fmt<18> { static constexpr int qk = 256, ipb = 8, step = 2;
     __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_iq3_xxs_q8_1(v, y, kbx, iqs); } };
 template<> struct Fmt<20> { static constexpr int qk = 32, ipb = 2, step = 2;
     __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_iq4_nl_q8_1(v, y, kbx, iqs); } };
+template<> struct Fmt<39> { static constexpr int qk = 32, ipb = 2, step = 2;   // MXFP4
+    __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_mxfp4_q8_1(v, y, kbx, iqs); } };
 template<> struct Fmt<21> { static constexpr int qk = 256, ipb = 8, step = 2;
     __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_iq3_s_q8_1(v, y, kbx, iqs); } };
 template<> struct Fmt<23> { static constexpr int qk = 256, ipb = 8, step = 4;
@@ -612,8 +646,8 @@ template<> struct Fmt<8> { static constexpr int qk = 32, ipb = QI8_0 / VDR_Q8_0,
 #else
 #define STRATA_GU_FMTS(X) X(16) X(17) X(18) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(6) X(2) X(3) X(8)
 #endif
-#define STRATA_D_FMTS(X) X(20) X(23) X(42) X(7) X(6) X(2) X(3) X(8)
-#define STRATA_MMVQ_FMTS(X) X(16) X(17) X(18) X(20) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(7) X(6) X(2) X(3) X(8)
+#define STRATA_D_FMTS(X) X(20) X(23) X(42) X(7) X(6) X(2) X(3) X(8) X(39)
+#define STRATA_MMVQ_FMTS(X) X(16) X(17) X(18) X(20) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(7) X(6) X(2) X(3) X(8) X(39)
 
 __device__ __forceinline__ float warp_sum(float v) {
 #pragma unroll
@@ -1665,6 +1699,18 @@ __device__ void dq_iq4_nl(const void* vx, int64_t ibs, dst_t* yy, int tid) {
         y[j + 16] = cvt<dst_t>(d * kvalues_iq4nl[q4[j] >> 4]);
     }
 }
+template<typename dst_t>
+__device__ void dq_mxfp4(const void* vx, int64_t ibs, dst_t* yy, int tid) {
+    const block_mxfp4* x = (const block_mxfp4*) vx + ibs * (QK_K / QK_MXFP4);
+    const int64_t il = tid / 8, ib = tid % 8;
+    dst_t* y = yy + 32 * ib + 4 * il;
+    const uint8_t* q4 = x[ib].qs + 4 * il;
+    const float d = e8m0_to_fp32(x[ib].e) * 0.5f;
+    for (int j = 0; j < 4; ++j) {
+        y[j + 0] = cvt<dst_t>(d * kvalues_mxfp4[q4[j] & 0xf]);
+        y[j + 16] = cvt<dst_t>(d * kvalues_mxfp4[q4[j] >> 4]);
+    }
+}
 // Q3_K (the Q2_0 file's token_embd): llama.cpp's dequantize_block_q3_K, its 64 threads folded onto 32
 template<typename dst_t>
 __device__ void dq_q3_k(const void* vx, int64_t ibs, dst_t* yy, int tid) {
@@ -1892,6 +1938,7 @@ __device__ __forceinline__ void dq_dispatch(int ty, const void* vx, int64_t ibs,
         case 2: dq_q4_0(vx, ibs, y, tid); break;
         case 3: dq_q4_1(vx, ibs, y, tid); break;
         case 8: dq_q8_0(vx, ibs, y, tid); break;
+        case 39: dq_mxfp4(vx, ibs, y, tid); break;
         case 30: dq_bf16(vx, ibs, y, tid); break;
         default: break;
     }
@@ -1916,9 +1963,9 @@ __global__ void dequant_gu_kernel(int ty, const void* __restrict__ gate, const v
 bool is_iq(int t) {
     return t == 16 || t == 17 || t == 18 || t == 20 || t == 21 || t == 22 || t == 23 || t == 29 || t == 42 || t == 11 ||
 #ifdef STRATA_Q6K_EXPERTS
-           t == 12 || t == 13 || t == 14 || t == 7 || t == 6 || t == 2 || t == 3 || t == 8;
+           t == 12 || t == 13 || t == 14 || t == 7 || t == 6 || t == 2 || t == 3 || t == 8 || t == 39;
 #else
-           t == 12 || t == 13 || t == 7 || t == 6 || t == 2 || t == 3 || t == 8;
+           t == 12 || t == 13 || t == 7 || t == 6 || t == 2 || t == 3 || t == 8 || t == 39;
 #endif
 }
 // values per block of the types the grouped expert kernels take (0 = none)
@@ -2720,6 +2767,7 @@ size_t iq_row_bytes(int t, int64_t n) noexcept {
         case 2: return (size_t) (n / 32) * sizeof(block_q4_0);
         case 3: return (size_t) (n / 32) * sizeof(block_q4_1);
         case 8: return (size_t) (n / 32) * sizeof(block_q8_0);
+        case 39: return (size_t) (n / 32) * sizeof(block_mxfp4);
         case 30: return (size_t) n * 2;   // BF16: the token embedding only (iq_embed_rows, iq_dequant_f32)
         default: return 0;
     }

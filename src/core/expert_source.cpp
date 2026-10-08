@@ -1803,6 +1803,14 @@ void FileExpertSource::warm(int64_t layer, const int64_t* experts, int64_t n) {
             ranges.push_back({(PVOID) p, (SIZE_T) role_bytes_[i]});
 #else
             const uintptr_t pg = 4096, a = (uintptr_t) p & ~(pg - 1);
+            // STRATA_WARM_POPULATE=1 (Linux 5.14+): also map the pages into this process (MADV_POPULATE_READ), so the
+            // pool's copy of the blob takes no page faults; WILLNEED only reads them into the page cache.
+            static const bool populate = [] { const char* v = std::getenv("STRATA_WARM_POPULATE"); return v != nullptr && std::atoi(v) != 0; }();
+#if defined(MADV_POPULATE_READ)
+            if (populate &&
+                madvise((void*) a, (size_t) ((uintptr_t) p + role_bytes_[i] - a), MADV_POPULATE_READ) == 0)
+                continue;
+#endif
             (void) madvise((void*) a, (size_t) ((uintptr_t) p + role_bytes_[i] - a), MADV_WILLNEED);
 #endif
         }

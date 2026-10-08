@@ -4878,6 +4878,29 @@ int main(int argc, char** argv) {
             err.clear();
         }
     }
+    // Unified memory (gfx1151): the experts the GPU cache could not take are read from the GGUF by the CPU pool, and a
+    // cold one faults its pages in from the SSD while the GPU waits for the layer.  STRATA_WARM_FILE_GIB=N asks the OS
+    // at startup for the profile's next-hottest experts beyond the cache, up to N GiB.  That is page cache, not a pinned
+    // copy: under memory pressure the kernel drops it without writing anything, so it never competes with the GPU.
+    if (srcp == &src && src.warms() && !profile.empty()) {
+        const char* wv = std::getenv("STRATA_WARM_FILE_GIB");
+        const double warm_gib = wv != nullptr ? std::atof(wv) : 0.0;
+        if (warm_gib > 0.0) {
+            const auto& lay = strata::kernels::cpu::expert_layout();
+            const uint64_t budget = (uint64_t) (warm_gib * 1073741824.0);
+            uint64_t warmed_bytes = 0;
+            int64_t warmed_n = 0;
+            for (size_t i = (size_t) prefilled; i < profile.size() && warmed_bytes < budget; ++i) {
+                const int64_t e = profile[i].second;
+                src.warm(profile[i].first, &e, 1);
+                warmed_bytes += lay.blob_bytes(profile[i].first);
+                ++warmed_n;
+            }
+            std::fprintf(stderr, "strata generate: asked the OS file cache for %lld experts beyond the GPU cache "
+                                 "(%.2f GiB, STRATA_WARM_FILE_GIB)\n",
+                         (long long) warmed_n, (double) warmed_bytes / 1073741824.0);
+        }
+    }
     // ---- R4.2c: THE HIT PATH.  Every one of these is required for `hits_ready()`, which is all-or-nothing on
     // purpose: a half-configured hit path would compute some experts twice and others not at all, and a token
     // built on that is wrong rather than refused.
