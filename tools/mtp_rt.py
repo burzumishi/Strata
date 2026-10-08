@@ -6,6 +6,10 @@ Writes
   experts.bin   512 routed experts in the engine's blob layout (`include/strata/kernels/cpu/expert.hpp`): gate/up
                 rows interleaved (2r = gate r, 2r+1 = up r), then down rows; the Q2_0 codes in one plane and the fp16
                 scales in another.  A lossless relayout of the GGUF's Q2_0 blocks (same bytes, `cpu_expert_fixture.py`).
+                A Q4_0 or Q8_0 GGUF is instead written in the native layout the grouped kernel takes directly:
+                [gate rows | up rows | down rows], raw GGUF blocks, no relayout.
+  format.txt    "native <gu_type> <d_type>" when experts.bin is in the native layout (read by src/core/mtp.cpp);
+                absent for the Q2_0 plane layout, which is the engine's default.
   dense.bin     every other tensor: the large projections quantized to Q8_0 (ggml's reference rounding) so the
                 engine's multi-column MMVQ can run them; the hyper-connection and router weights kept BF16; the
                 RMSNorm weights as F32 with the Gemma "+1" applied (vLLM GemmaRMSNorm scales by 1 + w).
@@ -67,12 +71,25 @@ def main() -> int:
     out.mkdir(parents=True, exist_ok=True)
     r = gguf.GGUFReader(a.gguf)
     tens = {t.name: t for t in r.tensors}
-    gu = np.asarray(tens["mtp.layers.0.mlp.experts.gate_up_proj"].data)
-    dn = np.asarray(tens["mtp.layers.0.mlp.experts.down_proj"].data)
-    assert gu.shape == (NE, 2 * FF, 720) and dn.shape == (NE, H, 180), (gu.shape, dn.shape)
-    with open(out / "experts.bin", "wb") as f:
-        for e in range(NE):
-            f.write(blob_of(gu[e], dn[e]))
+    gu_t, dn_t = tens["mtp.layers.0.mlp.experts.gate_up_proj"], tens["mtp.layers.0.mlp.experts.down_proj"]
+    gu_type, dn_type = int(gu_t.tensor_type), int(dn_t.tensor_type)
+    NATIVE = {2: 18, 8: 34}   # ggml type id -> block bytes: Q4_0, Q8_0
+    if gu_type in NATIVE and dn_type in NATIVE:
+        # Native layout: raw GGUF blocks as they stand, [gate rows | up rows | down rows] - the bytes
+        # `native_expert_grouped` reads, so the engine needs no relayout and the packer no plane split.
+        gu = np.asarray(gu_t.data).reshape(NE, 2 * FF, -1)
+        dn = np.asarray(dn_t.data).reshape(NE, H, -1)
+        with open(out / "experts.bin", "wb") as f:
+            for e in range(NE):
+                f.write(gu[e, :FF].tobytes() + gu[e, FF:].tobytes() + dn[e].tobytes())
+        (out / "format.txt").write_text(f"native {gu_type} {dn_type}\n", encoding="utf-8")
+    else:
+        gu = np.asarray(gu_t.data)
+        dn = np.asarray(dn_t.data)
+        assert gu.shape == (NE, 2 * FF, 720) and dn.shape == (NE, H, 180), (gu.shape, dn.shape)
+        with open(out / "experts.bin", "wb") as f:
+            for e in range(NE):
+                f.write(blob_of(gu[e], dn[e]))
     lines = []
     off = 0
     with open(out / "dense.bin", "wb") as f:

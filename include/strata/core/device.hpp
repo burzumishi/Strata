@@ -53,6 +53,13 @@ bool device_summary(int ordinal, std::string& name, std::string& detail);
 // this is the matching check at run time (a binary can be carried to a different machine).
 DeviceInfo device_info(int ordinal = 0);
 
+/// Strix Halo (gfx1151) and other APUs: `hipMalloc` allocates from the GTT/TTM pool, which IS this machine's RAM,
+/// so `cudaMemGetInfo` reports system memory seen twice. When the two figures agree, a host pointer is already a
+/// device pointer (SVM): the expert cache needs no RAM-to-VRAM copy, `fill_slot` is a memcpy, `device_alias` is
+/// the mapped pointer itself, and the cache budget must be checked against available RAM, not the GTT figure.
+/// `STRATA_UNIFIED` forces it (`=1` on, `=0` off); otherwise the two numbers decide.
+bool unified_memory(int ordinal = 0);
+
 /// "" when this build has device code for the current device, else CUDA's error: a build for other GPUs would
 /// otherwise fail at its first kernel launch, with nothing that names the cause.
 std::string device_code_error();

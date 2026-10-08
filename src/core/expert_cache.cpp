@@ -1,5 +1,6 @@
 // src/core/expert_cache.cpp - R4's slot storage and residency table.  Read the header first.
 #include "strata/core/expert_cache.hpp"
+#include "strata/core/expert_source.hpp"   // unified_available_bytes: the unified arena's real budget
 
 // #533's segmented cache uses CUDA's virtual memory management (cuMem*): not on HIP, neither the RDNA backend nor
 // the gfx906 compat build (PR #638), which compiles this file as HIP without STRATA_USE_HIP
@@ -487,7 +488,25 @@ bool ExpertCache::open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int6
     // `device_slot()` walks off the end. So the free-VRAM figure is read and compared BEFORE the allocation,
     // and the two numbers are named in the refusal.
     size_t free_b = 0, total_b = 0;
-    if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess) {
+    if (unified_) {
+        // On an APU the free-VRAM figure is this machine's RAM seen twice, so it is not the budget: the arena is
+        // host memory, and what it can hold is what the process can actually allocate.
+        uint64_t avail = 0;
+        if (!unified_available_bytes(avail)) {
+            err = "ExpertCache: unified arena: cannot read available RAM";
+            return false;
+        }
+        if (avail < want) {
+            char buf[320];
+            std::snprintf(buf, sizeof buf,
+                          "ExpertCache (unified memory): %lld slots x %lld B = %.2f GiB, but only %.2f GiB of RAM "
+                          "is available to this process. Lower --expert-cache.",
+                          (long long) n_slots, (long long) blob_bytes, (double) want / 1073741824.0,
+                          (double) avail / 1073741824.0);
+            err = buf;
+            return false;
+        }
+    } else if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess) {
         free_b = device_free_bytes();   // unified memory: what the OS can give back counts (see the header)
         if ((uint64_t) free_b < want) {
             char buf[320];
@@ -502,7 +521,23 @@ bool ExpertCache::open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int6
         }
     }
 
-    if (seg_req_ > 0) {   // #533: --vram-elastic: physical segments behind one address range (zeroed below)
+    if (unified_) {
+        // The arena is host memory the GPU reads through the same pointer. On the APU the device alias is the
+        // pointer itself (SVM); `fill_slot` then needs no transfer at all, and the kernel reads the slot directly.
+        void* arena = nullptr;
+        if (cudaHostAlloc(&arena, (size_t) want, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess) {
+            char buf[256];
+            std::snprintf(buf, sizeof buf, "ExpertCache: unified arena: cudaHostAlloc(%.2f GiB) failed: %s",
+                          (double) want / 1073741824.0, cudaGetErrorString(cudaGetLastError()));
+            err = buf;
+            return false;
+        }
+        base_ = (uint8_t*) arena;
+        void* alias = nullptr;
+        if (cudaHostGetDevicePointer(&alias, base_, 0) == cudaSuccess && alias != nullptr) device_base_ = (uint8_t*) alias;
+        else device_base_ = base_;   // SVM: the host pointer is already the device pointer
+        std::memset(base_, 0, (size_t) want);
+    } else if (seg_req_ > 0) {   // #533: --vram-elastic: physical segments behind one address range (zeroed below)
         if (!open_segmented(want, err)) return false;
     } else if (g_cache_vmm && vmm_available()) {
         // the elastic K/V: every chunk mapped now; the K/V may later take some of them (and give them back)
@@ -526,7 +561,7 @@ bool ExpertCache::open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int6
     }
     // Zeroed so a slot read before it is filled is a DETERMINISTIC wrong answer rather than whatever the
     // allocator handed back.  A stale block of a previous process's memory would still sum to finite floats.
-    if (cudaMemset(base_, 0, (size_t) want) != cudaSuccess) {
+    if (!unified_ && cudaMemset(base_, 0, (size_t) want) != cudaSuccess) {
         err = "ExpertCache: cudaMemset of the slot arena failed";
         close();
         return false;
@@ -598,7 +633,10 @@ void ExpertCache::close() {
     blocking_staging_bytes_ = 0;
 #endif
     off_.clear();
-    if (!segs_.empty()) {
+    if (unified_ && base_ != nullptr) {
+        (void) cudaFreeHost(base_);
+        base_ = nullptr;
+    } else if (!segs_.empty()) {
         release_segmented();
     } else if (vmm_) {
         vmm_.reset();   // unmaps and frees every chunk it still holds
@@ -607,6 +645,7 @@ void ExpertCache::close() {
         cudaFree(base_);
         base_ = nullptr;
     }
+    device_base_ = nullptr;
     residency_.clear();
     slots_ = 0;
     live_slots_ = 0;
@@ -657,14 +696,16 @@ int32_t ExpertCache::admit(int64_t layer, int64_t expert) {
 
 uint8_t* ExpertCache::device_slot(int32_t slot) {
     if (slot < 0 || slot >= slots_) return nullptr;
-    if (!off_.empty()) return base_ + off_[(size_t) slot];
-    return base_ + (size_t) slot * (size_t) blob_;
+    const uint8_t* b = unified_ ? device_base_ : base_;
+    if (!off_.empty()) return (uint8_t*) b + off_[(size_t) slot];
+    return (uint8_t*) b + (size_t) slot * (size_t) blob_;
 }
 
 const uint8_t* ExpertCache::device_slot(int32_t slot) const {
     if (slot < 0 || slot >= slots_) return nullptr;
-    if (!off_.empty()) return base_ + off_[(size_t) slot];
-    return base_ + (size_t) slot * (size_t) blob_;
+    const uint8_t* b = unified_ ? device_base_ : base_;
+    if (!off_.empty()) return b + off_[(size_t) slot];
+    return b + (size_t) slot * (size_t) blob_;
 }
 
 bool ExpertCache::fill_slot(int32_t slot, const uint8_t* host_blob, void* stream, std::string& err, int64_t bytes) {
@@ -678,6 +719,13 @@ bool ExpertCache::fill_slot(int32_t slot, const uint8_t* host_blob, void* stream
     if (host_blob == nullptr) {
         err = "ExpertCache::fill_slot: the host blob is null";
         return false;
+    }
+    if (unified_) {
+        // The slot and the blob are the same kind of memory: a transfer would copy RAM onto RAM. On the APU the
+        // kernel reads the slot through the same pointer it was written through.
+        std::memcpy(dst, host_blob, n);
+        ++fills_;
+        return true;
     }
     const cudaError_t e = cudaMemcpyAsync(dst, host_blob, n, cudaMemcpyHostToDevice,
                                           (cudaStream_t) stream);
@@ -699,6 +747,11 @@ bool ExpertCache::fill_slot_blocking(int32_t slot, const uint8_t* host_blob, std
     if (host_blob == nullptr) {
         err = "ExpertCache::fill_slot_blocking: the host blob is null";
         return false;
+    }
+    if (unified_) {
+        std::memcpy(dst, host_blob, n);
+        ++fills_;
+        return true;
     }
 #if defined(STRATA_USE_HIP)
     // Bound HIP's pageable-source staging to one expert instead of repeatedly
@@ -728,6 +781,11 @@ bool ExpertCache::fill_slot_queued(int32_t slot, const uint8_t* host_blob, std::
                              : "ExpertCache::fill_slot_queued: the host blob is null";
         return false;
     }
+    if (unified_) {
+        std::memcpy(dst, host_blob, n);
+        ++fills_;
+        return true;
+    }
     const cudaError_t e = cudaMemcpyAsync(dst, host_blob, n, cudaMemcpyHostToDevice, (cudaStream_t) 0);
     if (e != cudaSuccess) {
         err = std::string("ExpertCache::fill_slot_queued: ") + cudaGetErrorString(e);
@@ -756,6 +814,20 @@ bool ExpertCache::verify_slot(int32_t slot, const uint8_t* host_blob, std::strin
     // `cudaMemcpy` and not `cudaMemcpyAsync`: this is a startup check, and a check that can be read before it
     // has happened is not a check.  It also synchronises the fills queued before it, which is what makes the
     // comparison meaningful.
+    if (unified_) {
+        // The slot is host memory: reading it back is just comparing it where it stands.
+        if (std::memcmp(src, host_blob, (size_t) nb) != 0) {
+            size_t first = 0;
+            while (first < (size_t) nb && src[first] == host_blob[first]) ++first;
+            char buf[256];
+            std::snprintf(buf, sizeof buf,
+                          "ExpertCache::verify_slot: slot %d differs from the arena at byte %llu (of %lld)",
+                          (int) slot, (unsigned long long) first, (long long) blob_);
+            err = buf;
+            return false;
+        }
+        return true;
+    }
     std::vector<uint8_t> got((size_t) nb);
     const cudaError_t e = cudaMemcpy(got.data(), src, (size_t) nb, cudaMemcpyDeviceToHost);
     if (e != cudaSuccess) {

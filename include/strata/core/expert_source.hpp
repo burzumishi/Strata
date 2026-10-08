@@ -126,6 +126,10 @@ bool exchange_cache_complement(std::vector<uint64_t>& offsets, size_t in, size_t
 
 }  // namespace detail
 
+/// The machine's available RAM (MemAvailable, plus the cgroup-v2 reading when a finite limit is visible).
+/// The unified-memory cache budget sizes against it.
+bool unified_available_bytes(uint64_t& bytes);   // local: the cgroup-aware reading below, for the unified arena
+
 
 
 /// Where one routed expert's bytes come from.
@@ -500,6 +504,13 @@ public:
         const std::vector<std::pair<int32_t, int32_t>>* rank = nullptr);
     void close();
 
+    /// **UNIFIED MEMORY (Strix Halo, gfx1151).** On an APU the GPU's "VRAM" is this machine's RAM, so a pinned
+    /// complement arena would be a second copy of memory the machine does not have: the mapped pages are already
+    /// device-accessible through SVM, `pinned` answers for every blob, `device_alias` is the pointer itself, and
+    /// `pin_cache_complement` has nothing to pin. Set before `pin_cache_complement`.
+    void set_unified(bool on) { unified_ = on; }
+    bool unified() const { return unified_; }
+
     bool mapped() const { return base_ != nullptr; }
     int64_t blobs() const { return blobs_; }
     uint64_t pinned_bytes() const { return complement_pinned_ ? complement_pin_limit_ : 0; }
@@ -653,6 +664,7 @@ private:
     bool open_direct(std::string& why);
     std::vector<std::string> paths_;          ///< the mapped files, as maps_
     std::vector<void*> direct_;               ///< #286: per file, an unbuffered handle (Windows) or O_DIRECT fd (Linux)
+    bool unified_ = false;                    ///< unified memory (APU): `device_alias` is the mapped pointer itself
     std::vector<int> role_file_;              ///< 3 x n_layers: index into maps_ / direct_
     /// blobs assembled in the stage buffers (`blob` hands those out): the GGUF in place, or any unbuffered source
     bool staged() const { return !role_ptr_.empty() || !direct_.empty() || io_pf_; }

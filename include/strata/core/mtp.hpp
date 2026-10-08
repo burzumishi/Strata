@@ -21,6 +21,7 @@
 
 #include "strata/core/layer.hpp"
 #include "strata/core/session.hpp"
+#include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/sampler.hpp"
 
 #include <cuda_runtime.h>
@@ -234,6 +235,10 @@ private:
     // Slot drafters borrow immutable weights and head; each still owns its state and scratch.
     bool owns_weights_ = true;
     bool owns_draft_head_ = true;
+    /// A native-format pack (`format.txt`: "native <gu_type> <d_type>", tools/mtp_rt.py): raw GGUF blocks read by
+    /// `native_expert_grouped` as they stand, so the drafter can run Q4_0/Q8_0 experts, not only the Q2_0 planes.
+    bool native_ = false;
+    strata::kernels::NativeExpertLayout L_;
     void* state_arena_ = nullptr;
     QsaState st_;
     void* arena_ = nullptr;

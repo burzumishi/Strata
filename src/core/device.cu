@@ -1,9 +1,11 @@
 // src/core/device.cu - P2.S1: the CUDA side of the runtime core.
 #include "strata/core/device.hpp"
+#include "strata/platform/memory.hpp"
 
 #include <cuda_runtime.h>
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 namespace strata::core {
@@ -359,6 +361,17 @@ void* DeviceArena::alloc(uint64_t bytes, uint64_t align) {
     }
     used_ = start + bytes;
     return (char*) base_ + start;
+}
+
+bool unified_memory(int ordinal) {
+    const char* env = std::getenv("STRATA_UNIFIED");
+    if (env != nullptr && env[0] != '\0') return env[0] != '0';
+    size_t free_b = 0, total_b = 0;
+    if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) { (void) cudaGetLastError(); return false; }
+    const uint64_t physical = strata::platform::total_physical_memory();
+    // A discrete card reports its own VRAM; an APU reports the GTT pool, which is this machine's RAM. The two
+    // readings agree only on an APU (Strix Halo: 56 GiB of GTT against 64 GiB of LPDDR5X).
+    return physical > 0 && total_b >= physical * 8 / 10;
 }
 
 }  // namespace strata::core

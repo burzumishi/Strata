@@ -90,6 +90,15 @@ public:
     /// A cache that silently allocates less than it was asked for would report a hit rate for slots it does
     /// not have, which is the shape of error this project keeps paying for.
     bool open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int64_t blob_bytes, std::string& err);
+
+    /// **UNIFIED MEMORY (Strix Halo, gfx1151): THE ARENA IS RAM.** On an APU `cudaMalloc` allocates from the
+    /// GTT/TTM pool, so the "VRAM" the cache is sized against is this machine's RAM seen twice: the resident arena
+    /// and the file cache cannot both hold the model, and every fill copies bytes that were already in RAM. In
+    /// unified mode the arena is host-mapped memory the GPU reads through the same pointer (SVM): `open` sizes
+    /// against available RAM, `fill_slot` is a memcpy, `device_slot` answers through the device alias, and
+    /// `verify_slot` compares in place. Set before `open`.
+    void set_unified(bool on) { unified_ = on; }
+    bool unified() const { return unified_; }
     /// Plan v0.3 P6: slots of the given sizes, back to back (a native pack's blobs differ per layer, and a
     /// profile-filled tier never moves an expert to another layer's slot, so each slot keeps its first size).
     bool open_sized(const std::vector<int64_t>& slot_bytes, int64_t n_layers, int64_t n_expert, std::string& err);
@@ -227,6 +236,8 @@ private:
     std::vector<int64_t> seg_size_;     ///< #533: each segment's size (the last one may be shorter)
     int64_t mapped_segs_ = 0;           ///< #533: segments [0, mapped_segs_) are backed
     std::unique_ptr<VmmRange> vmm_;    ///< the arena's range when it is in VMM (set_vmm)
+    uint8_t* device_base_ = nullptr;    ///< unified mode: the device alias of the host-mapped arena (same pointer on an APU)
+    bool unified_ = false;
     std::vector<int32_t> residency_;   ///< [n_layers * n_expert] -> slot or kNotResident
     int64_t slots_ = 0;
     int64_t n_layers_ = 0;

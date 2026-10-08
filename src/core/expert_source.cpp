@@ -455,6 +455,9 @@ bool file_tier_unbuffered(const std::vector<std::string>& paths, uint64_t arena_
 
 }  // namespace
 
+// local (gfx1151 unified memory): the same cgroup-aware reading, for the unified arena's budget
+bool unified_available_bytes(uint64_t& bytes) { return available_memory_bytes(bytes); }
+
 // ================================ THE FILE-BACKED SOURCE ================================
 
 FileExpertSource::~FileExpertSource() { close(); }
@@ -2048,6 +2051,11 @@ bool FileExpertSource::pin_cache_complement(
     const std::vector<std::pair<int32_t, int32_t>>& additional_gpu_pairs, int64_t lend_from_slot,
     uint64_t headroom_bytes, uint64_t budget_bytes, const std::vector<std::pair<int32_t, int32_t>>* rank) {
     err.clear();
+    if (unified_) {
+        // Unified memory (APU): `device_alias` answers with the mapped pointer itself, so a pinned complement
+        // arena would be a second copy of RAM the machine does not have. Nothing to pin.
+        return true;
+    }
     const auto pin_t0 = std::chrono::steady_clock::now();
     if (base_ == nullptr) { err = "FileExpertSource: open the mapped experts before pinning a complement"; return false; }
     if (complement_ready_) { err = "FileExpertSource: the cache complement is already pinned"; return false; }
@@ -2800,6 +2808,7 @@ const uint8_t* FileExpertSource::blob(int64_t layer, int64_t expert) {
 }
 
 bool FileExpertSource::pinned(int64_t layer, int64_t expert) const {
+    if (unified_) return base_ != nullptr;   // SVM on an APU: every mapped page is already device-accessible
     if (!complement_ready_ || !complement_pinned_ || complement_host_ == nullptr || layer < 0 || expert < 0 ||
         layer >= n_layers_ || expert >= n_expert_) return false;
     const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
@@ -2811,6 +2820,11 @@ bool FileExpertSource::pinned(int64_t layer, int64_t expert) const {
 }
 
 const uint8_t* FileExpertSource::device_alias(int64_t layer, int64_t expert) const {
+    if (unified_) {
+        if (base_ == nullptr || layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_) return nullptr;
+        // The pointer is already the device pointer: no alias, no copy, no second residency.
+        return const_cast<FileExpertSource*>(this)->blob(layer, expert);
+    }
     if (!pinned(layer, expert) || complement_device_ == nullptr) return nullptr;
     const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
     if (exchange_storage_.active()) return exchange_storage_.resident(index).device;
@@ -2818,6 +2832,7 @@ const uint8_t* FileExpertSource::device_alias(int64_t layer, int64_t expert) con
 }
 
 bool FileExpertSource::pcie_layer(int64_t layer) const {
+    if (unified_) return base_ != nullptr;
     if (complement_ready_ && complement_pinned_ && complement_device_ != nullptr)
         return layer >= 0 && layer < n_layers_;
     return device_alias(layer, 0) != nullptr;

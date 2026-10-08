@@ -3957,6 +3957,11 @@ int main(int argc, char** argv) {
     // CUDA error left set by the failed `cudaHostRegister` and read later by `gr_read`'s launch check.  See the
     // note in `pinned.cu`.
     strata::core::FileExpertSource src;
+    // Strix Halo (gfx1151) and other APUs: `hipMalloc` allocates from the GTT pool, so the "VRAM" figure is this
+    // machine's RAM seen twice. When the two readings agree, the cache budget is available RAM, `device_alias` is
+    // the mapped pointer itself (SVM), and a fill is a memcpy - see `unified_memory()` in device.hpp.
+    const bool unified_mem = strata::core::unified_memory();
+    src.set_unified(unified_mem);
     {   // the card, and whether this build has code for it (a binary built for other GPUs fails at its first kernel
         // otherwise, after the whole expert arena has loaded) - before the arena starts loading
         int dev = 0;
@@ -4175,6 +4180,7 @@ int main(int argc, char** argv) {
     mem_mark("the weights, the session and the drafter");
     strata::core::ExpertCache xcache;
     // THE HEAD BEFORE THE CACHE: the native head and the logits are allocated above, before the expert arena (#620)
+    xcache.set_unified(unified_mem);
     const bool auto_cache = o.expert_cache < 0;
     bool reserve_adapted = false;   // #496: the auto sizing lowered the reserve so a small card's cache fits
     // --pipeline-windows: what it allocates on CUDA0 after the cache (see kPipeWindowMib)
@@ -4199,7 +4205,15 @@ int main(int argc, char** argv) {
     };
     if (o.expert_cache < 0) {
         size_t free_b = 0, total_b = 0;
-        free_b = strata::core::device_free_bytes(); (void) total_b;
+        uint64_t unified_avail = 0;
+        if (unified_mem && strata::core::unified_available_bytes(unified_avail)) {
+            // On an APU the free-VRAM figure is RAM seen twice; the arena is host memory, so the budget is what
+            // the machine actually has left for this process.
+            free_b = (size_t) unified_avail;
+        } else {
+            free_b = strata::core::device_free_bytes();
+        }
+        (void) total_b;
         // Plan v0.3 P5: the batched prompt path's chunk buffers are allocated later, so they are reserved here -
         // under WDDM an over-subscribed allocation does not fail, it pages to system memory and crawls.
         // (with borrowing - the default with a profile - the prompt path lends cache slots instead; `pf_borrow` is

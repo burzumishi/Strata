@@ -12,6 +12,7 @@
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/fused_gr.hpp"
 #include "strata/kernels/gr.hpp"
+#include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/kv_q4.hpp"
 #include "strata/kernels/kv_q8.hpp"
 #include "strata/kernels/native_moe.hpp"
@@ -259,6 +260,8 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
         dense_ = shared->dense_;
         experts_ = shared->experts_;
         tensors_ = shared->tensors_;
+        native_ = shared->native_;   // local: a native-format pack's layout comes with the shared experts
+        L_ = shared->L_;
         owns_weights_ = false;
         owns_draft_head_ = false;
     }
@@ -295,7 +298,23 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
     }
     // ---- the 512 routed experts, one blob each
     if (shared == nullptr) {
-        const uint64_t bytes = (uint64_t) g.n_expert * strata::kernels::cpu::BLOB;
+        // A native-format pack (tools/mtp_rt.py writes `format.txt`): raw GGUF blocks in [gate rows | up rows |
+        // down rows] order, read by `native_expert_grouped` as they stand - so the drafter runs Q4_0/Q8_0 experts
+        // with the same kernels the main model uses, not only the Q2_0 planes the blob layout stores.
+        std::ifstream fmt(rt_dir + "/format.txt");
+        std::string word;
+        int gu_type = 42, d_type = 42;   // the Q2_0 plane layout, the default when there is no marker
+        if (fmt >> word && word == "native" && fmt >> gu_type >> d_type) {
+            if (!strata::kernels::native_expert_supported(gu_type, d_type, g.n_embd, g.n_ff)) {
+                err = "mtp: format.txt names a native format the grouped kernel cannot run (" +
+                      std::to_string(gu_type) + "/" + std::to_string(d_type) + ")";
+                return false;
+            }
+            native_ = true;
+            L_ = strata::kernels::native_expert_layout(gu_type, d_type, g.n_embd, g.n_ff);
+        }
+        const int64_t blob = native_ ? (int64_t) L_.bytes : (int64_t) strata::kernels::cpu::BLOB;
+        const uint64_t bytes = (uint64_t) g.n_expert * blob;
         // Loader fix (0.1.15+loaderfix.2): each 64 MiB read below reached the disk as ~16k 4095-byte reads under
         // MSVC's `basic_filebuf::xsgetn`, which is what made 675 MiB of drafter experts take minutes.
         FILE* f = std::fopen((rt_dir + "/experts.bin").c_str(), "rb");
@@ -390,8 +409,9 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
         hit_slot_ = b.take<int32_t>(T * K); hit_dst_ = b.take<int32_t>(T * K); hit_count_ = b.take<int32_t>(4);
         grp_ptr_ = b.take<unsigned long long>(T * K); grp_start_ = b.take<int32_t>(T * K + 1);
         grp_counts_ = b.take<int32_t>(4);
-        hit_xq_ = b.take<uint8_t>(T * (N / 32) * 34); hit_xs_ = b.take<float>(T * (N / 32));
-        hit_scratch_ = b.take<uint8_t>(strata::kernels::moe_hit_grouped_scratch_bytes((int64_t) (T * K), g.n_embd, g.n_ff));
+        hit_xq_ = b.take<uint8_t>(T * (N / 32) * 36); hit_xs_ = b.take<float>(T * (N / 32));
+        hit_scratch_ = b.take<uint8_t>(native_ ? strata::kernels::native_expert_scratch_bytes((int64_t) (T * K), g.n_ff)
+                                               : strata::kernels::moe_hit_grouped_scratch_bytes((int64_t) (T * K), g.n_embd, g.n_ff));
         sh_scratch_ = (float*) b.take<uint8_t>(strata::kernels::shared_expert_scratch_bytes(g.n_ff));
         x_bf16_ = b.take<uint16_t>(N);
         out_ids_ = b.take<int32_t>(T + 4);
@@ -435,15 +455,15 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
     }
 #endif
     const double files_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_files).count();
+    const double exp_bytes = (double) g.n_expert * (native_ ? (double) L_.bytes : (double) strata::kernels::cpu::BLOB);
     if (shared != nullptr) {
         std::fprintf(stderr, "strata mtp: shared draft weights, %.0f MiB of private state and buffers\n",
                      (double) vram_ / 1048576.0);
     } else {
-        std::fprintf(stderr, "strata mtp: draft layer loaded, %.0f MiB of VRAM (experts %.0f, dense %.0f), files read in %.2f s (%.0f MiB/s)\n",
-                     (double) vram_ / 1048576.0, (double) g.n_expert * strata::kernels::cpu::BLOB / 1048576.0,
+        std::fprintf(stderr, "strata mtp: draft layer loaded, %.0f MiB of VRAM (experts %.0f %s, dense %.0f), files read in %.2f s (%.0f MiB/s)\n",
+                     (double) vram_ / 1048576.0, exp_bytes / 1048576.0, native_ ? "native" : "q2_0 planes",
                      (double) tensors_.back().off / 1048576.0, files_s,
-                     files_s > 0 ? ((double) g.n_expert * strata::kernels::cpu::BLOB + (double) tensors_.back().off) /
-                                       1048576.0 / files_s : 0.0);
+                     files_s > 0 ? (exp_bytes + (double) tensors_.back().off) / 1048576.0 / files_s : 0.0);
     }
     return true;
 }
@@ -900,12 +920,20 @@ bool MtpDrafter::record_rest(int step_row, cudaStream_t cs, std::string& err) {
             else router_top10(logits_ + t * g.n_expert, 1, (int) g.n_expert, (int) K, ids_ + t * K, w_ + t * K, cs);
         }
         }
-        moe_group_resident(ids_, (int) (T * K), (int) K, experts_, (int64_t) strata::kernels::cpu::BLOB, grp_ptr_,
+        const int64_t blob = native_ ? (int64_t) L_.bytes : (int64_t) strata::kernels::cpu::BLOB;
+        moe_group_resident(ids_, (int) (T * K), (int) K, experts_, blob, grp_ptr_,
                            grp_start_, grp_counts_, hit_dst_, hit_slot_, cs);
-        quantize_q8_0_scaled(mixed_, hit_xq_, hit_xs_, (int64_t) T * N, cs);
-        moe_grouped_s2(grp_ptr_, grp_start_, grp_counts_, hit_dst_, hit_slot_, (int64_t) T * K, (int64_t) T * K, hit_xq_,
-                       hit_xs_, hit_scratch_, parts_, cs);
-        if (branch_on) {
+        if (native_) {
+            // The same kernels the main model's hit path uses: q8_1 activations, `native_expert_grouped` over the
+            // raw blocks - which is why the packer can ship Q4_0/Q8_0 experts without a relayout.
+            native_quantize_q8_1(mixed_, hit_xq_, (int) N, (int) T, cs);
+            native_expert_grouped(L_, grp_ptr_, grp_start_, grp_counts_, hit_dst_, hit_slot_, (int64_t) T * K,
+                                  (int64_t) T * K, hit_xq_, hit_scratch_, parts_, cs);
+        } else {
+            quantize_q8_0_scaled(mixed_, hit_xq_, hit_xs_, (int64_t) T * N, cs);
+            moe_grouped_s2(grp_ptr_, grp_start_, grp_counts_, hit_dst_, hit_slot_, (int64_t) T * K, (int64_t) T * K, hit_xq_,
+                           hit_xs_, hit_scratch_, parts_, cs);
+        }
             if (cudaStreamWaitEvent(cs, sh_join_, 0) != cudaSuccess) { err = "mtp: the shared expert's join"; return false; }
         } else {
             shared_rows();
