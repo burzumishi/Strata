@@ -3958,10 +3958,45 @@ int main(int argc, char** argv) {
     // note in `pinned.cu`.
     strata::core::FileExpertSource src;
     // Strix Halo (gfx1151) and other APUs: `hipMalloc` allocates from the GTT pool, so the "VRAM" figure is this
-    // machine's RAM seen twice. When the two readings agree, the cache budget is available RAM, `device_alias` is
-    // the mapped pointer itself (SVM), and a fill is a memcpy - see `unified_memory()` in device.hpp.
+    // machine's RAM seen twice. The unified mode (a host arena the GPU reads through SVM, `device_alias` answering
+    // with the mapped pointer, the budget against available RAM) replaces the arena+page-cache double residency -
+    // but ONLY when the experts overflow the cache (IQ3_S). When the expert set fits in the GTT budget (IQ2_XS:
+    // all 24576 blobs in ~38 GiB), the old path is strictly better: `hipMalloc` hands out TTM pages, which the
+    // kernel cannot swap, while a host arena is anonymous memory - the first pressure turns it into swap and every
+    // GPU read through the swapped arena is a synchronous SVM restore (`svm_range_restore_work` storms, the #267
+    // mechanism). That was the 30 -> 10 t/s regression: 11 GiB of VmSwap against a host arena, measured 2026-10-04.
+    // So the mode is decided HERE, before the source opens (a source in unified mode answers `pinned()`/`pcie_layer`
+    // for every layer, and that cannot be unwound once the first blob is read): ON only when the VRAM budget cannot
+    // hold the whole profile - the same arithmetic the budget below makes, read before the session is allocated, so
+    // it is generous by the KV; IQ2_XS still clears it with thousands of slots to spare. `STRATA_UNIFIED` forces it
+    // either way.
     const bool unified_mem = strata::core::unified_memory();
-    src.set_unified(unified_mem);
+    const char* un_env = std::getenv("STRATA_UNIFIED");
+    const bool un_forced = un_env != nullptr && un_env[0] != '\0';
+    bool unified_on = false;
+    if (unified_mem) {
+        if (un_forced) {
+            unified_on = true;
+        } else {
+            size_t g_free = 0, g_total = 0;
+            const bool g_ok = cudaMemGetInfo(&g_free, &g_total) == cudaSuccess;
+            if (!g_ok) {
+                (void) cudaGetLastError();
+                unified_on = false;   // no figure: keep the old path, which is what it ran with before
+            } else {
+                const int64_t blob0 = (int64_t) strata::kernels::cpu::expert_layout().max_blob;
+                const int64_t room = ((int64_t) g_free - ((int64_t) o.vram_reserve_mib << 20)) / (blob0 > 0 ? blob0 : 1);
+                unified_on = !profile.empty() && room < (int64_t) profile.size();
+            }
+        }
+        std::fprintf(stderr, "strata generate: %s\n",
+                     unified_on
+                         ? "the experts overflow the VRAM budget: the unified mode is ON (host arena read through "
+                           "SVM, zero-copy alias, the cache budget against available RAM)"
+                         : "the whole expert set fits in the VRAM budget: keeping the pinned TTM arena - a host "
+                           "arena would only add swap pressure on this APU (STRATA_UNIFIED forces it either way)");
+        src.set_unified(unified_on);
+    }
     {   // the card, and whether this build has code for it (a binary built for other GPUs fails at its first kernel
         // otherwise, after the whole expert arena has loaded) - before the arena starts loading
         int dev = 0;
@@ -4180,7 +4215,7 @@ int main(int argc, char** argv) {
     mem_mark("the weights, the session and the drafter");
     strata::core::ExpertCache xcache;
     // THE HEAD BEFORE THE CACHE: the native head and the logits are allocated above, before the expert arena (#620)
-    xcache.set_unified(unified_mem);
+    // (its `set_unified` comes after the cache budget below: the mode is decided with the exact free figure)
     const bool auto_cache = o.expert_cache < 0;
     bool reserve_adapted = false;   // #496: the auto sizing lowered the reserve so a small card's cache fits
     // --pipeline-windows: what it allocates on CUDA0 after the cache (see kPipeWindowMib)
@@ -4206,7 +4241,7 @@ int main(int argc, char** argv) {
     if (o.expert_cache < 0) {
         size_t free_b = 0, total_b = 0;
         uint64_t unified_avail = 0;
-        if (unified_mem && strata::core::unified_available_bytes(unified_avail)) {
+        if (unified_on && strata::core::unified_available_bytes(unified_avail)) {
             // On an APU the free-VRAM figure is RAM seen twice; the arena is host memory, so the budget is what
             // the machine actually has left for this process.
             free_b = (size_t) unified_avail;
@@ -4250,6 +4285,25 @@ int main(int argc, char** argv) {
         const int64_t blob = (int64_t) strata::kernels::cpu::expert_layout().max_blob;
         int64_t slots = ((int64_t) free_b - reserve) / blob;
         if (!profile.empty()) slots = std::min<int64_t>(slots, (int64_t) profile.size());
+        if (!unified_on && !un_forced && unified_mem && !profile.empty() && slots < (int64_t) profile.size()) {
+            // the GTT figure cannot hold the whole profile: this is the overflow case the unified mode is FOR
+            // (IQ3_S on the APU).  Switch now: the budget below is available RAM, `device_alias` will answer with
+            // the mapped pointer, and the slots that do not fit are read by the GPU through the file's pages
+            // instead of being copied a second time into RAM.  (The check above, before `src.open`, could only
+            // read the free figure before the session and the drafter were allocated - generous by the KV, which
+            // is why IQ2_XS passed it and IQ3_S needs this exact one.)
+            unified_on = true;
+            src.set_unified(true);
+            uint64_t avail2 = 0;
+            if (strata::core::available_memory_bytes(avail2)) {
+                free_b = (size_t) avail2;
+                slots = ((int64_t) free_b - reserve) / blob;
+                if (!profile.empty()) slots = std::min<int64_t>(slots, (int64_t) profile.size());
+            }
+            std::fprintf(stderr, "strata generate: the experts overflow the VRAM budget: the unified mode is ON "
+                                 "- %.2f GiB of RAM available, %d slots\n",
+                         (double) free_b / 1073741824.0, (int) std::max<int64_t>(slots, 0));
+        }
         o.expert_cache = (int) std::max<int64_t>(slots, 0);
         std::fprintf(stderr, "strata generate: expert cache auto: %.2f GiB free, %d MiB reserved (+%lld MiB for the "
                              "draft head) -> %d slots\n",
@@ -4348,6 +4402,8 @@ int main(int argc, char** argv) {
     // one layer can land in another layer's slot. Every expert in a layer is one size, so the per-layer list is
     // `quota` copies of that layer's own blob, in layer order. `--expert-cache N` stays the budget of N largest
     // blobs, and the quota is however many copies of every layer fit in it.
+    // The cache takes the unified branch only with the source: both were decided with the SAME budget figure above.
+    xcache.set_unified(unified_on);
     std::vector<int64_t> sized_slots;
     uint64_t per_layer_bytes = 0;
     if (native_pack && o.expert_cache > 0 && o.expert_cache_per_layer) {

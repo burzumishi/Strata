@@ -1,6 +1,7 @@
 // src/core/expert_cache.cpp - R4's slot storage and residency table.  Read the header first.
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/expert_source.hpp"   // unified_available_bytes: the unified arena's real budget
+#include "strata/platform/memory.hpp"      // lock_resident: the unified arena is pinned like a TTM one
 
 // #533's segmented cache uses CUDA's virtual memory management (cuMem*): not on HIP, neither the RDNA backend nor
 // the gfx906 compat build (PR #638), which compiles this file as HIP without STRATA_USE_HIP
@@ -537,6 +538,15 @@ bool ExpertCache::open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int6
         if (cudaHostGetDevicePointer(&alias, base_, 0) == cudaSuccess && alias != nullptr) device_base_ = (uint8_t*) alias;
         else device_base_ = base_;   // SVM: the host pointer is already the device pointer
         std::memset(base_, 0, (size_t) want);
+        // THE ARENA IS PINNED, the way a `cudaMalloc` arena is: TTM pages cannot be swapped, and this one is the
+        // same RAM the kernel would otherwise write out.  An arena that reaches swap costs a synchronous
+        // `svm_range_restore_work` per GPU read (the #267 mechanism) - the 30 -> 10 t/s regression of 2026-10-04.
+        // The `memset` above already faulted every page in, so the lock asks for pages this process owns.
+        const strata::platform::LockResult lr = strata::platform::lock_resident(base_, (uint64_t) want);
+        std::fprintf(stderr, "ExpertCache: unified arena %.2f GiB %s%s\n", (double) want / 1073741824.0,
+                     lr.ok ? "pinned (mlock): the GPU reads it without swap"
+                           : "is NOT pinned - keep this machine's memory pressure low (swap would stall the GPU)",
+                     lr.ok ? "" : (std::string(" (") + (lr.note.empty() ? "mlock failed" : lr.note) + ")").c_str());
     } else if (seg_req_ > 0) {   // #533: --vram-elastic: physical segments behind one address range (zeroed below)
         if (!open_segmented(want, err)) return false;
     } else if (g_cache_vmm && vmm_available()) {
@@ -632,8 +642,10 @@ void ExpertCache::close() {
     blocking_staging_ = nullptr;
     blocking_staging_bytes_ = 0;
 #endif
+    const uint64_t arena_bytes = (uint64_t) bytes();   // sized before `off_` goes away: `bytes()` reads it
     off_.clear();
     if (unified_ && base_ != nullptr) {
+        strata::platform::unlock_resident(base_, arena_bytes);   // the pin is the arena's; free it first
         (void) cudaFreeHost(base_);
         base_ = nullptr;
     } else if (!segs_.empty()) {
