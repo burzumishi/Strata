@@ -4295,7 +4295,7 @@ int main(int argc, char** argv) {
             unified_on = true;
             src.set_unified(true);
             uint64_t avail2 = 0;
-            if (strata::core::available_memory_bytes(avail2)) {
+            if (strata::core::unified_available_bytes(avail2)) {
                 free_b = (size_t) avail2;
                 slots = ((int64_t) free_b - reserve) / blob;
                 if (!profile.empty()) slots = std::min<int64_t>(slots, (int64_t) profile.size());
