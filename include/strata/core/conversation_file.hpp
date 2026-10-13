@@ -222,6 +222,17 @@ struct SessionReadLimits {
     // parse holds at its peak (session_read_peak_bytes); false refuses the file.  Not a reservation.
     std::function<bool(uint64_t need_bytes, std::string& why)> admit;
     SessionProgress progress;
+    // Local (disk-parked conversations): the K/V streamed instead of held.  With `kv_data` set, every K/V part goes to
+    // it in blocks of at most 16 MiB and the image's K/V buffers stay empty (their headers are filled).  `kv_begin`
+    // runs once, after the live state and the checkpoints are parsed and before the first K/V byte is read (`head`
+    // holds them and `head_bytes` the payload bytes they took); `kv_part` before each part, with its byte count.  A
+    // false from any of them refuses the file.  The payload hash is checked only at the end, so a caller that
+    // writes the bytes somewhere must treat a later refusal as having overwritten that place.
+    std::function<bool(const SavedConversation& head, uint64_t head_bytes, std::string& why)> kv_begin;
+    std::function<bool(size_t layer, const ConversationKv& header, size_t part, uint64_t bytes, std::string& why)> kv_part;
+    std::function<bool(size_t layer, size_t part, uint64_t offset, const uint8_t* data, size_t n, std::string& why)> kv_data;
+    // the RAM preflight's figure for a file of this size (default session_read_peak_bytes)
+    std::function<uint64_t(uint64_t file_bytes)> peak;
 };
 // The largest file these limits admit (UINT64_MAX when one of them is open); session_file_read applies it.
 uint64_t session_read_max_file_bytes(const SessionReadLimits& limits);
@@ -234,6 +245,11 @@ uint64_t session_read_peak_bytes(uint64_t file_bytes);
 bool session_file_read(const std::string& path, const SessionFileIdentity& id, SavedConversation& image,
                        size_t& bytes, std::string& error, const SessionReadLimits& limits = {},
                        SessionStatus* status = nullptr);
+
+// Local (disk-parked conversations): the header, identity, live state and checkpoints of a session file, without its
+// K/V (no payload hash: the K/V is not read).  `head_bytes` is the payload bytes before the K/V, `bytes` the file's.
+bool session_file_peek(const std::string& path, const SessionFileIdentity& id, SavedConversation& head,
+                       uint64_t& head_bytes, size_t& bytes, std::string& error, const SessionReadLimits& limits = {});
 
 // The folder the free-space preflight asks about for `path`, by the rules of Windows or of POSIX (exposed so both can
 // be tested anywhere).  Windows: backslashes and a trailing backslash, as GetDiskFreeSpaceExW requires for a UNC

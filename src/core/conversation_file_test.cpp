@@ -190,6 +190,61 @@ int main() {
         check(read == written, "read reports the file size");
         check(same(original, back), "round trip is identical");
     }
+    // local: the streamed K/V read (disk-parked conversations): every part reaches kv_data in order and in blocks,
+    // kv_begin sees the live state and checkpoints first, the image keeps empty K/V buffers with their headers;
+    // a corrupt payload is refused at the end, after the parts were handed over
+    {
+        std::vector<std::array<std::vector<uint8_t>, 5>> got(original.kv.size());
+        bool began = false, began_first = true;
+        uint64_t head_bytes = 0;
+        SessionReadLimits l;
+        l.kv_begin = [&](const SavedConversation& h, uint64_t hb, std::string&) {
+            began = same_checkpoint(h.live, original.live) && h.checkpoints.size() == original.checkpoints.size();
+            head_bytes = hb;
+            return true;
+        };
+        l.kv_part = [&](size_t layer, const ConversationKv& hdr, size_t part, uint64_t bytes, std::string& why) {
+            if (!began) began_first = false;
+            const auto& o = original.kv[layer];
+            const ConversationBuffer* b[5] = {&o.k, &o.v, &o.k_scale, &o.v_scale, &o.pooled};
+            if (hdr.format != o.format || hdr.cells != o.cells || bytes != b[part]->size()) { why = "header"; return false; }
+            got[layer][part].reserve((size_t) bytes);
+            return true;
+        };
+        l.kv_data = [&](size_t layer, size_t part, uint64_t off, const uint8_t* p, size_t n, std::string& why) {
+            if (off != got[layer][part].size() || n > (16u << 20)) { why = "order"; return false; }
+            got[layer][part].insert(got[layer][part].end(), p, p + n);
+            return true;
+        };
+        SavedConversation back;
+        size_t read = 0;
+        check(session_file_read(good.string(), id, back, read, error, l), "streamed read succeeds");
+        check(began && began_first, "streamed read: the head comes before the first K/V part");
+        check(head_bytes > 0 && head_bytes < written, "streamed read: head bytes reported");
+        bool parts_same = back.kv.size() == original.kv.size();
+        for (size_t j = 0; parts_same && j < original.kv.size(); ++j) {
+            const auto& o = original.kv[j];
+            const ConversationBuffer* b[5] = {&o.k, &o.v, &o.k_scale, &o.v_scale, &o.pooled};
+            for (size_t part = 0; part < 5; ++part) {
+                std::vector<uint8_t> want;
+                b[part]->visit(0, b[part]->size(), [&](const uint8_t* q, size_t n, size_t) { want.insert(want.end(), q, q + n); return true; });
+                if (want != got[j][part] || !back.kv[j].k.empty() || back.kv[j].format != o.format) parts_same = false;
+            }
+        }
+        check(parts_same, "streamed read: every K/V part arrives whole, the image holds none");
+        SavedConversation head;
+        uint64_t hb2 = 0;
+        size_t fbytes = 0;
+        check(session_file_peek(good.string(), id, head, hb2, fbytes, error) && hb2 == head_bytes && fbytes == written &&
+              same_checkpoint(head.live, original.live) && head.kv.empty(), "peek: the head without the K/V");
+        // a flipped byte in the last K/V part: the parts were streamed, the read is still refused
+        const fs::path bad = dir / "bad-stream.bin";
+        std::vector<char> d = slurp(good);
+        d[d.size() - 16 - 3] ^= 1;
+        spit(bad, d);
+        for (auto& layer : got) for (auto& part : layer) part.clear();
+        check(!session_file_read(bad.string(), id, back, read, error, l), "streamed read refuses a corrupt payload");
+    }
     // writing twice produces the same bytes (deterministic format)
     {
         const fs::path again = dir / "again.bin";

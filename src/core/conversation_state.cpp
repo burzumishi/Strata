@@ -358,6 +358,28 @@ ConversationRestore conversation_snapshot_restore(const SavedConversation& image
     return ConversationRestore::restored;
 }
 
+// ---- local: disk-parked conversations restored as a stream
+bool conversation_head_validate(const SavedConversation& head, const SessionState& ss, const ModelGeometry& g,
+                                std::string& error) {
+    if (!head.live.stage_parts.empty() || !head.stage_images.empty())
+        return fail(error, "a layer split's image restored as a single session");
+    if (head.geometry != geometry_key(g)) return fail(error, "incompatible runtime geometry");
+    if (head.layer_lo != ss.layer_lo || head.layer_hi != ss.layer_hi)
+        return fail(error, "snapshot from another session layer range");
+    const ConversationView view{head.live.ids, head.live.imgs, head.checkpoints, head.cvec};
+    return view_validate(view, ss, g, error) && conversation_checkpoint_validate(head.live, ss, g, error);
+}
+
+const QsaState* conversation_kv_target(const SessionState& ss, size_t layer, const QsaState* draft) {
+    const size_t layers = owned_qsa(ss);
+    if (layer < layers) return &owned(ss, layer);
+    return layer == layers ? draft : nullptr;
+}
+
+size_t conversation_kv_layers(const SessionState& ss) { return owned_qsa(ss); }
+
+bool conversation_sync(std::string& error) { return sync(error); }
+
 // the draft layer's K/V included (the stage that owns the draft head, or no layer split)
 bool conversation_snapshot_bytes(const ConversationView& view, const SessionState& ss, const ModelGeometry& g,
                                  const QsaState& draft, size_t& bytes, std::string& error) {

@@ -113,4 +113,21 @@ bool conversation_snapshot_validate(const SavedConversation& image, const Sessio
 ConversationRestore conversation_snapshot_restore(const SavedConversation& image, SessionState& session,
                                                    const ModelGeometry& g, const QsaState* draft, std::string& error);
 
+// ---- local: disk-parked conversations, restored as a stream (a session file read in blocks, no whole image in RAM).
+// The order: conversation_head_validate (the live state and checkpoints, before any device write), then per K/V
+// layer and part conversation_kv_stream_check before its first byte and conversation_kv_stream_write for each block
+// (`conversation_kv_target` names the layer's state: the session's QSA layers, then the draft), then
+// conversation_kv_stream_finish per layer and conversation_checkpoint_restore of the live state.  A failure after the
+// first write leaves the session's K/V partly overwritten: the caller drops the session (and its checkpoints).
+bool conversation_head_validate(const SavedConversation& head, const SessionState& session, const ModelGeometry& g,
+                                std::string& error);
+const QsaState* conversation_kv_target(const SessionState& session, size_t layer, const QsaState* draft);
+size_t conversation_kv_layers(const SessionState& session);
+bool conversation_sync(std::string& error);
+bool conversation_kv_stream_check(const ConversationKv& header, const QsaState& state, const ModelGeometry& g,
+                                  int64_t upto, bool include_index, size_t part, uint64_t bytes, std::string& error);
+bool conversation_kv_stream_write(const QsaState& state, size_t part, uint64_t offset, const uint8_t* data, size_t n,
+                                  std::string& error);
+bool conversation_kv_stream_finish(const QsaState& state, const ModelGeometry& g, int64_t upto, std::string& error);
+
 } // namespace strata::core

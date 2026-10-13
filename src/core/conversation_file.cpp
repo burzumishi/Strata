@@ -716,6 +716,9 @@ struct In {
     const SessionReadLimits& limits;
     SessionError kind = SessionError::invalid;
     size_t kv_layer = 0;
+    const ConversationKv* kv_header = nullptr;   // the K/V layer being parsed (streamed reads)
+    std::vector<uint8_t> scratch;                // a streamed part's block
+    uint64_t payload = 0;                        // the payload's size (left at the start)
     bool fail(const std::string& m) { if (error.empty()) error = "session file: " + m; return false; }
     bool raw(void* p, size_t c) {
         if (c > left) return fail("payload ends early");
@@ -746,6 +749,18 @@ struct In {
         const uint64_t limit = kv_layer < limits.max_kv_bytes.size() ? limits.max_kv_bytes[kv_layer][part] : UINT64_MAX;
         if (!count(n, 1, limit)) return false;
         b = {};
+        if (limits.kv_data) {   // local: streamed to the caller, not held
+            std::string why;
+            if (limits.kv_part && !limits.kv_part(kv_layer, *kv_header, part, n, why)) return fail(why);
+            if (scratch.empty()) scratch.resize(16u << 20);
+            for (uint64_t at = 0; at < n;) {
+                const size_t c = (size_t) std::min<uint64_t>(scratch.size(), n - at);
+                if (!raw(scratch.data(), c)) return false;
+                if (!limits.kv_data(kv_layer, part, at, scratch.data(), c, why)) return fail(why);
+                at += c;
+            }
+            return true;
+        }
         b.resize((size_t) n);
         return b.visit(0, b.size(), [&](uint8_t* p, size_t c, size_t) { return raw(p, c); });
     }
@@ -781,9 +796,14 @@ bool get_payload(In& in, SavedConversation& s) {
     s.checkpoints.resize((size_t) n);
     for (auto& c : s.checkpoints) if (!get_checkpoint(in, c)) return false;
     if (!in.count(n, 96, in.limits.max_kv_layers)) return false;
+    if (in.limits.kv_begin) {   // local: the state before the K/V, handed over before any K/V byte is read
+        std::string why;
+        if (!in.limits.kv_begin(s, in.payload - in.left, why)) return in.fail(why);
+    }
     s.kv.resize((size_t) n);
     for (auto& k : s.kv) {
         in.kv_layer = (size_t) (&k - s.kv.data());
+        in.kv_header = &k;
         int64_t format = 0;
         if (!in.i64(format) || !in.i64(k.cells) || !in.i64(k.heads) || !in.i64(k.head_dim) ||
             !in.i64(k.page_size) || !in.i64(k.pooled_rows) || !in.i64(k.idx_dim)) return false;
@@ -1215,7 +1235,7 @@ bool read_impl(const std::string& path, const SessionFileIdentity& id, SavedConv
     }
     if (limits.admit) {
         std::string why;
-        if (!limits.admit(session_read_peak_bytes(size), why)) {
+        if (!limits.admit(limits.peak ? limits.peak(size) : session_read_peak_bytes(size), why)) {
             st.error = SessionError::memory;
             error = "session file: " + why;
             return false;
@@ -1223,6 +1243,7 @@ bool read_impl(const std::string& path, const SessionFileIdentity& id, SavedConv
     }
     SavedConversation parsed;
     In in{&f, SessionHasher(0), payload, error, limits};
+    in.payload = payload;
     if (!get_payload(in, parsed)) { st.error = in.kind; return false; }
     if (in.left) { error = "session file: payload has " + std::to_string(in.left) + " unparsed bytes"; return false; }
     uint8_t t[kTrailer];
@@ -1237,6 +1258,41 @@ bool read_impl(const std::string& path, const SessionFileIdentity& id, SavedConv
     return true;
 }
 } // namespace
+
+bool session_file_peek(const std::string& path, const SessionFileIdentity& id, SavedConversation& head,
+                       uint64_t& head_bytes, size_t& bytes, std::string& error, const SessionReadLimits& limits) {
+    static const char* kStop = "peek: stopped before the K/V";
+    SessionReadLimits l = limits;
+    bool reached = false;
+    l.kv_begin = [&](const SavedConversation& h, uint64_t hb, std::string& why) {
+        head = h;
+        head_bytes = hb;
+        reached = true;
+        why = kStop;
+        return false;
+    };
+    l.kv_data = [](size_t, size_t, uint64_t, const uint8_t*, size_t, std::string&) { return false; };
+    l.peak = [](uint64_t) { return uint64_t(64) << 20; };
+    SavedConversation unused;
+    SessionStatus st;
+    std::string e;
+    bool ok = false;
+    try {
+        ok = read_impl(path, id, unused, bytes, e, l, st);
+    } catch (const std::bad_alloc&) {
+        error = "session file: out of memory while reading " + path;
+        return false;
+    }
+    if (ok || !reached) {   // a file with no K/V section cannot be ok here; refusals before the K/V are the error
+        error = ok ? "session file: no K/V section" : e;
+        return false;
+    }
+    std::error_code ec;
+    const auto fs = std::filesystem::file_size(path, ec);
+    bytes = ec ? 0 : (size_t) fs;
+    error.clear();
+    return true;
+}
 
 bool session_file_read(const std::string& path, const SessionFileIdentity& id, SavedConversation& image,
                        size_t& bytes, std::string& error, const SessionReadLimits& limits, SessionStatus* status) {

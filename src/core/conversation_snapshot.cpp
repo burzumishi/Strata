@@ -226,6 +226,46 @@ bool conversation_kv_restore(const ConversationKv& image, const QsaState& st, co
     return false;
 }
 
+// ---- local: a K/V layer restored from a stream (disk-parked conversations, session files read in blocks)
+bool conversation_kv_stream_check(const ConversationKv& header, const QsaState& st, const ModelGeometry& g,
+                                  int64_t upto, bool index, size_t part, uint64_t bytes, std::string& error) {
+    Layout l{};
+    if (part >= 5) { error = "conversation snapshot: invalid K/V part"; return false; }
+    if (!layout(st, g, upto, index, l, error) || !valid(st, l, upto, error)) return false;
+    if (header.format != l.format || header.cells != l.cells || header.heads != g.n_head_kv ||
+        header.head_dim != g.head_dim || header.page_size != l.page_size || header.pooled_rows != l.pooled_rows ||
+        header.idx_dim != g.idx_key_dim) {
+        error = "conversation snapshot: incompatible K/V geometry";
+        return false;
+    }
+    const std::array<size_t,5> sizes = {l.data, l.value_data, l.scales, l.value_scales, l.pooled};
+    if (bytes != sizes[part]) { error = "conversation snapshot: invalid K/V payload size"; return false; }
+    if (bytes && !pools(st)[part]) { error = "conversation snapshot: missing target state buffer"; return false; }
+    return true;
+}
+
+bool conversation_kv_stream_write(const QsaState& st, size_t part, uint64_t offset, const uint8_t* data, size_t n,
+                                  std::string& error) {
+    if (part >= 5) { error = "conversation snapshot: invalid K/V part"; return false; }
+    return transfer(static_cast<uint8_t*>(pools(st)[part]) + offset, data, n, error);
+}
+
+bool conversation_kv_stream_finish(const QsaState& st, const ModelGeometry& g, int64_t upto, std::string& error) {
+    // the same residency steps as conversation_kv_restore, once every part has arrived
+    if (st.kv_mode == 1) strata::kernels::kv_stream_reset(st.map, nullptr);
+    if (st.kv_mode == 2 && upto > 0) {
+        auto shapes = strata::kernels::qsa_real_shapes();
+        shapes.n_head_kv = g.n_head_kv; shapes.head_dim = g.head_dim;
+        const int64_t end = (upto + shapes.page_size - 1) / shapes.page_size;
+        strata::kernels::kv_ring_restore(qsa_attn_pools(st), st.host, qsa_kv_format(st),
+                                        std::max<int64_t>(0, end - st.n_slots), end, st.n_slots, shapes, nullptr);
+    }
+    const auto status = cudaGetLastError();
+    if (status == cudaSuccess) return true;
+    error = std::string("conversation snapshot residency restore: ") + cudaGetErrorString(status);
+    return false;
+}
+
 bool conversation_kv_part_sizes(const QsaState& st, const ModelGeometry& g, int64_t upto, bool index,
                                 std::array<uint64_t, 5>& sizes, std::string& error) {
     Layout l{};
