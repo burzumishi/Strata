@@ -118,7 +118,8 @@ def main() -> int:
             lines.append(f"{short} {kind} {rows} {cols} {off} {len(raw)}")
             off += len(raw)
     (out / "dense.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
-    print(f"experts.bin {NE * BLOB} B, dense.bin {off} B, {len(lines)} tensors -> {out}")
+    experts_bytes = (out / "experts.bin").stat().st_size
+    print(f"experts.bin {experts_bytes} B, dense.bin {off} B, {len(lines)} tensors -> {out}")
     for l in lines:
         print("  " + l)
     return 0

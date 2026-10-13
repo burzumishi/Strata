@@ -2396,6 +2396,15 @@ class CancelledRead(unittest.TestCase):
         StrataEngine._parse_done(e, "DONE 0 98179 17565.0 0.0 cancel 0 0 0 0 0 0 0 0.0")
         self.assertNotIn("prompt_read", e.last)
 
+    def test_parse_done_lookup_chain_fields(self):
+        e = SimpleNamespace()
+        StrataEngine._parse_done(e, "DONE 0 100 10.0 20.0 stop 5 6 0 0 0 0 0 0.0 100 0 7 8 9 10 11")
+        self.assertEqual((e.last["chain_accepted"], e.last["chain_offered"],
+                          e.last["suffix_accepted"], e.last["suffix_offered"], e.last["windows"]),
+                         (7, 8, 9, 10, 11))
+        StrataEngine._parse_done(e, "DONE 0 100 10.0 20.0 stop 5 6 0 0 0 0 0 0.0 100 0")
+        self.assertNotIn("chain_accepted", e.last)
+
     def test_prompt_tokens_seen(self):
         last = {"finish": "cancel", "reused": 1000, "prompt_read": 2000}
         self.assertEqual(prompt_tokens_seen(98179, last), 3000)

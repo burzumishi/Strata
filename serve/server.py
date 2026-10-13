@@ -952,6 +952,9 @@ class StrataEngine:
             self.last.update(prompt_read=int(f[14]))
         if len(f) >= 16:                                  # #588 (engine 0.1.39+): routed experts read over PCIe
             self.last.update(offloaded=int(f[15]))
+        if len(f) >= 21:                                  # lookup-chain + suffix drafts (engine 0.1.40+, --lookup-chain)
+            self.last.update(chain_accepted=int(f[16]), chain_offered=int(f[17]),
+                             suffix_accepted=int(f[18]), suffix_offered=int(f[19]), windows=int(f[20]))
 
     def vram(self, reserve_mib: int | None, timeout: float = 120.0) -> dict:
         """#533: `VRAM <reserve_mib>` between requests (the caller holds the service's FIFO): the engine shrinks its
@@ -4312,7 +4315,12 @@ def request_timings(prompt_tokens: int, generated: int, last: dict) -> dict | No
             "predicted_per_second": round(decoded / (decode_ms / 1000), 1) if decoded and decode_ms > 0 else None,
             # the speculative drafts, as llama.cpp names them (from PR #83, @mikicvi): only when the engine reported them
             **({"draft_n": int(last["drafts_offered"]), "draft_n_accepted": int(last["drafts_accepted"])}
-               if last.get("drafts_offered") is not None else {})}
+               if last.get("drafts_offered") is not None else {}),
+            # the prompt-lookup drafts by source (engine 0.1.40+, only with --lookup-chain)
+            **({"suffix_draft_n": int(last["suffix_offered"]), "suffix_draft_n_accepted": int(last["suffix_accepted"]),
+                "chain_draft_n": int(last["chain_offered"]), "chain_draft_n_accepted": int(last["chain_accepted"]),
+                "windows": int(last["windows"])}
+               if last.get("chain_offered") is not None else {})}
 
 
 def request_stats(segments: list[dict]) -> dict:
@@ -4326,7 +4334,8 @@ def request_stats(segments: list[dict]) -> dict:
         else:
             result.pop(key, None)
     for key in ("prompt_ms", "decode_ms", "generated", "drafts_offered", "drafts_accepted",
-                "hits", "lookups", "offloaded", "ram_blobs", "file_blobs", "file_mb"):
+                "hits", "lookups", "offloaded", "ram_blobs", "file_blobs", "file_mb",
+                "chain_accepted", "chain_offered", "suffix_accepted", "suffix_offered"):
         if any(segment.get(key) is not None for segment in segments):
             result[key] = sum(segment.get(key) or 0 for segment in segments)
     return result
