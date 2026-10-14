@@ -540,6 +540,37 @@ __global__ void k_attn_softmax16(const float* S, __half* S16, int ld, int T, int
     const float inv = 1.0f / sum;
     for (int p = threadIdx.x; p < P; p += blockDim.x) out[p] = __float2half(p < n ? expf(row[p] * scale - mx) * inv : 0.f);
 }
+/// local: the merged-heads prompt attention (STRATA_Q36_ATT_MERGED, see layer()): q [T][H][HD] f32 -> qm
+/// [HKV][nt][G][HD] f16 for the rows t0 .. t0 + nt, so each KV head's G query heads are ONE GEMM operand of nt * G
+/// columns (hipBLAS picks far larger tiles than for G batched products of nt columns).  grid (nt * H), block HD.
+__global__ void k_q_repack(const float* q, __half* qm, int t0, int nt, int H, int G) {
+    const int r = blockIdx.x, d = threadIdx.x;
+    const int t = r / H, h = r % H, kvh = h / G, g = h % G;
+    qm[(((size_t) kvh * nt + t) * G + g) * 256 + d] = __float2half(q[((size_t) (t0 + t) * H + h) * 256 + d]);
+}
+/// Causal softmax of the merged scores: rows (kvh, t, g), grid (nt * G, HKV); row t of the slice sees pos0 + t + 1.
+__global__ void k_attn_softmax16_m(const float* S, __half* S16, int ld, int nt, int G, int P, int pos0, float scale) {
+    __shared__ float sh[kThreads];
+    const int r = blockIdx.x, kvh = blockIdx.y, t = r / G;
+    const float* row = S + ((size_t) kvh * nt * G + r) * ld;
+    __half* out = S16 + ((size_t) kvh * nt * G + r) * ld;
+    const int n = min(P, pos0 + t + 1);
+    float mx = -INFINITY;
+    for (int p = threadIdx.x; p < n; p += blockDim.x) mx = fmaxf(mx, row[p] * scale);
+    mx = block_max(mx, sh);
+    float sum = 0.f;
+    for (int p = threadIdx.x; p < n; p += blockDim.x) sum += expf(row[p] * scale - mx);
+    sum = block_sum(sum, sh);
+    const float inv = 1.0f / sum;
+    for (int p = threadIdx.x; p < P; p += blockDim.x) out[p] = __float2half(p < n ? expf(row[p] * scale - mx) * inv : 0.f);
+}
+/// om [HKV][nt][G][HD] -> att rows t0 .. t0 + nt [T][H][HD], times sigmoid(gate).  grid (nt * H), block HD.
+__global__ void k_attn_unpack_gate(const float* om, const float* gate, float* att, int t0, int nt, int H, int G) {
+    const int r = blockIdx.x, d = threadIdx.x;
+    const int t = r / H, h = r % H, kvh = h / G, g = h % G;
+    const size_t o = ((size_t) (t0 + t) * H + h) * 256 + d;
+    att[o] = om[(((size_t) kvh * nt + t) * G + g) * 256 + d] * sigm(gate[o]);
+}
 /// att *= sigmoid(gate) (the attention output gate), n values.
 __global__ void k_gate_mul(float* att, const float* gate, int64_t n) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
@@ -1239,6 +1270,7 @@ struct Engine {
     float* sk_part = nullptr;          // the split-K partials of the F32 projections: [kSplitK][tmax][<= 257]
     __half* att_p16 = nullptr;         // the probabilities in FP16 (kAttScoreFloats halves)
     __half *k16 = nullptr, *v16 = nullptr, *q16 = nullptr;   // the prompt attention's FP16 operands
+    float* att_om = nullptr;   // local: the merged-heads attention output [HKV][nt][G][HD] before the unpack
     size_t kAttScoreFloats = (size_t) 64 << 20;   // 256 MB (16 M floats when the experts' fit is close)
     // the prompt's MMQ experts
     bool use_mmq = false;
@@ -1343,6 +1375,7 @@ struct Engine {
             v16 = dalloc_t<__half>((size_t) g.n_head_kv * ctx * g.head_dim);
         }
         q16 = dalloc_t<__half>(T * g.n_head * g.head_dim);
+        att_om = dalloc(T * g.n_head * g.head_dim);
         use_mmq = MMQ::built() && std::getenv("STRATA_Q36_NO_MMQ") == nullptr;
         auto mmq_ok = [&](const Layer& L) {
             return MMQ::supported(L.L.gu_type) && MMQ::supported(L.L.d_type) && MMQ::fits(L.L.gu_type, 2 * g.n_ff) &&
@@ -1585,6 +1618,44 @@ struct Engine {
                 const size_t kv_stride = kv16 ? (size_t) ctx * HD : (size_t) P * HD;
                 if (!kv16)
                     k_kv_f16<<<grid1((int64_t) HKV * P * HD), kThreads, 0, st>>>(kc[li], vc[li], k16, v16, ctx, P, HD, HKV);
+                // local, opt-in STRATA_Q36_ATT_MERGED=1: measured +1.6% prompt at 32K on gfx1151 (498.5 vs 490.6 tok/s;
+                // hipBLAS's FP16 tiles stay the limit - 58% of a 32K prompt is these GEMMs), KL 2.9e-3 vs the batched
+                // path: kept off.  The real fix is a WMMA flash-attention prompt kernel.
+                static const bool merged = [] {
+                    const char* v = std::getenv("STRATA_Q36_ATT_MERGED");
+                    return v && v[0] == '1';
+                }();
+                if (merged && HD == 256) {
+                    for (int t0 = 0; t0 < T; t0 += tq) {
+                        const int nt = std::min(tq, T - t0), ncol = nt * G;
+                        k_q_repack<<<nt * H, HD, 0, st>>>(q, q16, t0, nt, H, G);
+                        for (int kvh = 0; kvh < HKV; ++kvh) {
+                            const __half* Kh = kbase16 + (size_t) kvh * kv_stride;
+                            const __half* Qm = q16 + (size_t) kvh * ncol * HD;
+                            float* Sh = att_s + (size_t) kvh * ncol * ldp;
+                            if (cublasGemmEx(blas, CUBLAS_OP_T, CUBLAS_OP_N, P, ncol, HD, &one, Kh, CUDA_R_16F, HD, Qm,
+                                             CUDA_R_16F, HD, &zero, Sh, CUDA_R_32F, ldp, CUBLAS_COMPUTE_32F,
+                                             CUBLAS_GEMM_DEFAULT) != CUBLAS_STATUS_SUCCESS) {
+                                std::fprintf(stderr, "strata-q36: merged attention scores GEMM failed\n");
+                                std::exit(1);
+                            }
+                        }
+                        k_attn_softmax16_m<<<dim3(ncol, HKV), kThreads, 0, st>>>(att_s, att_p16, ldp, nt, G, P,
+                                                                                 (int) p0 + t0, 1.0f / sqrtf((float) HD));
+                        for (int kvh = 0; kvh < HKV; ++kvh) {
+                            const __half* Vh = vbase16 + (size_t) kvh * kv_stride;
+                            const __half* Sh = att_p16 + (size_t) kvh * ncol * ldp;
+                            float* Om = att_om + (size_t) kvh * ncol * HD;
+                            if (cublasGemmEx(blas, CUBLAS_OP_N, CUBLAS_OP_N, HD, ncol, P, &one, Vh, CUDA_R_16F, HD, Sh,
+                                             CUDA_R_16F, ldp, &zero, Om, CUDA_R_32F, HD, CUBLAS_COMPUTE_32F,
+                                             CUBLAS_GEMM_DEFAULT) != CUBLAS_STATUS_SUCCESS) {
+                                std::fprintf(stderr, "strata-q36: merged attention values GEMM failed\n");
+                                std::exit(1);
+                            }
+                        }
+                        k_attn_unpack_gate<<<nt * H, HD, 0, st>>>(att_om, gate, att, t0, nt, H, G);
+                    }
+                } else {
                 k_to_f16<<<grid1((int64_t) T * H * HD), kThreads, 0, st>>>(q, q16, (int64_t) T * H * HD);
                 for (int t0 = 0; t0 < T; t0 += tq) {
                     const int nt = std::min(tq, T - t0);
@@ -1616,6 +1687,7 @@ struct Engine {
                     }
                 }
                 k_gate_mul<<<grid1((int64_t) T * H * HD), kThreads, 0, st>>>(att, gate, (int64_t) T * H * HD);
+                }
             } else {
                 // split-K over 256-cell chunks; the chunk grid covers every cell a row can see (graph mode: the whole
                 // context, past-the-end chunks return at once)
