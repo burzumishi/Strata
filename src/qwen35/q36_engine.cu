@@ -1401,7 +1401,9 @@ struct Engine {
         auto kv_alloc = [&](size_t n) -> float* {
             return kv16 ? reinterpret_cast<float*>(dalloc_t<__half>(n)) : dalloc(n);
         };
-        att_rows = (int) (g.n_head * std::min<int64_t>((int64_t) T, 64));   // 64 query tokens per attention batch
+        // local: the split-K path only serves batches of <= kGemmT rows (larger ones run as GEMMs), so kGemmT query
+        // tokens per attention batch (was 64: 2 GiB of partials at 524288 cells, 1.75 GiB of it never used)
+        att_rows = (int) (g.n_head * std::min<int64_t>((int64_t) T, kGemmT));
         pacc = dalloc((size_t) att_rows * n_chunk * g.head_dim);
         pm = dalloc((size_t) att_rows * n_chunk);
         pl = dalloc((size_t) att_rows * n_chunk);
@@ -2641,7 +2643,9 @@ int strata::qwen35::run(int argc, char** argv) {
     if (model.empty()) { std::fprintf(stderr, "strata-q36: --model is required\n"); return 2; }
 #if !defined(_WIN32)
     setenv("CUDA_MODULE_LOADING", "EAGER", 0);   // every kernel loaded with the context, not in the first prompt
-    setenv("STRATA_Q8_PACKED", "1", 0);   // the packed Q8_0 decode copy unless STRATA_Q8_PACKED is set otherwise
+    // local (gfx1151): no packed Q8_0 decode copy unless STRATA_Q8_PACKED=1 - on Strix Halo the plain blocks decode
+    // faster (35B-A3B Q8_0: 48.6 -> 51.4 tok/s) and the copy costs 1.8 GiB of the shared memory (upstream: "1")
+    setenv("STRATA_Q8_PACKED", "0", 0);
     setenv("STRATA_MMQ_KQ", "1", 0);      // the K-quant MMQ prompt kernels (every expert of this family is a K-quant)
 #else
     if (std::getenv("STRATA_MMQ_KQ") == nullptr) _putenv_s("STRATA_MMQ_KQ", "1");
@@ -2657,6 +2661,11 @@ int strata::qwen35::run(int argc, char** argv) {
         std::fprintf(stderr, "strata-q36: %s\n", e.what());
         return 1;
     }
+#if !defined(_WIN32)
+    // local: a dense 27B's prompt projections on llama.cpp's int8 MMQ (gfx1151: 80 -> 190+ tok/s at 4K; the FP16
+    // dequantize + hipBLAS GEMMs run at ~4 TFLOPS on these shapes).  STRATA_DENSE_MMQ=0 keeps the FP16 path.
+    if (m.dense) setenv("STRATA_DENSE_MMQ", "1", 0);
+#endif
     if (kv16 && m.g.n_head != 8 * m.g.n_head_kv && m.g.n_head != 6 * m.g.n_head_kv) {
         std::fprintf(stderr, "strata-q36: --kv f16 needs 6 or 8 query heads per KV head (this model: %lld / %lld)\n",
                      (long long) m.g.n_head, (long long) m.g.n_head_kv);

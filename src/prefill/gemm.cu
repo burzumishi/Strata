@@ -813,7 +813,7 @@ void Gemm::f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_
 bool Gemm::native_mmq(const uint16_t* X, int type, const void* W, float* Y, int64_t T, int64_t N, int64_t K,
                       int64_t ldy) {
     namespace mmq = strata::prefill::mmq;
-    constexpr int64_t kRows = 1024, kMaxK = 8192;
+    constexpr int64_t kRows = 1024, kMaxK = 18432;   // local: 18432 (was 8192) takes the dense 27B's ffn_down (K 17408)
     static const bool enabled = [] {
         const char* e = std::getenv("STRATA_DENSE_MMQ");
         return e && e[0] == '1';
