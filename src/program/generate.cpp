@@ -1829,7 +1829,7 @@ int main(int argc, char** argv) {
         // `strata --families`: the GGUF architectures this build runs (setup asks before it installs one)
         if (std::strcmp(argv[i], "--families") == 0) {
 #if defined(STRATA_HAVE_QWEN35)
-            std::printf("qwen4exp qwen35moe\n");
+            std::printf("qwen4exp qwen35moe qwen35\n");
 #else
             std::printf("qwen4exp\n");
 #endif
@@ -1891,7 +1891,8 @@ int main(int argc, char** argv) {
         bool qwen35 = false;
         try {
             const strata::GgufFile meta(strata::gguf_split_paths(argv[i + 1]).front());
-            qwen35 = strata::model_family(meta) == strata::ModelFamily::Qwen35Moe;
+            const strata::ModelFamily fam = strata::model_family(meta);
+            qwen35 = fam == strata::ModelFamily::Qwen35Moe || fam == strata::ModelFamily::Qwen35;   // local: + dense 27B
         } catch (const std::exception&) {
             // not readable here: the normal path below reports it
         }
