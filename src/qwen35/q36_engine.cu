@@ -36,6 +36,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <type_traits>
 #include <cctype>
 #if !defined(_WIN32)
 #include <sys/mman.h>
@@ -244,7 +245,7 @@ template <class KV>
 __global__ void k_attn_prep(const float* qg, const float* kx, const float* vx, const float* qw, const float* kw,
                             float* q, float* gate, KV* kc, KV* vc, int H, int HKV, int HD, int n_rot,
                             const int32_t* pos0, int ctx, float base, float eps, float fs, float ext, float lo, float hi,
-                            float ms) {
+                            float ms, __half* ksc = nullptr, __half* vsc = nullptr) {
     __shared__ float sh[kThreads];
     __shared__ float buf[256];
     const int head = blockIdx.x, t = blockIdx.y;
@@ -283,9 +284,34 @@ __global__ void k_attn_prep(const float* qg, const float* kx, const float* vx, c
         gate[((size_t) t * H + head) * HD + i] = qg[((size_t) t * H + head) * 2 * HD + HD + i];
     } else {
         const int kh = head - H;
-        kc[((size_t) kh * ctx + pos) * HD + i] = (KV) v;
-        vc[((size_t) kh * ctx + pos) * HD + i] = (KV) vx[((size_t) t * HKV + kh) * HD + i];
+        const size_t row = (size_t) kh * ctx + pos;
+        const float vv = vx[((size_t) t * HKV + kh) * HD + i];
+        if constexpr (std::is_same<KV, int8_t>::value) {
+            // local (--kv int8): Q8_0 groups of 32 - a wave32 is one group (HD 256 = 8 groups, ksc / vsc [row][8])
+            float ka = fabsf(v), va = fabsf(vv);
+            for (int o = 16; o > 0; o >>= 1) {
+                ka = fmaxf(ka, __shfl_xor_sync(0xffffffffu, ka, o));
+                va = fmaxf(va, __shfl_xor_sync(0xffffffffu, va, o));
+            }
+            const __half kd = __float2half(ka / 127.0f), vd = __float2half(va / 127.0f);
+            const float kf = __half2float(kd), vf = __half2float(vd);
+            kc[row * HD + i] = (int8_t) (kf > 0.f ? fmaxf(-127.f, fminf(127.f, rintf(v / kf))) : 0.f);
+            vc[row * HD + i] = (int8_t) (vf > 0.f ? fmaxf(-127.f, fminf(127.f, rintf(vv / vf))) : 0.f);
+            if ((i & 31) == 0) {
+                ksc[row * 8 + (i >> 5)] = kd;
+                vsc[row * 8 + (i >> 5)] = vd;
+            }
+        } else {
+            kc[row * HD + i] = (KV) v;
+            vc[row * HD + i] = (KV) vv;
+        }
     }
+}
+/// local: one K/V value as float - FP32 / FP16 as stored, int8 times its Q8_0 group's scale (`sc` [row][8]).
+template <class KV>
+__device__ __forceinline__ float kv_ld(const KV* base, const __half* sc, size_t row, int d) {
+    if constexpr (std::is_same<KV, int8_t>::value) return (float) base[row * 256 + d] * __half2float(sc[row * 8 + (d >> 5)]);
+    else return (float) base[row * 256 + d];
 }
 
 /// Split-K attention, one block per (chunk of 256 cells, query row): query row qi = t * H + h (t from t0) sees the
@@ -336,7 +362,8 @@ __global__ void k_attn_part(const float* q, const float* kc, const float* vc, co
 template <int G, class KV>
 __global__ void __launch_bounds__(256) k_attn_part_g(const float* q, const KV* kc, const KV* vc, const int32_t* pos0,
                                                      int t0, int H, int HKV, int ctx, float scale, int n_chunk,
-                                                     float* pacc, float* pm, float* pl) {
+                                                     float* pacc, float* pm, float* pl, const __half* ksc = nullptr,
+                                                     const __half* vsc = nullptr) {
     constexpr int HD = 256, NW = 8;
     __shared__ float sc[G][kChunkCells];
     __shared__ float qs[G][HD];
@@ -360,18 +387,17 @@ __global__ void __launch_bounds__(256) k_attn_part_g(const float* q, const KV* k
             qr[g][i] = qs[g][4 * lane + i];
             qr[g][4 + i] = qs[g][128 + 4 * lane + i];
         }
-    const KV* kbase = kc + ((size_t) kvh * ctx + p0) * HD;
     for (int pi = w; pi < kChunkCells; pi += NW) {
         float a[G];
 #pragma unroll
         for (int g = 0; g < G; ++g) a[g] = 0.f;
         if (pi < n) {
-            const KV* kp = kbase + (size_t) pi * HD;
+            const size_t krow = (size_t) kvh * ctx + p0 + pi;
             float kv[8];
 #pragma unroll
             for (int i = 0; i < 4; ++i) {
-                kv[i] = (float) kp[4 * lane + i];
-                kv[4 + i] = (float) kp[128 + 4 * lane + i];
+                kv[i] = kv_ld(kc, ksc, krow, 4 * lane + i);
+                kv[4 + i] = kv_ld(kc, ksc, krow, 128 + 4 * lane + i);
             }
 #pragma unroll
             for (int g = 0; g < G; ++g)
@@ -408,9 +434,9 @@ __global__ void __launch_bounds__(256) k_attn_part_g(const float* q, const KV* k
     float acc[G];
 #pragma unroll
     for (int g = 0; g < G; ++g) acc[g] = 0.f;
-    const KV* vp = vc + ((size_t) kvh * ctx + p0) * HD + j;
+    const size_t vrow0 = (size_t) kvh * ctx + p0;
     for (int k = 0; k < n; ++k) {
-        const float v = (float) vp[(size_t) k * HD];
+        const float v = kv_ld(vc, vsc, vrow0 + k, j);
 #pragma unroll
         for (int g = 0; g < G; ++g) acc[g] += sc[g][k] * v;
     }
@@ -580,10 +606,28 @@ __global__ void k_attn_unpack_gate(const float* om, const float* gate, float* at
 /// grid (ceil(T / (64 / G)), HKV), block 256.
 typedef _Float16 fa_h16 __attribute__((ext_vector_type(16)));
 typedef float fa_f8 __attribute__((ext_vector_type(8)));
-template <int G>
-__global__ void __launch_bounds__(256) k_fa_prompt(const float* __restrict__ q, const __half* __restrict__ kc,
-                                                   const __half* __restrict__ vc, const float* __restrict__ gate,
-                                                   float* __restrict__ att, int T, int p0, int H, int ctx, float scale) {
+/// local: 8 K/V values of row `row` from dim d8 as 8 FP16 (one uint4): FP16 as stored, int8 dequantized (Q8_0 scale).
+template <class KV>
+__device__ __forceinline__ uint4 kv_ld8(const KV* base, const __half* sc, size_t row, int d8) {
+    if constexpr (std::is_same<KV, int8_t>::value) {
+        const uint2 raw = *reinterpret_cast<const uint2*>(base + row * 256 + d8);
+        const int8_t* b = reinterpret_cast<const int8_t*>(&raw);
+        const float d = __half2float(sc[row * 8 + (d8 >> 5)]);
+        uint4 out;
+        _Float16* h = reinterpret_cast<_Float16*>(&out);
+#pragma unroll
+        for (int j = 0; j < 8; ++j) h[j] = (_Float16) ((float) b[j] * d);
+        return out;
+    } else {
+        return *reinterpret_cast<const uint4*>(base + row * 256 + d8);
+    }
+}
+template <int G, class KV = __half>
+__global__ void __launch_bounds__(256) k_fa_prompt(const float* __restrict__ q, const KV* __restrict__ kc,
+                                                   const KV* __restrict__ vc, const float* __restrict__ gate,
+                                                   float* __restrict__ att, int T, int p0, int H, int ctx, float scale,
+                                                   const __half* __restrict__ ksc = nullptr,
+                                                   const __half* __restrict__ vsc = nullptr) {
 #if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__) || \
     defined(__gfx1150__) || defined(__gfx1151__)
     constexpr int HD = 256, R = 64, QT = R / G, KC = 32, QS = HD + 8, KS = HD + 8, SS = KC + 1, PS = KC + 8;
@@ -614,15 +658,14 @@ __global__ void __launch_bounds__(256) k_fa_prompt(const float* __restrict__ q, 
     const int t_last = min(T, tb + QT) - 1;
     const int kmax = p0 + t_last;   // the last key any row of the block sees
     const int nkc = kmax / KC + 1;
-    const __half* kbase = kc + (size_t) kvh * ctx * HD;
-    const __half* vbase = vc + (size_t) kvh * ctx * HD;
+    const size_t row0 = (size_t) kvh * ctx;
     __syncthreads();
     for (int c = 0; c < nkc; ++c) {
         const int c0 = c * KC;
         for (int i = t; i < KC * HD / 8; i += 256) {   // K rows of the chunk, 16 bytes at a time
             const int k = i / (HD / 8), d8 = (i % (HD / 8)) * 8;
             uint4 v = make_uint4(0, 0, 0, 0);
-            if (c0 + k <= kmax) v = *reinterpret_cast<const uint4*>(kbase + (size_t) (c0 + k) * HD + d8);
+            if (c0 + k <= kmax) v = kv_ld8(kc, ksc, row0 + c0 + k, d8);
             *reinterpret_cast<uint4*>(&KVs[k * KS + d8]) = v;
         }
         __syncthreads();
@@ -649,7 +692,7 @@ __global__ void __launch_bounds__(256) k_fa_prompt(const float* __restrict__ q, 
         for (int i = t; i < KC * HD / 8; i += 256) {   // the chunk's V rows into the same buffer
             const int k = i / (HD / 8), d8 = (i % (HD / 8)) * 8;
             uint4 v = make_uint4(0, 0, 0, 0);
-            if (c0 + k <= kmax) v = *reinterpret_cast<const uint4*>(vbase + (size_t) (c0 + k) * HD + d8);
+            if (c0 + k <= kmax) v = kv_ld8(vc, vsc, row0 + c0 + k, d8);
             *reinterpret_cast<uint4*>(&KVs[k * KS + d8]) = v;
         }
         {   // online softmax: 4 threads per row, 8 cells each
@@ -1400,6 +1443,8 @@ struct Engine {
     int n_chunk = 0, att_rows = 0;   // attention partials: att_rows query rows x n_chunk chunks
     std::vector<float*> conv, S, kc, vc;   // per layer; the MTP block's K / V at index n_layers
     bool kv16 = false;   // local (--kv f16): kc / vc hold __half (reinterpreted), the prompt GEMMs read them in place
+    bool kv8 = false;    // local (--kv int8): kc / vc hold int8 Q8_0 rows, kcs / vcs their FP16 scales [row][8]
+    std::vector<__half*> kcs, vcs;
     // verify windows (T <= kVerify): the GDN inputs of every row per layer, kept for the commit
     static constexpr int kVerify = 8;
     std::vector<float*> v_qkv, v_hc, v_alpha, v_beta;
@@ -1515,7 +1560,7 @@ struct Engine {
         // dense 27B, which has no router - sized by n_expert alone it overflowed)
         sk_part = dalloc((size_t) kSplitK * T * std::max<int64_t>(g.n_expert + 1, g.ssm_v_heads));
         att_p16 = dalloc_t<__half>(kAttScoreFloats);
-        if (!kv16) {   // local: with --kv f16 the cache itself is the GEMMs' FP16 operand
+        if (!kv16 && !kv8) {   // local: with --kv f16 the cache itself is the GEMMs' FP16 operand (int8: the FA reads it)
             k16 = dalloc_t<__half>((size_t) g.n_head_kv * ctx * g.head_dim);
             v16 = dalloc_t<__half>((size_t) g.n_head_kv * ctx * g.head_dim);
         }
@@ -1577,7 +1622,11 @@ struct Engine {
         CK(cudaHostAlloc((void**) &hpin, 64 * sizeof(int32_t), cudaHostAllocDefault));
         n_chunk = (ctx + kChunkCells - 1) / kChunkCells;
         auto kv_alloc = [&](size_t n) -> float* {
+            if (kv8) return reinterpret_cast<float*>(dalloc_t<int8_t>(n));
             return kv16 ? reinterpret_cast<float*>(dalloc_t<__half>(n)) : dalloc(n);
+        };
+        auto sc_alloc = [&](bool attn_layer) -> __half* {   // local: int8 K/V scales (one FP16 per 32 values)
+            return kv8 && attn_layer ? dalloc_t<__half>((size_t) g.n_head_kv * ctx * (g.head_dim / 32)) : nullptr;
         };
         // local: the split-K path only serves batches of <= kGemmT rows (larger ones run as GEMMs), so kGemmT query
         // tokens per attention batch (was 64: 2 GiB of partials at 524288 cells, 1.75 GiB of it never used)
@@ -1591,12 +1640,16 @@ struct Engine {
                 S.push_back(nullptr);
                 kc.push_back(kv_alloc((size_t) g.n_head_kv * ctx * g.head_dim));
                 vc.push_back(kv_alloc((size_t) g.n_head_kv * ctx * g.head_dim));
+                kcs.push_back(sc_alloc(true));
+                vcs.push_back(sc_alloc(true));
                 for (auto* v : {&v_qkv, &v_hc, &v_alpha, &v_beta}) v->push_back(nullptr);
             } else {
                 conv.push_back(dalloc(C * (g.ssm_d_conv - 1)));
                 S.push_back(dalloc((size_t) g.ssm_v_heads * g.ssm_state_size * g.ssm_state_size));
                 kc.push_back(nullptr);
                 vc.push_back(nullptr);
+                kcs.push_back(nullptr);
+                vcs.push_back(nullptr);
                 v_qkv.push_back(dalloc((size_t) kVerify * C));
                 v_hc.push_back(dalloc((size_t) kVerify * C));
                 v_alpha.push_back(dalloc((size_t) kVerify * g.ssm_v_heads));
@@ -1608,6 +1661,8 @@ struct Engine {
             S.push_back(nullptr);
             kc.push_back(kv_alloc((size_t) g.n_head_kv * ctx * g.head_dim));
             vc.push_back(kv_alloc((size_t) g.n_head_kv * ctx * g.head_dim));
+            kcs.push_back(sc_alloc(true));
+            vcs.push_back(sc_alloc(true));
             mtp_cat = dalloc(T * 2 * N);
             hmtp = dalloc(T * N);
             logits_m = dalloc((size_t) g.n_vocab);
@@ -1739,7 +1794,12 @@ struct Engine {
             apply(L.wq, xq, qg, T);
             apply(L.wk, xq, kx, T);
             apply(L.wv, xq, vx, T);
-            if (kv16)
+            if (kv8)
+                k_attn_prep<int8_t><<<dim3(H + HKV, T), kThreads, 0, st>>>(
+                    qg, kx, vx, L.q_norm, L.k_norm, q, gate, reinterpret_cast<int8_t*>(kc[li]),
+                    reinterpret_cast<int8_t*>(vc[li]), H, HKV, HD, m->n_rot, dpos, ctx, m->rope_base, m->eps,
+                    m->rope_freq_scale, m->yarn_ext, m->yarn_lo, m->yarn_hi, m->yarn_mscale, kcs[li], vcs[li]);
+            else if (kv16)
                 k_attn_prep<__half><<<dim3(H + HKV, T), kThreads, 0, st>>>(
                     qg, kx, vx, L.q_norm, L.k_norm, q, gate, reinterpret_cast<__half*>(kc[li]),
                     reinterpret_cast<__half*>(vc[li]), H, HKV, HD, m->n_rot, dpos, ctx, m->rope_base, m->eps,
@@ -1761,14 +1821,25 @@ struct Engine {
                 const __half* kbase16 = kv16 ? reinterpret_cast<const __half*>(kc[li]) : k16;
                 const __half* vbase16 = kv16 ? reinterpret_cast<const __half*>(vc[li]) : v16;
                 const size_t kv_stride = kv16 ? (size_t) ctx * HD : (size_t) P * HD;
-                if (!kv16)
+                if (!kv16 && !kv8)
                     k_kv_f16<<<grid1((int64_t) HKV * P * HD), kThreads, 0, st>>>(kc[li], vc[li], k16, v16, ctx, P, HD, HKV);
                 // local: the WMMA flash attention (default with --kv f16 on gfx11; STRATA_Q36_FA=0 keeps the GEMMs)
                 static const bool fa_on = [] {
                     const char* v = std::getenv("STRATA_Q36_FA");
                     return !(v && v[0] == '0');
                 }();
-                if (fa_on && kv16 && HD == 256 && (G == 8 || G == 6)) {
+                if (kv8) {   // local: int8 K/V only through the FA (checked at start: gfx11, G 6 / 8)
+                    const float scl = 1.0f / sqrtf((float) HD);
+                    const int8_t* k8 = reinterpret_cast<const int8_t*>(kc[li]);
+                    const int8_t* v8 = reinterpret_cast<const int8_t*>(vc[li]);
+                    if (G == 8)
+                        k_fa_prompt<8, int8_t><<<dim3((T + 7) / 8, HKV), 256, 0, st>>>(q, k8, v8, gate, att, T, (int) p0,
+                                                                                       H, ctx, scl, kcs[li], vcs[li]);
+                    else
+                        k_fa_prompt<6, int8_t><<<dim3((T + 9) / 10, HKV), 256, 0, st>>>(q, k8, v8, gate, att, T,
+                                                                                        (int) p0, H, ctx, scl, kcs[li],
+                                                                                        vcs[li]);
+                } else if (fa_on && kv16 && HD == 256 && (G == 8 || G == 6)) {
                     const float scl = 1.0f / sqrtf((float) HD);
                     const __half* k16p = reinterpret_cast<const __half*>(kc[li]);
                     const __half* v16p = reinterpret_cast<const __half*>(vc[li]);
@@ -1860,7 +1931,15 @@ struct Engine {
                                               : (int) std::min<int64_t>(n_chunk, (p0 + t0 + nt + kChunkCells - 1) / kChunkCells);
                     const float sc = 1.0f / sqrtf((float) HD);
                     static const bool old_attn = std::getenv("STRATA_Q36_ATTN_OLD") != nullptr;   // local: A/B
-                    if (kv16 && H == 8 * HKV)
+                    if (kv8 && H == 8 * HKV)
+                        k_attn_part_g<8, int8_t><<<dim3(nc, nt * HKV), 256, 0, st>>>(
+                            q, reinterpret_cast<const int8_t*>(kc[li]), reinterpret_cast<const int8_t*>(vc[li]), dpos, t0,
+                            H, HKV, ctx, sc, n_chunk, pacc, pm, pl, kcs[li], vcs[li]);
+                    else if (kv8 && H == 6 * HKV)
+                        k_attn_part_g<6, int8_t><<<dim3(nc, nt * HKV), 256, 0, st>>>(
+                            q, reinterpret_cast<const int8_t*>(kc[li]), reinterpret_cast<const int8_t*>(vc[li]), dpos, t0,
+                            H, HKV, ctx, sc, n_chunk, pacc, pm, pl, kcs[li], vcs[li]);
+                    else if (kv16 && H == 8 * HKV)
                         k_attn_part_g<8, __half><<<dim3(nc, nt * HKV), 256, 0, st>>>(
                             q, reinterpret_cast<const __half*>(kc[li]), reinterpret_cast<const __half*>(vc[li]), dpos, t0,
                             H, HKV, ctx, sc, n_chunk, pacc, pm, pl);
@@ -2811,7 +2890,7 @@ int strata::qwen35::run(int argc, char** argv) {
     bool warm = true;
     int expert_slots = 0;
     bool serve_mode = false, graph = true;
-    bool kv16 = false;                                   // local: --kv f16
+    bool kv16 = false, kv8 = false;                      // local: --kv f16 / int8
     std::string rope_scaling;                            // local: --rope-scaling yarn
     double rope_scale = 1.0;
     int yarn_orig_ctx = 0;
@@ -2853,8 +2932,9 @@ int strata::qwen35::run(int argc, char** argv) {
         else if (a == "--kv") {   // local: f16 halves the K/V cache and its reads; f32 (default) as upstream
             const std::string v = next();
             if (v == "f16" || v == "fp16") kv16 = true;
-            else if (v == "f32" || v == "fp32") kv16 = false;
-            else { std::fprintf(stderr, "strata-q36: --kv takes f16 or f32 (not %s)\n", v.c_str()); return 2; }
+            else if (v == "int8" || v == "q8_0") kv8 = true;   // local: Q8_0 K/V (half of f16; needs the FA)
+            else if (v == "f32" || v == "fp32") kv16 = kv8 = false;
+            else { std::fprintf(stderr, "strata-q36: --kv takes f16, int8 or f32 (not %s)\n", v.c_str()); return 2; }
         }
         else if (a == "--rope-scaling") rope_scaling = next();
         else if (a == "--rope-scale") rope_scale = std::atof(next().c_str());
@@ -2900,7 +2980,12 @@ int strata::qwen35::run(int argc, char** argv) {
     // dequantize + hipBLAS GEMMs run at ~4 TFLOPS on these shapes).  STRATA_DENSE_MMQ=0 keeps the FP16 path.
     if (m.dense) setenv("STRATA_DENSE_MMQ", "1", 0);
 #endif
-    if (kv16 && m.g.n_head != 8 * m.g.n_head_kv && m.g.n_head != 6 * m.g.n_head_kv) {
+    if (kv8) {
+        const char* fa = std::getenv("STRATA_Q36_FA");
+        if (fa && fa[0] == '0') { std::fprintf(stderr, "strata-q36: --kv int8 needs the FA (STRATA_Q36_FA=0 set)\n"); return 2; }
+        kv16 = false;
+    }
+    if ((kv16 || kv8) && m.g.n_head != 8 * m.g.n_head_kv && m.g.n_head != 6 * m.g.n_head_kv) {
         std::fprintf(stderr, "strata-q36: --kv f16 needs 6 or 8 query heads per KV head (this model: %lld / %lld)\n",
                      (long long) m.g.n_head, (long long) m.g.n_head_kv);
         return 2;
@@ -2924,7 +3009,9 @@ int strata::qwen35::run(int argc, char** argv) {
     Engine E;
     E.use_graph = graph;
     E.kv16 = kv16;
+    E.kv8 = kv8;
     if (kv16) std::fprintf(stderr, "strata-q36: K/V cache in FP16\n");
+    if (kv8) std::fprintf(stderr, "strata-q36: K/V cache in int8 (Q8_0 groups of 32)\n");
     if (chunk == 0) {
         // auto: 512 with every expert in VRAM; 2048 when they will not all fit (a prompt chunk streams every layer's
         // experts over PCIe once, so a bigger chunk pays that once for more tokens)
