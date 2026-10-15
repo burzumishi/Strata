@@ -571,6 +571,151 @@ __global__ void k_attn_unpack_gate(const float* om, const float* gate, float* at
     const size_t o = ((size_t) (t0 + t) * H + h) * 256 + d;
     att[o] = om[(((size_t) kvh * nt + t) * G + g) * 256 + d] * sigm(gate[o]);
 }
+/// local (gfx11 WMMA): causal flash attention for a prompt chunk on the FP16 K/V cache (--kv f16), the output gate
+/// fused.  One block of 256 threads (8 waves) per (8 / 10 query tokens x G heads = 64 rows, KV head): the K / V rows
+/// are read once for the G heads that share them, 32 cells at a time; S = Q K^T and O += P V on
+/// v_wmma_f32_16x16x16_f16 with FP32 accumulation and an online softmax (FP16 probabilities, as the GEMM path's
+/// P V).  Replaces the hipBLAS score / value GEMMs (58% of a 32K prompt on gfx1151, small Tensile tiles).
+/// q [T][H][HD] f32 (chunk rows), kc / vc [HKV][ctx][HD] f16, positions p0 + t; att [T][H][HD] = O * sigmoid(gate).
+/// grid (ceil(T / (64 / G)), HKV), block 256.
+typedef _Float16 fa_h16 __attribute__((ext_vector_type(16)));
+typedef float fa_f8 __attribute__((ext_vector_type(8)));
+template <int G>
+__global__ void __launch_bounds__(256) k_fa_prompt(const float* __restrict__ q, const __half* __restrict__ kc,
+                                                   const __half* __restrict__ vc, const float* __restrict__ gate,
+                                                   float* __restrict__ att, int T, int p0, int H, int ctx, float scale) {
+#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__) || \
+    defined(__gfx1150__) || defined(__gfx1151__)
+    constexpr int HD = 256, R = 64, QT = R / G, KC = 32, QS = HD + 8, KS = HD + 8, SS = KC + 1, PS = KC + 8;
+    __shared__ __attribute__((aligned(16))) _Float16 Qs[R * QS];    // the block's queries (x scale), FP16
+    // the chunk's K, then its V (row-major: a transposed V was measured slower, its scattered LDS stores conflict)
+    __shared__ __attribute__((aligned(16))) _Float16 KVs[KC * KS];
+    __shared__ __attribute__((aligned(16))) float Ss[R * SS];       // scores; the FP16 P overlays them
+    __shared__ float mrow[R], lrow[R], arow[R];
+    _Float16* Ph = reinterpret_cast<_Float16*>(Ss);
+    const int kvh = blockIdx.y, tb = blockIdx.x * QT;
+    const int t = threadIdx.x, lane = t & 31, w = t >> 5, col = lane & 15, half = lane >> 4;
+    const int nrow = QT * G;   // rows in use (G 6: 60 of 64)
+    for (int i = t; i < R * HD; i += 256) {
+        const int r = i / HD, d = i % HD, tq = r / G;
+        float v = 0.f;
+        if (r < nrow && tb + tq < T) v = q[((size_t) (tb + tq) * H + kvh * G + r % G) * HD + d] * scale;
+        Qs[r * QS + d] = (_Float16) v;
+    }
+    if (t < R) {
+        mrow[t] = -INFINITY;
+        lrow[t] = 0.f;
+        arow[t] = 0.f;
+    }
+    const int mt = w >> 1, snt = w & 1, dh = (w & 1) * 128;
+    fa_f8 acc[8];
+#pragma unroll
+    for (int n = 0; n < 8; ++n) acc[n] = fa_f8{0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+    const int t_last = min(T, tb + QT) - 1;
+    const int kmax = p0 + t_last;   // the last key any row of the block sees
+    const int nkc = kmax / KC + 1;
+    const __half* kbase = kc + (size_t) kvh * ctx * HD;
+    const __half* vbase = vc + (size_t) kvh * ctx * HD;
+    __syncthreads();
+    for (int c = 0; c < nkc; ++c) {
+        const int c0 = c * KC;
+        for (int i = t; i < KC * HD / 8; i += 256) {   // K rows of the chunk, 16 bytes at a time
+            const int k = i / (HD / 8), d8 = (i % (HD / 8)) * 8;
+            uint4 v = make_uint4(0, 0, 0, 0);
+            if (c0 + k <= kmax) v = *reinterpret_cast<const uint4*>(kbase + (size_t) (c0 + k) * HD + d8);
+            *reinterpret_cast<uint4*>(&KVs[k * KS + d8]) = v;
+        }
+        __syncthreads();
+        {   // S tile (mt, snt): rows mt*16.., cells snt*16..
+            fa_f8 sacc = fa_f8{0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+#pragma unroll 4
+            for (int kk = 0; kk < HD / 16; ++kk) {
+                fa_h16 a, b;
+#pragma unroll
+                for (int i = 0; i < 16; ++i) {
+                    a[i] = Qs[(mt * 16 + col) * QS + kk * 16 + i];
+                    b[i] = KVs[(snt * 16 + col) * KS + kk * 16 + i];
+                }
+                sacc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, sacc);
+            }
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const int r = mt * 16 + 2 * i + half, key = c0 + snt * 16 + col, tq = r / G;
+                const bool ok = r < nrow && tb + tq < T && key <= p0 + tb + tq;
+                Ss[r * SS + snt * 16 + col] = ok ? sacc[i] : -INFINITY;
+            }
+        }
+        __syncthreads();
+        for (int i = t; i < KC * HD / 8; i += 256) {   // the chunk's V rows into the same buffer
+            const int k = i / (HD / 8), d8 = (i % (HD / 8)) * 8;
+            uint4 v = make_uint4(0, 0, 0, 0);
+            if (c0 + k <= kmax) v = *reinterpret_cast<const uint4*>(vbase + (size_t) (c0 + k) * HD + d8);
+            *reinterpret_cast<uint4*>(&KVs[k * KS + d8]) = v;
+        }
+        {   // online softmax: 4 threads per row, 8 cells each
+            const int r = t >> 2, sub = t & 3;
+            float x[8], mx = -INFINITY;
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                x[j] = Ss[r * SS + sub * 8 + j];
+                mx = fmaxf(mx, x[j]);
+            }
+            mx = fmaxf(mx, __shfl_xor(mx, 1));
+            mx = fmaxf(mx, __shfl_xor(mx, 2));
+            const float mold = mrow[r], mnew = fmaxf(mold, mx);
+            float p[8], ps = 0.f;
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                p[j] = mnew == -INFINITY ? 0.f : expf(x[j] - mnew);
+                ps += p[j];
+            }
+            ps += __shfl_xor(ps, 1);
+            ps += __shfl_xor(ps, 2);
+            __syncthreads();   // every S read before the P writes that overlay it
+            if (sub == 0) {
+                const float al = mold == -INFINITY ? 0.f : expf(mold - mnew);
+                arow[r] = al;
+                lrow[r] = lrow[r] * al + ps;
+                mrow[r] = mnew;
+            }
+#pragma unroll
+            for (int j = 0; j < 8; ++j) Ph[r * PS + sub * 8 + j] = (_Float16) p[j];
+        }
+        __syncthreads();
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const float al = arow[mt * 16 + 2 * i + half];
+#pragma unroll
+            for (int n = 0; n < 8; ++n) acc[n][i] *= al;
+        }
+#pragma unroll
+        for (int ks = 0; ks < KC / 16; ++ks) {
+            fa_h16 a;
+#pragma unroll
+            for (int i = 0; i < 16; ++i) a[i] = Ph[(mt * 16 + col) * PS + ks * 16 + i];
+#pragma unroll
+            for (int n = 0; n < 8; ++n) {
+                fa_h16 b;
+#pragma unroll
+                for (int i = 0; i < 16; ++i) b[i] = KVs[(ks * 16 + i) * KS + dh + n * 16 + col];
+                acc[n] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, acc[n]);
+            }
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const int r = mt * 16 + 2 * i + half, tq = r / G;
+        if (r >= nrow || tb + tq >= T) continue;
+        const float inv = 1.0f / lrow[r];
+        const size_t ob = ((size_t) (tb + tq) * H + kvh * G + r % G) * HD + dh + col;
+#pragma unroll
+        for (int n = 0; n < 8; ++n) att[ob + n * 16] = acc[n][i] * inv * sigm(gate[ob + n * 16]);
+    }
+#else
+    __trap();
+#endif
+}
 /// att *= sigmoid(gate) (the attention output gate), n values.
 __global__ void k_gate_mul(float* att, const float* gate, int64_t n) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
@@ -1618,6 +1763,22 @@ struct Engine {
                 const size_t kv_stride = kv16 ? (size_t) ctx * HD : (size_t) P * HD;
                 if (!kv16)
                     k_kv_f16<<<grid1((int64_t) HKV * P * HD), kThreads, 0, st>>>(kc[li], vc[li], k16, v16, ctx, P, HD, HKV);
+                // local: the WMMA flash attention (default with --kv f16 on gfx11; STRATA_Q36_FA=0 keeps the GEMMs)
+                static const bool fa_on = [] {
+                    const char* v = std::getenv("STRATA_Q36_FA");
+                    return !(v && v[0] == '0');
+                }();
+                if (fa_on && kv16 && HD == 256 && (G == 8 || G == 6)) {
+                    const float scl = 1.0f / sqrtf((float) HD);
+                    const __half* k16p = reinterpret_cast<const __half*>(kc[li]);
+                    const __half* v16p = reinterpret_cast<const __half*>(vc[li]);
+                    if (G == 8)
+                        k_fa_prompt<8><<<dim3((T + 7) / 8, HKV), 256, 0, st>>>(q, k16p, v16p, gate, att, T, (int) p0, H,
+                                                                               ctx, scl);
+                    else
+                        k_fa_prompt<6><<<dim3((T + 9) / 10, HKV), 256, 0, st>>>(q, k16p, v16p, gate, att, T, (int) p0,
+                                                                                H, ctx, scl);
+                } else {
                 // local, opt-in STRATA_Q36_ATT_MERGED=1: measured +1.6% prompt at 32K on gfx1151 (498.5 vs 490.6 tok/s;
                 // hipBLAS's FP16 tiles stay the limit - 58% of a 32K prompt is these GEMMs), KL 2.9e-3 vs the batched
                 // path: kept off.  The real fix is a WMMA flash-attention prompt kernel.
@@ -1688,6 +1849,7 @@ struct Engine {
                 }
                 k_gate_mul<<<grid1((int64_t) T * H * HD), kThreads, 0, st>>>(att, gate, (int64_t) T * H * HD);
                 }
+                }   // the FA else
             } else {
                 // split-K over 256-cell chunks; the chunk grid covers every cell a row can see (graph mode: the whole
                 // context, past-the-end chunks return at once)
