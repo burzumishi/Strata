@@ -2978,7 +2978,8 @@ int strata::qwen35::run(int argc, char** argv) {
 #if !defined(_WIN32)
     // local: a dense 27B's prompt projections on llama.cpp's int8 MMQ (gfx1151: 80 -> 190+ tok/s at 4K; the FP16
     // dequantize + hipBLAS GEMMs run at ~4 TFLOPS on these shapes).  STRATA_DENSE_MMQ=0 keeps the FP16 path.
-    if (m.dense) setenv("STRATA_DENSE_MMQ", "1", 0);
+    // (also the 35B-A3B's dense projections: 32K prompt 635 -> 910 tok/s, 38% of it was these GEMMs after the FA)
+    setenv("STRATA_DENSE_MMQ", "1", 0);
 #endif
     if (kv8) {
         const char* fa = std::getenv("STRATA_Q36_FA");
