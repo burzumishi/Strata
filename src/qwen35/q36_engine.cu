@@ -36,6 +36,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <functional>
 #include <type_traits>
 #include <cctype>
 #if !defined(_WIN32)
@@ -2367,7 +2368,10 @@ struct Engine {
     /// tokens of the rows the block must redo first (the drafts the last window accepted, seeded by hmain rows
     /// 0 .. fix.size() - 1 of that window).  Drafts d1 .. dD, then the window [x, d1 .. dD] through the main model;
     /// returns the accepted count a and writes the picks of rows 0 .. a (row a's pick is the token after them).
-    int spec_step(int x_tok, const std::vector<int32_t>& fix, int D, std::vector<int32_t>& drafts, int32_t* picks) {
+    /// local: `sampler` (sampled requests) picks each verify row's token from its logits (host copy); a draft is kept
+    /// while it equals the sampled token, so every emitted token is a sample of the model's own distribution.
+    int spec_step(int x_tok, const std::vector<int32_t>& fix, int D, std::vector<int32_t>& drafts, int32_t* picks,
+                  const std::function<int32_t(const float*, int)>* sampler = nullptr) {
         const int N = (int) m->g.n_embd;
         if (main_hybrid) D = std::min<int>(D, (int) (kRebalanceEvery - pos % kRebalanceEvery) - 1);
         const int T0 = (int) fix.size() + 1;   // the redo rows and the row of x
@@ -2417,8 +2421,19 @@ struct Engine {
         CK(cudaMemcpyAsync(hpin + 2, pick, (size_t) T * 4, cudaMemcpyDeviceToHost, st));
         CK(cudaStreamSynchronize(st));
         int a = 0;
-        while (a < D && hpin[2 + a] == drafts[(size_t) a]) ++a;
-        for (int i = 0; i <= a; ++i) picks[i] = hpin[2 + i];
+        if (sampler) {
+            std::vector<float> row((size_t) m->g.n_vocab);
+            for (;; ++a) {
+                CK(cudaMemcpyAsync(row.data(), logits + (size_t) a * m->g.n_vocab, row.size() * 4, cudaMemcpyDeviceToHost,
+                                   st));
+                CK(cudaStreamSynchronize(st));
+                picks[a] = (*sampler)(row.data(), a);
+                if (a >= D || picks[a] != drafts[(size_t) a]) break;
+            }
+        } else {
+            while (a < D && hpin[2 + a] == drafts[(size_t) a]) ++a;
+            for (int i = 0; i <= a; ++i) picks[i] = hpin[2 + i];
+        }
         commit(a + 1);
         CK(cudaMemcpyAsync(hlast, hmain + (size_t) a * N, (size_t) N * 4, cudaMemcpyDeviceToDevice, st));
         pos += a + 1;
@@ -2831,18 +2846,31 @@ int serve(Engine& E) {
         const auto d0 = Clock::now();
         long long produced = 0, offered = 0, accepted = 0;
         const char* finish = "length";
-        // greedy requests with the MTP block: speculative steps of mtp_d drafts (verified, so the text is the greedy
-        // text); sampled ones one token at a time
-        const bool spec = E.mtp_d > 0 && !smp.needs_logits();
+        // speculative steps of mtp_d drafts with the MTP block: greedy requests verify against the argmax (the text is
+        // the greedy text); local: sampled ones sample every verify row and keep a draft while it equals the sample
+        static const bool sampled_mtp = [] {   // local: STRATA_Q36_SAMPLED_MTP=0 keeps sampled requests token by token
+            const char* v = std::getenv("STRATA_Q36_SAMPLED_MTP");
+            return !(v && v[0] == '0');
+        }();
+        const bool spec = E.mtp_d > 0 && (!smp.needs_logits() || sampled_mtp);
+        bool nx_ready = false;
         std::vector<int32_t> fix, drafts;
         int32_t picks[16];
+        std::function<int32_t(const float*, int)> sampler = [&](const float* row, int i) -> int32_t {
+            std::vector<float> l(row, row + E.m->g.n_vocab);
+            if (i == 0 || (smp.repeat == 1.f && smp.freq == 0.f && smp.present == 0.f)) return sample(l, smp, hist, rng);
+            std::vector<int32_t> h2 = hist;   // penalties: the drafts kept before this row are history too
+            h2.insert(h2.end(), drafts.begin(), drafts.begin() + i);
+            return sample(l, smp, h2, rng);
+        };
         int nx = smp.needs_logits() ? -1 : E.greedy();
         bool done = false;
         while (!done) {
-            if (smp.needs_logits()) {
+            if (smp.needs_logits() && !nx_ready) {
                 E.host_logits(lg);
                 nx = sample(lg, smp, hist, rng);
             }
+            nx_ready = false;
             auto emit = [&](int t) {   // false: the answer ends here
                 std::printf("T %d\n", t);
                 std::fflush(stdout);
@@ -2855,7 +2883,7 @@ int serve(Engine& E) {
             };
             if (!emit(nx)) break;
             if (spec && E.pos + E.mtp_d + 1 <= E.ctx) {
-                const int a = E.spec_step(nx, fix, E.mtp_d, drafts, picks);
+                const int a = E.spec_step(nx, fix, E.mtp_d, drafts, picks, smp.needs_logits() ? &sampler : nullptr);
                 offered += E.mtp_d;
                 accepted += a;
                 live.push_back(nx);
@@ -2865,6 +2893,7 @@ int serve(Engine& E) {
                     if (!emit(drafts[(size_t) i])) { done = true; break; }
                 }
                 nx = picks[a];
+                nx_ready = true;
                 continue;
             }
             if (E.pos + 1 > E.ctx) break;
