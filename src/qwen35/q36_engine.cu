@@ -242,11 +242,14 @@ __global__ void k_gate_rows(float* sh, const float* gate, int n, int T) {
 /// RMS-normed per head with their weights, NEOX RoPE over the first n_rot dims, k / v into the cache, the gate kept.
 /// grid (H + HKV, T), block 256 (HD <= 256).
 /// local: KV = float or __half (--kv f16); fs / ext / lo / hi / ms = YaRN (fs 1, ext 0: plain RoPE, the same bits).
+/// Pictures (--vision): `mtab` is the request's M-RoPE table [cell][3] = t, h, w (pair p takes stream p % 3, llama.cpp's
+/// IMROPE), else the cell's rotary position is `pos + *rdelta` (the text after a picture continues at p + max(nx, ny)).
 template <class KV>
 __global__ void k_attn_prep(const float* qg, const float* kx, const float* vx, const float* qw, const float* kw,
                             float* q, float* gate, KV* kc, KV* vc, int H, int HKV, int HD, int n_rot,
                             const int32_t* pos0, int ctx, float base, float eps, float fs, float ext, float lo, float hi,
-                            float ms, __half* ksc = nullptr, __half* vsc = nullptr) {
+                            float ms, const int32_t* rdelta, const int32_t* mtab, __half* ksc = nullptr,
+                            __half* vsc = nullptr) {
     __shared__ float sh[kThreads];
     __shared__ float buf[256];
     const int head = blockIdx.x, t = blockIdx.y;
@@ -264,7 +267,9 @@ __global__ void k_attn_prep(const float* qg, const float* kx, const float* vx, c
     const int half = n_rot / 2;
     if (i < n_rot) {
         const int p = i < half ? i : i - half;
-        const float theta_e = (float) pos * powf(base, -2.0f * (float) p / (float) n_rot);
+        const int dl = rdelta ? __ldg(rdelta) : 0;
+        const int rp = mtab ? __ldg(mtab + (size_t) pos * 3 + p % 3) : pos + dl;
+        const float theta_e = (float) rp * powf(base, -2.0f * (float) p / (float) n_rot);
         float theta = theta_e, mag = 1.0f;
         if (ext != 0.0f) {   // YaRN: interpolated low frequencies, extrapolated high ones, ramped between lo and hi
             const float y = ((float) p - lo) / fmaxf(0.001f, hi - lo);
@@ -308,6 +313,15 @@ __global__ void k_attn_prep(const float* qg, const float* kx, const float* vx, c
         }
     }
 }
+/// local (--vision): picture rows over the embeddings of a chunk: x[r] = img[map[r]] for the rows with map[r] >= 0
+/// (the rows of a picture's <|image_pad|> cells).  grid (T), block 256.
+__global__ void k_put_rows(float* x, const float* img, const int32_t* map, int n) {
+    const int r = blockIdx.x;
+    const int m = map[r];
+    if (m < 0) return;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) x[(size_t) r * n + i] = img[(size_t) m * n + i];
+}
+
 /// local: one K/V value as float - FP32 / FP16 as stored, int8 times its Q8_0 group's scale (`sc` [row][8]).
 template <class KV>
 __device__ __forceinline__ float kv_ld(const KV* base, const __half* sc, size_t row, int d) {
@@ -1430,6 +1444,21 @@ struct Engine {
     cudaStream_t st = nullptr;
     int ctx = 32768, tmax = 512;
     int64_t pos = 0;   // cells holding a processed token
+    // local (--vision): a request's pictures - the encoder's rows, the cell -> row map of its <|image_pad|> cells
+    // (`img_map`, -1 for text) and the M-RoPE table of its prompt cells (`d_mtab`); `rdelta` is what the text after
+    // the prompt (and after each picture) adds to its cell: llama.cpp's mtmd advances by max(nx, ny) per picture.
+    bool vision = false;
+    float* d_img = nullptr;
+    size_t img_cap = 0;
+    int32_t* d_map = nullptr;
+    int32_t* d_mtab = nullptr;
+    int32_t* d_rdelta = nullptr;
+    std::vector<int32_t> img_map;
+    bool img_active = false;
+    int64_t img_prompt_cells = 0;
+    const int32_t* mtab_now = nullptr;
+    bool map_on = false;
+    int32_t rdelta = 0;
     // activations [tmax][...]
     float *x, *h, *y, *qkv, *hc, *z, *alpha, *beta, *gdn_y, *qg, *kx, *vx, *q, *gate, *att, *logits_r, *eparts, *moe_out,
         *sg, *su, *shh, *sy, *sgate, *ewts, *logits;
@@ -1530,9 +1559,10 @@ struct Engine {
         }
     }
 
-    void init(const Model& model, int ctx_, int tmax_) {
+    void init(const Model& model, int ctx_, int tmax_, bool vision_ = false) {
         m = &model;
         ctx = ctx_;
+        vision = vision_;
         tmax = std::max(tmax_, kVerify);
         const auto& g = m->g;
         const size_t T = (size_t) tmax, N = (size_t) g.n_embd, Kp = (size_t) m->top_k, FF = (size_t) g.n_ff;
@@ -1557,6 +1587,11 @@ struct Engine {
             std::exit(1);
         }
         att_s = dalloc(kAttScoreFloats);
+        if (vision) {   // local: the M-RoPE table, the cell -> row map and the text's rotary offset
+            d_mtab = dalloc_t<int32_t>((size_t) ctx * 3);
+            d_map = dalloc_t<int32_t>((size_t) ctx);
+            d_rdelta = dalloc_t<int32_t>(1);
+        }
         // f32mm's split-K partials: the router (n_expert + 1 rows) and alpha / beta (ssm_v_heads rows; local: 48 on the
         // dense 27B, which has no router - sized by n_expert alone it overflowed)
         sk_part = dalloc((size_t) kSplitK * T * std::max<int64_t>(g.n_expert + 1, g.ssm_v_heads));
@@ -1678,9 +1713,54 @@ struct Engine {
                      m->has_mtp ? ", MTP block loaded" : "", (double) fr / (1 << 30));
     }
 
+    // ---- pictures (--vision).  A request with pictures hands the engine its rows (the encoder's, in prompt order), the
+    // cell -> row map of its <|image_pad|> cells and the M-RoPE table of its prompt cells; the cells below the prompt
+    // length take their rotary positions from the table, the text after it continues at cell + delta (what the pictures
+    // did not use of their cells: llama.cpp's mtmd advances the text position by max(nx, ny) per picture).
+    void set_images(const std::vector<float>& rows, const std::vector<int32_t>& cell_row,
+                    const std::vector<int32_t>& mrope, int64_t n_prompt, int32_t delta) {
+        const size_t need = rows.size();
+        if (need > img_cap) {
+            CK(cudaDeviceSynchronize());
+            if (d_img) CK(cudaFree(d_img));
+            CK(cudaMalloc((void**) &d_img, std::max<size_t>(need, 1) * 4));
+            img_cap = need;
+        }
+        if (need) CK(cudaMemcpy(d_img, rows.data(), need * 4, cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(d_mtab, mrope.data(), mrope.size() * 4, cudaMemcpyHostToDevice));
+        img_map = cell_row;
+        img_prompt_cells = n_prompt;
+        img_active = true;
+        set_delta(delta);
+    }
+    void clear_images() {
+        img_map.clear();
+        img_active = false;
+        img_prompt_cells = 0;
+        mtab_now = nullptr;
+        map_on = false;
+        set_delta(0);
+    }
+    void set_delta(int32_t d) {
+        rdelta = d;
+        if (d_rdelta) CK(cudaMemcpyAsync(d_rdelta, &rdelta, 4, cudaMemcpyHostToDevice, st));
+    }
+    /// A forward over the cells [c0, c0 + T): the picture rows of its cells, and the table when it is a prompt's.
+    void chunk_pictures(int64_t c0, int T) {
+        mtab_now = nullptr;
+        map_on = false;
+        if (!img_active) return;
+        if (c0 < img_prompt_cells) mtab_now = d_mtab;
+        const int64_t left = (int64_t) img_map.size() - c0;
+        if (left > 0) {
+            const int n = (int) std::min<int64_t>(T, left);
+            CK(cudaMemcpyAsync(d_map, img_map.data() + c0, (size_t) n * 4, cudaMemcpyHostToDevice, st));
+            map_on = true;
+        }
+    }
+
     /// The recurrent state and the cache to a fresh sequence.
-    void reset() {
-        const auto& g = m->g;
+    void reset() {        const auto& g = m->g;
         for (size_t l = 0; l < conv.size(); ++l) {
             if (conv[l]) CK(cudaMemsetAsync(conv[l], 0, (size_t) g.ssm_conv_channels * (g.ssm_d_conv - 1) * 4, st));
             if (S[l]) CK(cudaMemsetAsync(S[l], 0, (size_t) g.ssm_v_heads * g.ssm_state_size * g.ssm_state_size * 4, st));
@@ -1799,16 +1879,18 @@ struct Engine {
                 k_attn_prep<int8_t><<<dim3(H + HKV, T), kThreads, 0, st>>>(
                     qg, kx, vx, L.q_norm, L.k_norm, q, gate, reinterpret_cast<int8_t*>(kc[li]),
                     reinterpret_cast<int8_t*>(vc[li]), H, HKV, HD, m->n_rot, dpos, ctx, m->rope_base, m->eps,
-                    m->rope_freq_scale, m->yarn_ext, m->yarn_lo, m->yarn_hi, m->yarn_mscale, kcs[li], vcs[li]);
+                    m->rope_freq_scale, m->yarn_ext, m->yarn_lo, m->yarn_hi, m->yarn_mscale, d_rdelta, mtab_now,
+                    kcs[li], vcs[li]);
             else if (kv16)
                 k_attn_prep<__half><<<dim3(H + HKV, T), kThreads, 0, st>>>(
                     qg, kx, vx, L.q_norm, L.k_norm, q, gate, reinterpret_cast<__half*>(kc[li]),
                     reinterpret_cast<__half*>(vc[li]), H, HKV, HD, m->n_rot, dpos, ctx, m->rope_base, m->eps,
-                    m->rope_freq_scale, m->yarn_ext, m->yarn_lo, m->yarn_hi, m->yarn_mscale);
+                    m->rope_freq_scale, m->yarn_ext, m->yarn_lo, m->yarn_hi, m->yarn_mscale, d_rdelta, mtab_now);
             else
                 k_attn_prep<float><<<dim3(H + HKV, T), kThreads, 0, st>>>(
                     qg, kx, vx, L.q_norm, L.k_norm, q, gate, kc[li], vc[li], H, HKV, HD, m->n_rot, dpos, ctx,
-                    m->rope_base, m->eps, m->rope_freq_scale, m->yarn_ext, m->yarn_lo, m->yarn_hi, m->yarn_mscale);
+                    m->rope_base, m->eps, m->rope_freq_scale, m->yarn_ext, m->yarn_lo, m->yarn_hi, m->yarn_mscale,
+                    d_rdelta, mtab_now);
             if (T > kGemmT) {
                 // a prompt chunk: scores = Q K^T and out = P V as FP16 GEMMs (FP32 accumulation, FP32 scores) per KV
                 // head (its query heads one strided batch over the shared K / V), the causal softmax in between writing
@@ -2058,6 +2140,7 @@ struct Engine {
             stream_begin(seq);
         }
         K::iq_embed_rows(m->embd_type, m->embd, m->embd_row, tok, T, N, x, st);
+        if (map_on) k_put_rows<<<T, kThreads, 0, st>>>(x, d_img, d_map, N);   // a picture's cells take its rows
         k_rms<<<T, kThreads, 0, st>>>(x, m->layers[0].attn_norm, h, N, m->eps);   // later layers: from k_moe_out
         for (size_t l = 0; l < m->layers.size(); ++l) {
             const bool last = l + 1 == m->layers.size();
@@ -2329,6 +2412,7 @@ struct Engine {
             CK(cudaMemcpyAsync(tok, hpin, 4, cudaMemcpyHostToDevice, st));
             CK(cudaMemcpyAsync(pos0, hpin + 1, 4, cudaMemcpyHostToDevice, st));
             rows_deferred = true;
+            chunk_pictures(pos, 1);
             graph_run(g1, [&] { forward(1, pos, 1, use_graph, false); });
             rows_deferred = false;
             CK(cudaMemcpyAsync(hlast, hmain, (size_t) N * 4, cudaMemcpyDeviceToDevice, st));
@@ -2343,6 +2427,7 @@ struct Engine {
             hpin[1] = (int32_t) pos;
             CK(cudaMemcpyAsync(tok, toks + i, (size_t) T * 4, cudaMemcpyHostToDevice, st));
             CK(cudaMemcpyAsync(pos0, hpin + 1, 4, cudaMemcpyHostToDevice, st));
+            chunk_pictures(pos, T);
             forward(T, pos, i + T == n ? 1 : 0, false, false);
             if (m->has_mtp && mtp_d > 0) {
                 // seeds: h_{q-1} for each row q: hlast, then this chunk's rows 0 .. T - 2 (in `y`, free here)
@@ -2416,6 +2501,7 @@ struct Engine {
         CK(cudaMemcpyAsync(tok, hpin + 16, (size_t) T * 4, cudaMemcpyHostToDevice, st));
         CK(cudaMemcpyAsync(pos0, hpin + 1, 4, cudaMemcpyHostToDevice, st));
         rows_deferred = true;
+        chunk_pictures(pos, T);
         graph_run(gv[T], [&] { forward(T, pos, T, use_graph, true); });
         rows_deferred = false;
         CK(cudaMemcpyAsync(hpin + 2, pick, (size_t) T * 4, cudaMemcpyDeviceToHost, st));
@@ -2749,6 +2835,75 @@ std::vector<int32_t> parse_ids(const char* s) {
 bool is_eos(int t) { return t == 248044 || t == 248046; }
 
 // ------------------------------------------------------------------------------------------------ serve
+// ------------------------------------------------------------------------------------------------ pictures (--vision)
+constexpr int32_t kImagePad = 248056;   // <|image_pad|> (Qwen3.6/3.8, the same id in every 248320-vocabulary file)
+
+/// A request's pictures: the encoder's rows in prompt order, each picture's cell run, and the positions.
+struct ImgReq {
+    std::vector<float> rows;
+    std::vector<int32_t> cell_row;   // per prompt cell: its row in `rows`, or -1 (text)
+    std::vector<int32_t> mrope;      // [cell][3] t, h, w of every prompt cell (llama.cpp's mtmd positions)
+    int32_t delta = 0;               // the text after the prompt: rotary position = cell + delta
+};
+
+/// Reads a strata-vision file (one or more records: int32 'SVE1', n, nx, ny, n_embd, then n x n_embd floats, in prompt
+/// order) and lays the pictures over the prompt's <|image_pad|> runs.  Positions as mtmd's: text counts up by one; a
+/// picture's cells take (t, h, w) = (p, p + row, p + column) and the text after it continues at p + max(nx, ny).  "" or
+/// the error.
+std::string build_images(const std::string& path, const std::vector<int32_t>& ids, int64_t n_embd, ImgReq& r) {
+    struct Img { int64_t n, nx, ny; size_t off; };
+    std::vector<Img> imgs;
+    std::FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) return "cannot open " + path;
+    std::string ve;
+    while (ve.empty()) {
+        int32_t hdr[5];
+        const size_t got = std::fread(hdr, sizeof(int32_t), 5, f);
+        if (got == 0) break;
+        if (got != 5 || hdr[0] != 0x31455653 || hdr[1] < 1 || hdr[2] < 1 || hdr[3] < 1 || (int64_t) hdr[2] * hdr[3] != hdr[1] ||
+            hdr[4] != (int32_t) n_embd) {
+            ve = "bad embeddings file (expected strata-vision records of width " + std::to_string((long long) n_embd) + ")";
+            break;
+        }
+        const size_t off = r.rows.size(), cnt = (size_t) hdr[1] * (size_t) hdr[4];
+        r.rows.resize(off + cnt);
+        if (std::fread(r.rows.data() + off, sizeof(float), cnt, f) != cnt) { ve = "short embeddings file"; break; }
+        imgs.push_back({hdr[1], hdr[2], hdr[3], off});
+    }
+    std::fclose(f);
+    if (!ve.empty()) return ve;
+    const int64_t n = (int64_t) ids.size();
+    r.cell_row.assign((size_t) n, -1);
+    r.mrope.assign((size_t) n * 3, 0);
+    auto put = [&](int64_t c, int64_t t, int64_t h, int64_t w) {
+        r.mrope[(size_t) c * 3] = (int32_t) t;
+        r.mrope[(size_t) c * 3 + 1] = (int32_t) h;
+        r.mrope[(size_t) c * 3 + 2] = (int32_t) w;
+    };
+    int64_t p = 0, i = 0;
+    size_t k = 0;
+    while (i < n) {
+        if (ids[(size_t) i] != kImagePad) { put(i, p, p, p); ++p; ++i; continue; }
+        if (k >= imgs.size()) return "the prompt has more images than the embeddings file";
+        const Img& im = imgs[k++];
+        for (int64_t j = 0; j < im.n; ++j)
+            if (i + j >= n || ids[(size_t) (i + j)] != kImagePad)
+                return "image " + std::to_string(k) + " has " + std::to_string((long long) im.n) +
+                       " rows but fewer <|image_pad|> tokens";
+        for (int64_t j = 0; j < im.n; ++j) {
+            const int64_t y = j / im.nx, x = j % im.nx;
+            put(i + j, p, p + y, p + x);
+            r.cell_row[(size_t) (i + j)] = (int32_t) ((im.off / (size_t) n_embd) + (size_t) j);
+        }
+        i += im.n;
+        p += std::max(im.nx, im.ny);
+    }
+    if (k != imgs.size()) return "the embeddings file has more images than the prompt";
+    if (n > 0 && ids[(size_t) (n - 1)] == kImagePad) return "the prompt cannot end in an image";
+    r.delta = (int32_t) (p - n);
+    return "";
+}
+
 int serve(Engine& E) {
     std::printf("READY %d stop\n", E.ctx);
     std::fflush(stdout);
@@ -2783,13 +2938,14 @@ int serve(Engine& E) {
             lines.pop_front();
         }
         if (line.empty()) continue;
-        if (line.rfind("GEN ", 0) != 0) {
-            std::printf("ERR expected: GEN <max_new> [key=value ...] <id,id,...>\n");
+        const bool geni = line.rfind("GENI ", 0) == 0;
+        if (!geni && line.rfind("GEN ", 0) != 0) {
+            std::printf("ERR expected: GEN <max_new> [key=value ...] <id,id,...> or GENI <max_new> [keys] <file> <id,id,...>\n");
             std::fflush(stdout);
             continue;
         }
         char* p = nullptr;
-        const long long max_new = std::strtoll(line.c_str() + 4, &p, 10);
+        const long long max_new = std::strtoll(line.c_str() + (geni ? 5 : 4), &p, 10);
         Sampling smp;
         for (;;) {
             while (*p == ' ') ++p;
@@ -2810,9 +2966,22 @@ int serve(Engine& E) {
             else if (key == "penalty_present") smp.present = std::strtof(v, nullptr);
             else if (key == "seed") smp.seed = std::strtoull(v, nullptr, 10);
         }
+        std::string emb;
+        if (geni) {   // the encoder's embeddings file, before the ids
+            while (*p == ' ') ++p;
+            const char* e = p;
+            while (*e && *e != ' ') ++e;
+            emb.assign(p, (size_t) (e - p));
+            p = const_cast<char*>(e);
+        }
         const std::vector<int32_t> ids = parse_ids(p);
-        if (max_new < 1 || ids.empty()) {
+        if (max_new < 1 || ids.empty() || (geni && emb.empty())) {
             std::printf("ERR bad request: max_new or the ids\n");
+            std::fflush(stdout);
+            continue;
+        }
+        if (geni && !E.vision) {
+            std::printf("ERR this engine was started without --vision\n");
             std::fflush(stdout);
             continue;
         }
@@ -2824,6 +2993,14 @@ int serve(Engine& E) {
         bool bad = false;
         for (int32_t t : ids) bad |= t < 0 || t >= (int32_t) E.m->g.n_vocab;
         if (bad) { std::printf("ERR a token id is outside the vocabulary\n"); std::fflush(stdout); continue; }
+        ImgReq ir;
+        if (geni) {
+            const std::string ve = build_images(emb, ids, (int64_t) E.m->g.n_embd, ir);
+            if (!ve.empty()) { std::printf("ERR %s\n", ve.c_str()); std::fflush(stdout); continue; }
+            E.set_images(ir.rows, ir.cell_row, ir.mrope, (int64_t) ids.size(), ir.delta);
+        } else {
+            E.clear_images();
+        }
         stop.store(false);
         // the held state continues when the request extends it (the recurrent state cannot step back)
         size_t reuse = 0;
@@ -2918,7 +3095,7 @@ int strata::qwen35::run(int argc, char** argv) {
     double expert_vram = -1.0;
     bool warm = true;
     int expert_slots = 0;
-    bool serve_mode = false, graph = true;
+    bool serve_mode = false, graph = true, vision = false;
     bool kv16 = false, kv8 = false;                      // local: --kv f16 / int8
     std::string rope_scaling;                            // local: --rope-scaling yarn
     double rope_scale = 1.0;
@@ -2947,6 +3124,7 @@ int strata::qwen35::run(int argc, char** argv) {
         else if (a == "--bench-tg") bench_tg = std::atoi(next().c_str());
         else if (a == "--no-graph") graph = false;
         else if (a == "--no-warmup") warm = false;
+        else if (a == "--vision") vision = true;   // local: GENI requests (the encoder's rows over <|image_pad|>)
         else if (a == "--mtp") {
             // a number of drafts; Flash-Next's "--mtp <draft layer dir>" means nothing for this family
             const std::string v = next();
@@ -3057,11 +3235,26 @@ int strata::qwen35::run(int argc, char** argv) {
         const bool fits = expert_slots <= 0 && (expert_vram < 0 ? want <= (double) fr
                                                                : (double) experts <= expert_vram * (double) (1ull << 30));
         chunk = fits ? 512 : 2048;
+        // local, opt-in (port of upstream's prompt-chunk rule): the largest chunk 4096 .. 1024 whose buffers
+        // (~0.5 MiB per row, measured upstream) fit beside every expert and the 1.1 GiB of engine buffers.  A bigger
+        // chunk feeds the MMQ expert kernels more rows per expert (R9700: pp4096 3390 vs pp512 4490 tok/s on the
+        // 35B); it costs that VRAM and the same answer bits.  STRATA_Q36_CHUNK_AUTO=1.
+        static const bool chunk_auto = [] {
+            const char* v = std::getenv("STRATA_Q36_CHUNK_AUTO");
+            return v != nullptr && v[0] != '0';
+        }();
+        if (chunk_auto && fits) {
+            const int64_t room = (int64_t) fr - (int64_t) experts - (1100 << 20);
+            int c = 1024;
+            for (int cand : {4096, 2048})
+                if (room > (int64_t) cand * (512 << 10)) { c = cand; break; }
+            chunk = c;
+        }
         if (std::getenv("STRATA_Q36_PLACE_DEBUG"))
             std::fprintf(stderr, "strata-q36: chunk rule: free %.2f GiB (with %.2f packed), main experts %.2f GiB\n",
                          fr / 1073741824.0, packed / 1073741824.0, experts / 1073741824.0);
     }
-    E.init(m, ctx, chunk);
+    E.init(m, ctx, chunk, vision);
     if (!place_experts(m, E, expert_vram, cpu_threads, hybrid_rows, expert_slots, err)) {
         std::fprintf(stderr, "strata-q36: %s\n", err.c_str());
         return 1;
