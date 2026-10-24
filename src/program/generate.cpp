@@ -6210,7 +6210,6 @@ int main(int argc, char** argv) {
                                  "- %.2f GiB of RAM available, %d slots\n",
                          (double) free_b / 1073741824.0, (int) std::max<int64_t>(slots, 0));
         }
-        }
 #if defined(STRATA_GPU_METAL)
         // Metal: the decode window reads its experts from its own arena (metal/src/engine/window.cpp), and the device copies the shared host
         // code makes - this cache included - are given back before the arena is sized.  An auto cache of everything that is "free" (14.56 GiB on
