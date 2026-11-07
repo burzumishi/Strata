@@ -7075,6 +7075,8 @@ def make_handler(svc: Service):
                 self._json(400, {"error": {"type": "invalid_request_error", "message": "a JSON body {tool, params}"}})
                 return
             lt = getattr(svc, "llama_tools", None)
+            _ta = json.dumps(params, ensure_ascii=False)
+            print(f"[strata] tool {name} {_ta[:300]}{'...' if len(_ta) > 300 else ''} (cwd {self.headers.get('x-tool-cwd') or '-'})", flush=True)
             if lt is not None and lt.has(name):   # llama.cpp's own tools (--tools): its answers, its streaming
                 cwd = self.headers.get("x-tool-cwd") or None
                 if body.get("stream"):
@@ -7094,7 +7096,10 @@ def make_handler(svc: Service):
                     self.wfile.write(b"data: " + json.dumps(done).encode() + b"\n\n")
                     self.wfile.flush()
                     return
-                self._json(200, lt.call(name, params, cwd))
+                res = lt.call(name, params, cwd)
+                print(f"[strata] tool {name} -> " + (f"ERROR {res['error'][:200]}" if res.get("error") else
+                      f"{len(json.dumps(res, ensure_ascii=False))} chars"), flush=True)
+                self._json(200, res)
                 return
             hub = svc.mcp
             route = hub.routes().get(name) if hub else None
