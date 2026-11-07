@@ -3691,7 +3691,7 @@ class WebApp(unittest.TestCase):
         try:
             props = json.loads(self.get("/props")[2])
             self.assertEqual(props["model_path"], engine.model_path)
-            self.assertEqual(props["build_info"], "Strata 0.1.21")
+            self.assertRegex(props["build_info"], r"^ds-wormhole( [0-9a-f]+)? \(Strata 0\.1\.21\)$")   # (2026-11-07: our build first)
             for busy in (True, False):
                 with self.svc.status_lock:
                     self.svc.status["busy"] = busy

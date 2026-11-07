@@ -481,6 +481,19 @@ class GpuBusy(RuntimeError):
 PAGE_CSP = "frame-src 'none'"
 
 
+def _wormhole_rev() -> str:
+    """The ds-wormhole tree's commit at start-up (build_info), "" outside a git checkout."""
+    try:
+        r = subprocess.run(["git", "-C", str(Path(__file__).resolve().parents[1]), "rev-parse", "--short", "HEAD"],
+                           capture_output=True, text=True, timeout=5)
+        return r.stdout.strip() if r.returncode == 0 else ""
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+_WORMHOLE_REV = _wormhole_rev()
+
+
 def unload_wait(value, default: float) -> float:
     """#1997: the `wait` of POST /unload?wait=...: absent / 0 / false: 0 (answer "busy" at once, as before); 1 / true /
     yes: `default` seconds; a number of seconds above 1: that long (at most an hour)."""
@@ -8016,7 +8029,8 @@ def make_handler(svc: Service):
                 props["model_path"] = svc.engine.model_path
             version = getattr(svc.engine, "info", {}).get("version")
             if version:
-                props["build_info"] = "Strata " + str(version)
+                # (2026-11-07) our build: ds-wormhole, its commit, then the engine it runs
+                props["build_info"] = f"ds-wormhole {_WORMHOLE_REV} (Strata {version})" if _WORMHOLE_REV else f"ds-wormhole (Strata {version})"
             # (llama.cpp's web UI) as its router, so the page shows the model picker, here with the one model served
             if "model=" not in (self.path.split("?", 1)[1] if "?" in self.path else ""):
                 props["role"] = "router"
