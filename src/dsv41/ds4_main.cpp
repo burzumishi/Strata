@@ -410,6 +410,9 @@ struct Req {
                             // tools): the state at N is kept as a checkpoint, so another agent behind the same start
                             // goes back to it instead of reading it again
     float cum = -1.0f;      // dspark_cum=F: the cut on the product of the confidences (-1: the engine's, dspark_cum_default)
+    // 2026-11-07: penalty_repeat / penalty_freq / penalty_present / penalty_last_n (the server sent them; they were dropped here)
+    float pen_rep = 1.0f, pen_freq = 0.0f, pen_pres = 0.0f;
+    int pen_n = 64;
     std::string file;   // GENI: the pictures
     std::vector<int> ids;
 };
@@ -507,6 +510,10 @@ bool parse_gen(const std::string& line, Req& r, bool geni) {
         else if (k == "dspark_conf") r.conf = std::strtof(v.c_str(), nullptr);
         else if (k == "pin") r.pin = std::atoll(v.c_str());
         else if (k == "dspark_cum" || k == "spec_cum") r.cum = std::strtof(v.c_str(), nullptr);
+        else if (k == "penalty_repeat") r.pen_rep = std::strtof(v.c_str(), nullptr);
+        else if (k == "penalty_freq") r.pen_freq = std::strtof(v.c_str(), nullptr);
+        else if (k == "penalty_present") r.pen_pres = std::strtof(v.c_str(), nullptr);
+        else if (k == "penalty_last_n") r.pen_n = std::max(0, std::atoi(v.c_str()));
     }
     return !r.ids.empty() && (!geni || !r.file.empty());
 }
@@ -1059,6 +1066,12 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         const long long limit = r.max_new > 0 ? r.max_new : m.max_context() - (long long) r.ids.size();
         long long d_off = 0, d_acc = 0;
         bool cool = false;
+        // (the penalties' window: the prompt's tail and what this request emits; off unless the request set them, and a
+        //  request without them leaves none behind from the last one)
+        const bool pen_on = r.pen_n > 0 && (r.pen_rep != 1.0f || r.pen_freq != 0.0f || r.pen_pres != 0.0f);
+        std::vector<int> pen_hist;
+        if (pen_on) pen_hist.assign(r.ids.size() > (size_t) r.pen_n ? r.ids.end() - r.pen_n : r.ids.begin(), r.ids.end());
+        m.set_penalties(r.pen_rep, r.pen_freq, r.pen_pres, pen_on ? r.pen_n : 0, pen_hist);
         int tok = m.sample(r.temperature, r.top_p, r.top_k, r.min_p, r.seed, counter++);
         std::vector<int> got;
         g_suf.reset(r.ids);
@@ -1102,6 +1115,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             }
             std::printf("T %d\n", tok);
             g_suf.push(tok);
+            if (pen_on) pen_hist.push_back(tok);
             ++produced;
             if (produced % 8 == 0) stat_line();
             std::fflush(stdout);
@@ -1118,6 +1132,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 // a round whose drafts were all below the confidence floor: the next one does without the drafter
                 // (a request's spec / dspark_conf keys over the engine's: the speed calibration measures both ways)
                 const bool try_spec = (r.spec < 0 ? spec : r.spec != 0) && !cool;
+                if (pen_on) m.set_penalties(r.pen_rep, r.pen_freq, r.pen_pres, r.pen_n, pen_hist);
                 if (!round(m, tok, room, try_spec, r.conf >= 0 ? r.conf : conf_min, r.temperature, r.top_p, r.top_k,
                            r.min_p, r.seed, counter, got,
                            off, acc, err, r.cum)) {

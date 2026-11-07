@@ -2315,6 +2315,31 @@ float flow_penalty(int il) {
     return pen_of[(size_t) std::clamp(il, 0, 63)];
 }
 
+namespace {
+// 2026-11-07 (ds-wormhole): llama.cpp's repetition / frequency / presence penalties on rows of logits, in place, before sampling.
+// Row r's pairs are tok[off[r] .. off[r+1]) with their counts in that row's window: repeat divides a positive logit by rp and
+// multiplies a negative one; then logit -= count * fp + (count > 0) * pp.
+__global__ void penalize_kernel(float* logits, int V, const int* tok, const int* cnt, const int* off, float rp, float fp, float pp) {
+    const int r = blockIdx.x;
+    float* L = logits + (size_t) r * V;
+    for (int j = off[r] + threadIdx.x; j < off[r + 1]; j += blockDim.x) {
+        const int t = tok[j];
+        if (t < 0 || t >= V) continue;
+        float l = L[t];
+        if (rp != 1.0f) l = l > 0.0f ? l / rp : l * rp;
+        const int c = cnt[j];
+        l -= (float) c * fp + (c > 0 ? pp : 0.0f);
+        L[t] = l;
+    }
+}
+}  // namespace
+
+void penalize(float* logits, int V, int rows, const int* tok, const int* cnt, const int* off, float rp, float fp, float pp,
+              cudaStream_t s) {
+    if (rows <= 0) return;
+    strata_ds4_launch(penalize_kernel, rows, 128, 0, s, logits, V, tok, cnt, off, rp, fp, pp);
+}
+
 void route_publish(const float* logits, const float* bias, int n, int k, int T, float route_scale,
                    const unsigned long long* vram, const float* x, int dim, int* idx, float* w,
                    unsigned long long* plan_ptr, Req* req, unsigned seq, cudaStream_t s, const float* bias_vl,

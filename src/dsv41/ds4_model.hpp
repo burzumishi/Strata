@@ -180,6 +180,9 @@ public:
     uint64_t slot_save(std::vector<uint8_t>& out, std::string& err);
     /// `data` (a slot's bytes) back into the model: the state at the slot's position n_pos, as slot_save took it -
     /// what a prompt that continues the slot's tokens reads on from (the caller checked the tokens are a prefix).
+    /// 2026-11-07: the request's repetition / frequency / presence penalties (llama.cpp's) over the last n tokens of `hist`
+    /// (which ends with the round's first token); n = 0 or neutral values turn them off
+    void set_penalties(float rp, float fp, float pp, int n, const std::vector<int>& hist);
     bool slot_load(const uint8_t* data, size_t bytes, int64_t n_pos, std::string& err);
     /// What a saved conversation must match: this engine's version, this model's geometry and files and the drafter's
     /// blocks - a slot naming anything else is not this model's state (a file's .meta says so; slot_load refuses).

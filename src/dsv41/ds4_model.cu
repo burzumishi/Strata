@@ -8341,6 +8341,67 @@ struct Model::Impl {
         return true;
     }
 
+    // 2026-11-07 (ds-wormhole): the request's repetition / frequency / presence penalties (llama.cpp's; the server always sent
+    // them as penalty_repeat / penalty_freq / penalty_present / penalty_last_n, the engine dropped them). pen_hist: the last
+    // penalty_last_n tokens up to and including the round's first token; a verify row r adds the drafts before it.
+    float pen_rp = 1.0f, pen_fp = 0.0f, pen_pp = 0.0f;
+    int pen_n = 0;
+    bool pen_active = false;
+    std::vector<int> pen_hist, h_pen;
+    int* d_pen = nullptr;
+    size_t d_pen_cap = 0;
+    void set_penalties(float rp, float fp, float pp, int n, const std::vector<int>& hist) {
+        pen_active = n > 0 && (rp != 1.0f || fp != 0.0f || pp != 0.0f) && rp > 0.0f;
+        pen_rp = rp;
+        pen_fp = fp;
+        pen_pp = pp;
+        pen_n = n;
+        pen_hist.clear();
+        if (!pen_active) return;
+        const size_t s0 = hist.size() > (size_t) n ? hist.size() - (size_t) n : 0;
+        pen_hist.assign(hist.begin() + (long) s0, hist.end());
+    }
+    // the penalties on `rows` rows of logits (row r's window: pen_hist + extra[0 .. r), its last pen_n tokens)
+    void penalize_rows(Dev& d, float* logits, int rows, const int* extra) {
+        if (!pen_active || rows <= 0) return;
+        std::vector<int> off((size_t) rows + 1, 0), tok, cnt;
+        std::unordered_map<int, int> c;
+        for (int r = 0; r < rows; ++r) {
+            c.clear();
+            const int total = (int) pen_hist.size() + r;
+            const int first = std::max(0, total - pen_n);
+            for (int i = first; i < total; ++i) {
+                const int t = i < (int) pen_hist.size() ? pen_hist[(size_t) i] : extra[i - (int) pen_hist.size()];
+                ++c[t];
+            }
+            for (const auto& kv : c) {
+                tok.push_back(kv.first);
+                cnt.push_back(kv.second);
+            }
+            off[(size_t) r + 1] = (int) tok.size();
+        }
+        const size_t N = tok.size(), need = (size_t) rows + 1 + 2 * N;
+        h_pen.assign(off.begin(), off.end());
+        h_pen.insert(h_pen.end(), tok.begin(), tok.end());
+        h_pen.insert(h_pen.end(), cnt.begin(), cnt.end());
+        cudaSetDevice(d.id);
+        if (need > d_pen_cap) {
+            if (d_pen != nullptr) {
+                cudaStreamSynchronize(d.st);
+                cudaFree(d_pen);
+            }
+            d_pen_cap = std::max<size_t>(need, 4096);
+            if (cudaMalloc((void**) &d_pen, d_pen_cap * 4) != cudaSuccess) {
+                d_pen = nullptr;
+                d_pen_cap = 0;
+                return;
+            }
+        }
+        CK(cudaMemcpyAsync(d_pen, h_pen.data(), need * 4, cudaMemcpyHostToDevice, d.st));
+        penalize(logits, g.vocab, rows, d_pen + rows + 1, d_pen + rows + 1 + N, d_pen, pen_rp, pen_fp, pen_pp, d.st);
+        cudaStreamSynchronize(d.st);   // (h_pen is written again by the next call)
+    }
+
     int sample_row(int row, float temperature, float top_p, int top_k, float min_p, uint64_t seed, uint64_t counter,
                    const float* bias) {
         Dev& d = devs[(size_t) head_dev];
@@ -8385,6 +8446,7 @@ struct Model::Impl {
         if (!ok) return false;
         Dev& hd = devs[(size_t) head_dev];
         cudaSetDevice(hd.id);
+        penalize_rows(hd, hd.logits, T, tk + 1);   // (row r: the drafts before it in its window)
         int m = 0;
         if (temperature <= 0.0f) {
             strata::dsv41k::SamplerParams sp;
@@ -11128,6 +11190,7 @@ struct Model::Impl {
         sp.min_p = min_p;
         sp.seed = seed;
         sp.counter = counter;
+        penalize_rows(d, d.logits + (size_t) std::max(0, n_logits - 1) * g.vocab, 1, nullptr);
         strata::dsv41k::sample_tokens(d.logits + (size_t) std::max(0, n_logits - 1) * g.vocab, 1, g.vocab, nullptr, 0,
                                        sp, d.tok, d.st);
         int t = -1;
@@ -11281,6 +11344,7 @@ void Model::pin() { p_->pin(); }
 std::vector<int64_t> Model::check_positions() const { return p_->check_positions(); }
 int64_t Model::restorable(int64_t limit) const { return p_->restorable(limit); }
 uint64_t Model::slot_save(std::vector<uint8_t>& out, std::string& err) { return p_->slot_save(out, err); }
+void Model::set_penalties(float rp, float fp, float pp, int n, const std::vector<int>& hist) { p_->set_penalties(rp, fp, pp, n, hist); }
 bool Model::slot_load(const uint8_t* data, size_t bytes, int64_t n_pos, std::string& err) {
     return p_->slot_load(data, bytes, n_pos, err);
 }
