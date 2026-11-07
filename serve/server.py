@@ -8097,6 +8097,15 @@ def make_handler(svc: Service):
                 items.close()
 
         def _openai(self, req):
+            # 2026-11-07: llama.cpp's n_predict 0 (its web UI's "Pre-fill KV cache after response") means "read the prompt, write
+            # nothing"; this server read no n_predict and took no limit as "the rest of the context": a full second answer after
+            # every reply. Until the engine has a prompt-only read, it is answered empty at once.
+            if req.get("n_predict") == 0 and not req.get("stream") and req.get("max_tokens") is None:
+                self._json(200, {"id": "chatcmpl-prefill", "object": "chat.completion", "created": int(time.time()),
+                                 "model": svc.model, "choices": [{"index": 0, "finish_reason": "length",
+                                                                  "message": {"role": "assistant", "content": ""}}],
+                                 "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}})
+                return
             req = svc.with_shared(req, "openai")
             bias_api.normalize(req.get("logit_bias"), len(getattr(svc.tok, "tokens", ())) or None)
             messages, tools, kw = openai_to_messages(req)
