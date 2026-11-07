@@ -244,6 +244,8 @@ void union_fac(const int* idx, int T, int k, const unsigned long long* vram, con
 float flow_penalty(int il);    // a chunk's miss penalty of a layer (DS4_FLOW_PEN_MAX, DS4_FLOW_PEN_LAYERS)
 float route_penalty(int il);   // the miss penalty of a layer (DS4_ROUTE_MISS_PENALTY, DS4_ROUTE_PEN_LAYERS)
 void route_layer(int il);   // the layer the next route_publish on this thread is for (DS4_ROUTE_PEN_LAYERS)
+// 2026-11-07: the miss penalty times s for the windows that follow (DS4_TIE_RECHECK recomputes a tied position with 0)
+void set_penalty_scale(float s);
 // 2026-11-07: repetition / frequency / presence penalties on `rows` rows of logits (llama.cpp's semantics), pairs by row
 void penalize(float* logits, int V, int rows, const int* tok, const int* cnt, const int* off, float rp, float fp, float pp,
               cudaStream_t s);

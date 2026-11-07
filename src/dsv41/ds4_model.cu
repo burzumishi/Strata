@@ -8408,13 +8408,13 @@ struct Model::Impl {
         pen_hist.assign(hist.begin() + (long) s0, hist.end());
     }
     // the penalties on `rows` rows of logits (row r's window: pen_hist + extra[0 .. r), its last pen_n tokens)
-    void penalize_rows(Dev& d, float* logits, int rows, const int* extra) {
+    void penalize_rows(Dev& d, float* logits, int rows, const int* extra, int row0 = 0) {
         if (!pen_active || rows <= 0) return;
         std::vector<int> off((size_t) rows + 1, 0), tok, cnt;
         std::unordered_map<int, int> c;
         for (int r = 0; r < rows; ++r) {
             c.clear();
-            const int total = (int) pen_hist.size() + r;
+            const int total = (int) pen_hist.size() + row0 + r;
             const int first = std::max(0, total - pen_n);
             for (int i = first; i < total; ++i) {
                 const int t = i < (int) pen_hist.size() ? pen_hist[(size_t) i] : extra[i - (int) pen_hist.size()];
@@ -8542,8 +8542,51 @@ struct Model::Impl {
             next = m < n ? h_idx[m] : sample_row(n, temperature, top_p, top_k, min_p, seed, counter + (uint64_t) n, nullptr);
         }
         drafts_q = false;
-        rollback(p0, T, m + 1);
-        if (!seed_drafter(p0, m + 1, 0, err)) return false;
+        // 2026-11-07 (DS4_TIE_RECHECK=g): the first row of this round whose chosen token had a rival within g (the gap of their
+        // logits over the temperature: p2/p1 > e^-g) is computed again with the exact routing (penalty 0: its missing experts
+        // read) and its token drawn again. The typos ("heapppush", "CONTENido") come from such near-ties the penalty tips over;
+        // ties are rare, so this costs a one-token step now and then instead of protecting experts on every token.
+        static const float tie_gap = std::getenv("DS4_TIE_RECHECK") ? std::strtof(std::getenv("DS4_TIE_RECHECK"), nullptr) : 0.0f;
+        int r_tie = -1, c_tie = -1;
+        if (tie_gap > 0.0f) {
+            const int rows = m + 1;
+            std::vector<float> lg((size_t) rows * V);
+            CK(cudaMemcpyAsync(lg.data(), hd.logits, lg.size() * 4, cudaMemcpyDeviceToHost, hd.st));
+            CK(cudaStreamSynchronize(hd.st));
+            const float tt = temperature > 0.0f ? temperature : 1.0f;
+            for (int r = 0; r < rows && r_tie < 0; ++r) {
+                const float* L1 = lg.data() + (size_t) r * V;
+                int a1 = 0, a2 = -1;
+                for (int v = 1; v < V; ++v)
+                    if (L1[v] > L1[a1]) { a2 = a1; a1 = v; }
+                    else if (a2 < 0 || L1[v] > L1[a2]) a2 = v;
+                const int ch = r < m ? drafts[(size_t) r] : next;
+                if ((ch == a1 || ch == a2) && (L1[a1] - L1[a2]) / tt < tie_gap) {
+                    r_tie = r;
+                    c_tie = ch;
+                }
+            }
+        }
+        static long tie_rounds = 0, tie_hits = 0, tie_changed = 0;
+        ++tie_rounds;
+        if (r_tie >= 0) {
+            ++tie_hits;
+            rollback(p0, T, r_tie);   // (rows before the tie kept; the tied row is computed again)
+            if (r_tie > 0 && !seed_drafter(p0, r_tie, 0, err)) return false;
+            strata::ds4::set_penalty_scale(0.0f);
+            const bool ok2 = forward(tk + r_tie, 1, 1, err);   // (seeds the drafter with its own row)
+            strata::ds4::set_penalty_scale(1.0f);
+            if (!ok2) return false;
+            penalize_rows(hd, hd.logits, 1, tk + 1, r_tie);
+            next = sample_row(0, temperature, top_p, top_k, min_p, seed, counter + (uint64_t) r_tie + 17, nullptr);
+            if (next != c_tie) ++tie_changed;
+            m = r_tie;
+            if (tie_hits <= 3 || tie_hits % 100 == 0)
+                std::fprintf(stderr, "ds4 tie recheck: %ld of %ld rounds rechecked, %ld tokens changed\n", tie_hits, tie_rounds, tie_changed);
+        } else {
+            rollback(p0, T, m + 1);
+            if (!seed_drafter(p0, m + 1, 0, err)) return false;
+        }
         accepted = m;
         st.drafts_offered += n;
         st.drafts_accepted += m;

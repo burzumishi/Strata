@@ -2299,6 +2299,10 @@ static std::vector<float> pen_table(float all, const char* l) {
 }
 static bool route_pen_off_ = false;
 void route_penalty_off() { route_pen_off_ = true; }
+// 2026-11-07 (DS4_TIE_RECHECK): the miss penalty scaled for the windows that follow (0: the exact routing, for a recheck)
+static float g_pen_scale = 1.0f;
+void set_penalty_scale(float s) { g_pen_scale = s; }
+
 float route_penalty(int il) {
     // DS4_ROUTE_MISS_PENALTY: every layer's; DS4_ROUTE_PEN_LAYERS="a-b=p,c=q": those layers' own (route_layer says which this is)
     static const std::vector<float> pen_of = [] {
@@ -2353,7 +2357,7 @@ void route_publish(const float* logits, const float* bias, int n, int k, int T, 
         return;
     }
 #endif
-    const float miss_penalty = route_penalty(route_layer_);
+    const float miss_penalty = route_penalty(route_layer_) * g_pen_scale;
     static const int exact_norm = std::getenv("DS4_EXACT_NORM") != nullptr ? std::max(1, std::atoi(std::getenv("DS4_EXACT_NORM")) == 1 ? 6 : std::atoi(std::getenv("DS4_EXACT_NORM"))) : 0;   // (1 = the model's 6)
     static int tail_from = 0;
     static float tail_mul = 1.0f;
