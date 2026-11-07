@@ -65,7 +65,14 @@ public:
         std::function<uint64_t()> ram_avail;   // the RAM this process can still get (~0: unknown)
         // a new chunk of the arena for the GPU to read in place: returns the device address of `host` (null: not visible)
         std::function<void*(void* host, size_t bytes)> map_chunk;
+        // 2026-11-06 (DS4_STORE_PINNED): the whole arena from this allocator (pinned host memory the GPU reads in place, e.g.
+        // hipHostMalloc), committed already: no mprotect, no RAM-floor check when growing, no giving back; freed by arena_free
+        std::function<void*(size_t bytes)> arena_alloc;
+        std::function<void(void* p)> arena_free;
         std::function<void(void* host)> unmap_chunk;
+        // 2026-11-07 (P3, DS4_STORE_MAPREAD): where the file range lies in this process's mapping of the model; a range wholly in the page cache
+        // is then copied from there (buffered) instead of read again from the disk unbuffered (the reader's j.map path, ds4_pool.hpp)
+        std::function<const void*(int file, uint64_t off)> map_at;
         size_t reserve = 192;              // slots kept evictable (not visible) for the window's demand and guesses
         int vis_percent = 100;             // the share of experts the GPU may take (by a fixed hash): the rest stay the CPU lane's, so both lanes work
     };
@@ -83,7 +90,11 @@ public:
         nmax_ = c.budget_bytes / slot_bytes_;
         // one reserved range for the whole arena (chunks committed as they are needed), 64 KB aligned chunks
         arena_bytes_ = ((nmax_ + kChunk - 1) / kChunk) * kChunk * slot_bytes_;
-        arena_ = (uint8_t*) os::range_reserve(arena_bytes_);
+        if (cfg_.arena_alloc) {
+            arena_ = (uint8_t*) cfg_.arena_alloc(arena_bytes_);
+            arena_pinned_ = arena_ != nullptr;
+        }
+        if (arena_ == nullptr) arena_ = (uint8_t*) os::range_reserve(arena_bytes_);
         if (arena_ == nullptr) return false;
         slots_.reset(new Slot[nmax_]);
         where_.resize(geo_.size());
@@ -112,7 +123,11 @@ public:
         io_.reset();
         for (size_t i = 0; i < chunks_.size(); ++i)
             if (cfg_.unmap_chunk && chunk_dev_[i] != nullptr) cfg_.unmap_chunk(chunks_[i].first);
-        os::range_release(arena_, arena_bytes_);
+        if (arena_pinned_) {
+            if (cfg_.arena_free) cfg_.arena_free(arena_);
+        } else {
+            os::range_release(arena_, arena_bytes_);
+        }
     }
 
     size_t slot_bytes() const { return slot_bytes_; }
@@ -130,6 +145,22 @@ public:
         Slot& sp = slots_[(size_t) s];
         try_ready(sp);
         return sp.state.load(std::memory_order_acquire) == kReady && sp.layer == layer && sp.expert == e ? s : -1;
+    }
+    /// The slot holding (layer, e) when it is ready, pinned so it stays while the caller copies it, or -1.  unpin() gives it back.
+    int pin_ready(int layer, int e) {
+        if (layer < 0 || layer >= (int) where_.size()) return -1;
+        std::lock_guard<std::mutex> lk(mu_);
+        const int s = where_[(size_t) layer][(size_t) e];
+        if (s < 0) return -1;
+        Slot& sp = slots_[(size_t) s];
+        try_ready(sp);
+        if (sp.state.load(std::memory_order_acquire) != kReady || sp.layer != layer || sp.expert != e) return -1;
+        sp.pin++;
+        return s;
+    }
+    void unpin(int slot) {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (slots_[(size_t) slot].pin > 0) slots_[(size_t) slot].pin--;
     }
     const uint8_t* mat(int slot, int r) const { return slots_[(size_t) slot].base + geo_[(size_t) slots_[(size_t) slot].layer].tr[r]; }
     const uint8_t* blob(int slot) const { return slots_[(size_t) slot].base; }
@@ -379,6 +410,7 @@ public:
     /// RAM is short: gives back whole chunks from the end of the arena (their experts forgotten) - up to `want`, stopping at one
     /// with a slot in use (pinned, loading, or GPU-visible).  Returns the chunks given back.
     size_t shrink_chunks(size_t want) {
+        if (arena_pinned_) return 0;   // (a pinned arena cannot give pages back)
         std::lock_guard<std::mutex> lk(mu_);
         size_t done = 0;
         while (done < want && !chunks_.empty()) {
@@ -497,6 +529,7 @@ private:
             j.len = g.bytes[r];
             j.dst = dst;
             j.keep = fin;
+            j.map = cfg_.map_at ? cfg_.map_at(g.file[r], off) : nullptr;
             j.left = &sp.left;
             j.bad = &sp.bad;
             j.cancel = demand ? nullptr : &sp.cancel;
@@ -529,9 +562,9 @@ private:
         const size_t n = std::min(kChunk, nmax_ - nalloc_);
         const size_t bytes = n * slot_bytes_;
         const uint64_t avail = cfg_.ram_avail ? cfg_.ram_avail() : ~uint64_t{0};
-        if (avail != ~uint64_t{0} && avail < bytes + cfg_.floor_bytes) return false;
+        if (!arena_pinned_ && avail != ~uint64_t{0} && avail < bytes + cfg_.floor_bytes) return false;   // (a pinned arena: its RAM is taken already)
         void* p = arena_ + nalloc_ * slot_bytes_;
-        if (!os::range_commit(p, bytes)) return false;
+        if (!arena_pinned_ && !os::range_commit(p, bytes)) return false;
         chunks_.push_back({p, bytes});
         void* dev = cfg_.map_chunk ? cfg_.map_chunk(p, bytes) : nullptr;
         chunk_dev_.push_back(dev);
@@ -576,6 +609,7 @@ private:
     std::vector<os::fd_t> dfds_, pfds_;
     size_t slot_bytes_ = 0, nmax_ = 0, nalloc_ = 0, free_hint_ = 0, arena_bytes_ = 0;
     uint8_t* arena_ = nullptr;
+    bool arena_pinned_ = false;
     size_t shrunk_ = 0;
     std::unique_ptr<Slot[]> slots_;
     std::vector<std::pair<void*, size_t>> chunks_;

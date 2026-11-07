@@ -104,7 +104,8 @@ struct VlBits {
     uint32_t w[kVlRows / 32];
 };
 void route(const float* logits, const float* bias, int n, int k, int T, float route_scale, int* idx, float* w,
-           cudaStream_t s, const float* bias_vl = nullptr, const VlBits* vl = nullptr);
+           cudaStream_t s, const float* bias_vl = nullptr, const VlBits* vl = nullptr, const unsigned long long* vram = nullptr,
+           float miss_penalty = 0.0f);
 
 /// h = silu(min(g, lim)) * clamp(u, -lim, lim)  (lim <= 0: no clamp); n values.
 void swiglu(const float* g, const float* u, int n, float lim, float* h, cudaStream_t s);
@@ -225,6 +226,7 @@ struct Req {
     int ids[kWin][kPicks];
     float w[kWin][kPicks];
     int ahead[kWin][kAhead];
+    int wanted[kWin][kPicks];   // DS4_HEAT_WANTED: what the router would pick without the miss penalty
     float x[kWin][kMaxDim];
 };
 struct Resp {
@@ -235,13 +237,21 @@ struct Resp {
 };
 /// route() for the T tokens of a window, plus: plan_ptr[t][i] = vram[idx[t][i]] (0: not on the device), each token's x
 /// (dim floats) and picks into the request slot, then T and seq (req null: no request, the plan alone).
+void route_penalty_off();      // from here on no miss penalty on the token path (DS4_SUFFIX_EXACT)
+/// DS4_UNION_PEN: fac[e] = base[e] (or 1), and 0 for the off-GPU experts the T rows of idx picked (one block).
+void union_fac(const int* idx, int T, int k, const unsigned long long* vram, const float* base, float* fac, int n,
+               cudaStream_t s);
+float flow_penalty(int il);    // a chunk's miss penalty of a layer (DS4_FLOW_PEN_MAX, DS4_FLOW_PEN_LAYERS)
+float route_penalty(int il);   // the miss penalty of a layer (DS4_ROUTE_MISS_PENALTY, DS4_ROUTE_PEN_LAYERS)
+void route_layer(int il);   // the layer the next route_publish on this thread is for (DS4_ROUTE_PEN_LAYERS)
 void route_publish(const float* logits, const float* bias, int n, int k, int T, float route_scale,
                    const unsigned long long* vram, const float* x, int dim, int* idx, float* w,
                    unsigned long long* plan_ptr, Req* req, unsigned seq, cudaStream_t s, const float* bias_vl = nullptr,
-                   unsigned vl = 0, int na0 = 0, int na1 = 0);
+                   unsigned vl = 0, int na0 = 0, int na1 = 0, const float* pen_fac = nullptr);
 /// Lookahead: the m picks a later layer will likely make (its gate's logits on this layer's FFN input, the routing's
 /// score + bias, the m best of n) into req->ahead[t][off ..) for the T tokens - before route_publish, which publishes them.
-void route_ahead(const float* logits, const float* bias, int n, int m, int T, Req* req, int off, cudaStream_t s);
+void route_ahead(const float* logits, const float* bias, int n, int m, int T, Req* req, int off, cudaStream_t s,
+                 const unsigned long long* vram = nullptr, float miss_penalty = 0.0f);
 /// The RAM store's picks for the device (a decode token's k plan pointers): those the VRAM table left at 0 whose expert zc_tab has (the
 /// slot's device address) are copied into stage slot i (stride apart, `bytes` each) and the plan then points there.
 void zc_stage(unsigned long long* plan, const int* idx, const unsigned long long* zc_tab, int k, uint8_t* stage, size_t stride, size_t bytes,

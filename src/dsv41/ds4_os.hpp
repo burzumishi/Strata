@@ -511,7 +511,13 @@ inline bool range_commit(void* p, size_t bytes) {
 #if defined(_WIN32)
     return VirtualAlloc(p, bytes, MEM_COMMIT, PAGE_READWRITE) != nullptr;
 #else
-    return ::mprotect(p, bytes, PROT_READ | PROT_WRITE) == 0;
+    if (::mprotect(p, bytes, PROT_READ | PROT_WRITE) != 0) return false;
+    // 2026-11-06: DS4_STORE_THP=1 asks transparent huge pages for the store's slots (THP is "madvise" here): 4 KB pages stop
+    // the CPU lane's hardware prefetch at every page of a ~10 MB expert.  Opt-in: with defrag=defer+madvise a fault in such a
+    // range compacts memory directly, and the store grows while decoding (take_slot -> grow): latency spikes possible.
+    static const bool thp = std::getenv("DS4_STORE_THP") != nullptr && std::atoi(std::getenv("DS4_STORE_THP")) != 0;
+    if (thp) (void) ::madvise(p, bytes, MADV_HUGEPAGE);
+    return true;
 #endif
 }
 /// A committed piece of a reserved range given back to the system (its address range stays reserved)

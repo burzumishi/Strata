@@ -664,6 +664,8 @@ __global__ void mx_wait_kernel(const unsigned* p, unsigned v) {
     while (*(volatile const unsigned*) p != v) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
         __nanosleep(200);
+#elif defined(__HIP_DEVICE_COMPILE__) && !defined(DS4_SPIN_NO_SLEEP)   // (2026-11-06: HIP waited without sleeping)
+        __builtin_amdgcn_s_sleep(2);
 #endif
     }
     __threadfence_system();

@@ -335,6 +335,81 @@ template <> struct FmtX<17> : Fmt<17> {
         sc = scales4(2 * (s0 & 15) + 1, 2 * (s0 >> 4) + 1, 2 * (s1 & 15) + 1, 2 * (s1 >> 4) + 1);
     }
 };
+// IQ2_XS grid in registers (2026-11-06, T3 of the DeepSeek plan): every byte of iq2xs_grid is one of three levels (0x08, 0x19,
+// 0x2B), so an entry packs into eight 2-bit codes, one u16, and the 512 entries into 1 KB = 16 zmm.  A block's 32 indices are
+// looked up at once (8 vpermt2w on 64-entry pairs, then blends on index bits 6, 7, 8); a 64-value chunk expands its eight code
+// words with vpermw (one word to its qword), vpmultishiftqb (bit offsets 0, 2, .. 14), & 3 and a vpshufb level table.  The bytes
+// are the table's own, so the sums are bit for bit those of the loads.  Needs AVX512_VBMI (Zen 4, Zen 5, Ice Lake on);
+// STRATA_IQ2XS_REG=0 / 1 forces it off / on (default: on where VBMI is).
+static bool has_vbmi() {
+    static const bool ok = [] {
+#if defined(_MSC_VER)
+        int r[4];
+        __cpuidex(r, 7, 0);
+        return ((r[2] >> 1) & 1) != 0;
+#else
+        unsigned a, b, c, d;
+        __cpuid_count(7, 0, a, b, c, d);
+        return ((c >> 1) & 1u) != 0;
+#endif
+    }();
+    return ok;
+}
+const bool reg17 = [] {
+    const char* v = std::getenv("STRATA_IQ2XS_REG");
+    return v != nullptr && v[0] != '\0' ? std::atoi(v) != 0 && has_vbmi() : has_vbmi();
+}();
+struct Iq2xsCodes {
+    __m512i t[16];   // entry e's code word at u16 lane e % 32 of t[e / 32]
+    bool ok = true;
+    Iq2xsCodes() {
+        alignas(64) uint16_t c[512];
+        for (int e = 0; e < 512; ++e) {
+            uint16_t w = 0;
+            for (int k = 0; k < 8; ++k) {
+                const uint8_t v = (uint8_t) (iq2xs_grid[e] >> (8 * k));
+                const int lv = v == 0x08 ? 0 : v == 0x19 ? 1 : v == 0x2B ? 2 : -1;
+                if (lv < 0) ok = false;
+                w |= (uint16_t) ((lv < 0 ? 0 : lv) << (2 * k));
+            }
+            c[e] = w;
+        }
+        for (int i = 0; i < 16; ++i) t[i] = _mm512_load_si512((const void*) (c + 32 * i));
+    }
+};
+inline const Iq2xsCodes& iq2xs_codes() {
+    static const Iq2xsCodes c;
+    return c;
+}
+// the register form: iq2xs_prep() once a block, iq2xs_decode_c() a 64-value chunk
+inline __m512i iq2xs_prep(const uint8_t* b) {   // the block's 32 code words (u16 lanes 0..31, in the block's order)
+    const Iq2xsCodes& C = iq2xs_codes();
+    const __m512i idx = _mm512_and_si512(_mm512_loadu_si512((const void*) (b + 2)), _mm512_set1_epi16(511));
+    __m512i r[8];
+    for (int p = 0; p < 8; ++p) r[p] = _mm512_permutex2var_epi16(C.t[2 * p], idx, C.t[2 * p + 1]);
+    const __mmask32 b6 = _mm512_test_epi16_mask(idx, _mm512_set1_epi16(64));
+    const __mmask32 b7 = _mm512_test_epi16_mask(idx, _mm512_set1_epi16(128));
+    const __mmask32 b8 = _mm512_test_epi16_mask(idx, _mm512_set1_epi16(256));
+    const __m512i s0 = _mm512_mask_blend_epi16(b6, r[0], r[1]), s1 = _mm512_mask_blend_epi16(b6, r[2], r[3]);
+    const __m512i s2 = _mm512_mask_blend_epi16(b6, r[4], r[5]), s3 = _mm512_mask_blend_epi16(b6, r[6], r[7]);
+    const __m512i u0 = _mm512_mask_blend_epi16(b7, s0, s1), u1 = _mm512_mask_blend_epi16(b7, s2, s3);
+    return _mm512_mask_blend_epi16(b8, u0, u1);
+}
+inline void iq2xs_decode_c(const uint8_t* b, int j, __m512i codes, __m512i& g, __mmask64& m, __m512i& sc) {
+    // u16 lane w of the result = code word 8j + w/4: each qword holds its entry's code word (four times)
+    const __m512i sel = _mm512_add_epi16(_mm512_set1_epi16((short) (8 * j)),
+                                         _mm512_set_epi16(7, 7, 7, 7, 6, 6, 6, 6, 5, 5, 5, 5, 4, 4, 4, 4,
+                                                          3, 3, 3, 3, 2, 2, 2, 2, 1, 1, 1, 1, 0, 0, 0, 0));
+    const __m512i cw = _mm512_permutexvar_epi16(sel, codes);
+    const __m512i sh = _mm512_set1_epi64((long long) 0x0E0C0A0806040200ull);   // byte k <- bits 2k .. 2k+7 of its qword
+    const __m512i lvl = _mm512_and_si512(_mm512_multishift_epi64_epi8(sh, cw), _mm512_set1_epi8(3));
+    const __m512i lut = _mm512_set4_epi32(0, 0, 0, 0x002B1908);   // 0 -> 0x08, 1 -> 0x19, 2 -> 0x2B
+    g = _mm512_shuffle_epi8(lut, lvl);
+    const uint8_t* q = b + 2 + 16 * j;
+    m = sign_mask_from_idx(_mm256_srli_epi32(_mm256_cvtepu16_epi32(_mm_loadu_si128((const __m128i*) q)), 9));
+    const uint8_t s0 = b[66 + 2 * j], s1 = b[66 + 2 * j + 1];
+    sc = scales4(2 * (s0 & 15) + 1, 2 * (s0 >> 4) + 1, 2 * (s1 & 15) + 1, 2 * (s1 >> 4) + 1);
+}
 template <> struct FmtX<18> : Fmt<18> {
     static inline void decode(const uint8_t* b, int j, __m512i& g, __mmask64& m, __m512i& sc) {
         const uint8_t* q = b + 2 + 16 * j;
@@ -368,6 +443,8 @@ inline void row_dot_x(const uint8_t* row, int nblocks, const block_q8_K* const* 
     __m256 accf[NT];
     for (int t = 0; t < NT; ++t) accf[t] = _mm256_setzero_ps();
     const __m512i zero = _mm512_setzero_si512();
+    // (the register grid only when every grid byte was one of the three levels; otherwise the table loads, as before)
+    [[maybe_unused]] const bool use17 = TY == 17 && reg17 && iq2xs_codes().ok;
     for (int i = 0; i < nblocks; ++i) {
         const uint8_t* blk = row + (size_t) i * FmtX<TY>::bytes;
         if (prefetch_ahead > 0) {
@@ -377,10 +454,18 @@ inline void row_dot_x(const uint8_t* row, int nblocks, const block_q8_K* const* 
         }
         __m512i acci[NT];
         for (int t = 0; t < NT; ++t) acci[t] = _mm512_setzero_si512();
+        [[maybe_unused]] __m512i codes = _mm512_setzero_si512();
+        if constexpr (TY == 17)
+            if (use17) codes = iq2xs_prep(blk);
         for (int j = 0; j < 4; ++j) {
             __m512i g, sc;
             __mmask64 m;
-            FmtX<TY>::decode(blk, j, g, m, sc);
+            if constexpr (TY == 17) {
+                if (use17) iq2xs_decode_c(blk, j, codes, g, m, sc);
+                else FmtX<TY>::decode(blk, j, g, m, sc);
+            } else {
+                FmtX<TY>::decode(blk, j, g, m, sc);
+            }
             for (int t = 0; t < NT; ++t) {
                 const __m512i yv = _mm512_loadu_si512((const void*) (y[t][i].qs + 64 * j));
                 const __m512i ys = _mm512_mask_sub_epi8(yv, m, zero, yv);

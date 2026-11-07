@@ -41,6 +41,7 @@
 #include <csignal>
 #include <filesystem>
 #include <memory>
+#include <unordered_map>
 #include <cstdio>
 #include <fstream>
 #include <sstream>
@@ -52,6 +53,8 @@
 #include <string>
 #include <thread>
 #include <vector>
+
+namespace strata::ds4 { void route_penalty_off(); }
 
 namespace {
 
@@ -165,6 +168,62 @@ static std::string g_round_tag;
 static int g_spec_depth = 64;   // --dspark-depth: at most this many drafts a round
 static std::vector<float> g_round_conf;
 static int g_round_nd = 0;
+// DS4_SUFFIX_DRAFT=K: drafts copied from the context.  The last K tokens are looked up among the earlier ones; when they
+// were seen before, what followed them then is offered as up to DS4_SUFFIX_MAX (15) drafts, at least DS4_SUFFIX_MIN (4),
+// and verified like DSpark's (a point q: every kept token is still the model's own draw, nothing changes but the speed).
+// An agent copies paths, names and code from what it read, which the drafter's five-token block cannot follow.
+struct SuffixDraft {
+    bool on = false;
+    size_t K = 8;
+    int maxn = 15, minn = 4;
+    long long rounds = 0, offered = 0, accepted = 0;
+    std::vector<int> h;
+    std::unordered_map<uint64_t, int> last;   // the hash of the K tokens before a position -> that position (the latest)
+    SuffixDraft() {
+        if (const char* v = std::getenv("DS4_SUFFIX_DRAFT")) {
+            on = std::atoi(v) > 0;
+            K = (size_t) std::max(2, std::atoi(v));
+        }
+        if (const char* v = std::getenv("DS4_SUFFIX_MAX")) maxn = std::max(1, std::min(15, std::atoi(v)));
+        if (const char* v = std::getenv("DS4_SUFFIX_MIN")) minn = std::max(1, std::atoi(v));
+    }
+    uint64_t key(size_t end) const {   // FNV-1a over h[end - K, end)
+        uint64_t x = 1469598103934665603ull;
+        for (size_t i = end - K; i < end; ++i) {
+            x ^= (uint32_t) h[i];
+            x *= 1099511628211ull;
+        }
+        return x;
+    }
+    void reset(const std::vector<int>& ids) {
+        if (!on) return;
+        h.clear();
+        last.clear();
+        h.reserve(ids.size() + 8192);
+        for (int t : ids) push(t);
+    }
+    void push(int t) {
+        if (!on) return;
+        h.push_back(t);
+        const size_t n = h.size();
+        if (n > K) last[key(n - 1)] = (int) (n - 1);   // (the K tokens before the newest -> the newest; the newest's own
+                                                       //  K-gram is recorded with the next token, so a lookup sees earlier ones)
+    }
+    void propose(std::vector<int>& d, int room) const {
+        d.clear();
+        const size_t n = h.size();
+        if (!on || n <= K || room < 2) return;
+        const auto it = last.find(key(n));
+        if (it == last.end()) return;
+        const size_t p = (size_t) it->second;
+        if (p < K || p >= n) return;
+        for (size_t i = 0; i < K; ++i)
+            if (h[p - K + i] != h[n - K + i]) return;   // (a hash collision)
+        const size_t lim = (size_t) std::min(maxn, room - 1);
+        for (size_t q = p; q < n && d.size() < lim; ++q) d.push_back(h[q]);
+    }
+};
+static SuffixDraft g_suf;
 
 // The drafts' cut on the product of their confidences (DeepInfer's cumulative rule): a draft is verified while the chance
 // that it and every draft before it are kept stays at least this - a long window whose later drafts are likely lost is
@@ -173,6 +232,12 @@ static int g_round_nd = 0;
 // six 128-token decodes an arm in one load - 71.7 -> 76.9 tok/s (medians), the same ids.  Project Maya ran 0.5 on a Radeon 8065S (Strix Halo,
 // gfx1151: +6.5% decode, the same tokens), but that is a single datapoint on a box the 0.2.7 defaults have not been tested on, so
 // Strix keeps 0 until it is; the CUDA measurements in 0.2.7 had it flat, so CUDA keeps 0.  STRATA_DS4_DSPARK_CUM overrides everywhere.
+// DS4_DSPARK_NO_COOL=1: a round whose drafts all fell below the floor does not make the next one go without the drafter
+bool dspark_cool() {
+    static const bool cool = std::getenv("DS4_DSPARK_NO_COOL") == nullptr || std::atoi(std::getenv("DS4_DSPARK_NO_COOL")) == 0;
+    return cool;
+}
+
 float dspark_cum_default(const strata::ds4::Model& m) {
     static const char* const e = std::getenv("STRATA_DS4_DSPARK_CUM");
     return strata::ds4::dspark_cum_value(e != nullptr, e != nullptr ? (float) std::atof(e) : 0.0f, m.gpus_are_gfx12(),
@@ -220,6 +285,42 @@ bool round(strata::ds4::Model& m, int tok, int room, bool spec, float conf_min, 
            int& accepted, std::string& err, float cum_min = -1.0f) {
     out.clear();
     offered = accepted = 0;
+    if (g_suf.on && room > 1) {   // DS4_SUFFIX_DRAFT: a copy from the context first, the drafter when there is none
+        std::vector<int> drafts;
+        g_suf.propose(drafts, room);
+        if ((int) drafts.size() >= g_suf.minn) {
+            // DS4_SUFFIX_CHUNK=S (6): a long copy verified in windows of at most S drafts, one after another while each is
+            // taken whole - a 16-row window's experts (~3000) do not fit the RAM store (973) and every window emptied it (N6)
+            static const int chunk = std::max(1, std::getenv("DS4_SUFFIX_CHUNK") ? std::atoi(std::getenv("DS4_SUFFIX_CHUNK")) : 15);
+            const double rt1 = rt_now();
+            int cur = tok;
+            size_t at = 0;
+            offered = accepted = 0;
+            for (;;) {
+                const size_t n = std::min(drafts.size() - at, (size_t) chunk);
+                std::vector<int> part(drafts.begin() + (long) at, drafts.begin() + (long) (at + n));
+                int acc = 0, next = -1;
+                if (!m.verify(cur, part, temperature, top_p, top_k, min_p, seed, counter, acc, next, err)) return false;
+                ++g_rt.spec_rounds;
+                ++g_suf.rounds;
+                g_suf.offered += (long long) n;
+                g_suf.accepted += acc;
+                offered += (int) n;
+                accepted += acc;
+                counter += (unsigned long long) acc + 1;
+                for (int i = 0; i < acc; ++i) out.push_back(part[(size_t) i]);
+                out.push_back(next);
+                at += n;
+                // the next window only when this one was taken whole and the model's own next token is the copy's next
+                if (acc < (int) n || at >= drafts.size() || next != drafts[at] || (int) out.size() >= room - 1) break;
+                cur = next;
+                ++at;   // (next stands for drafts[at]: already in out)
+                if (at >= drafts.size()) break;
+            }
+            g_rt.verify += rt_now() - rt1;
+            return true;
+        }
+    }
     if (spec && room > 1 && m.draft_block() > 0) {
         std::vector<int> drafts;
         std::vector<float> conf;
@@ -238,9 +339,34 @@ bool round(strata::ds4::Model& m, int tok, int room, bool spec, float conf_min, 
         int keep = 0;
         if (cum_min < 0) cum_min = dspark_cum_default(m);
         float cum = 1.0f;
-        while (keep < (int) drafts.size() && keep < room - 1 && keep < g_spec_depth && conf[(size_t) keep] >= conf_min &&
-               (cum *= conf[(size_t) keep]) >= cum_min)
-            ++keep;
+        // DS4_SPEC_COST=c0,c1,..: the measured ms of a round that verifies k drafts (c0: a plain step).  Then k is the one
+        // with the most tokens expected per ms - 1 + the sum over j <= k of the product of the confidences up to j - over
+        // its cost (EVICT, arXiv 2605.00342: lossless, it only chooses how many drafts the model checks).  Else the floor.
+        static const std::vector<double> spec_cost = [] {
+            std::vector<double> v;
+            if (const char* e = std::getenv("DS4_SPEC_COST"))
+                for (const char* p = e; *p;) {
+                    char* q = nullptr;
+                    const double x = std::strtod(p, &q);
+                    if (q == p) break;
+                    v.push_back(x);
+                    p = *q == ',' ? q + 1 : q;
+                }
+            return v;
+        }();
+        if (spec_cost.size() >= 2) {
+            const int lim = std::min({(int) drafts.size(), room - 1, g_spec_depth, (int) spec_cost.size() - 1});
+            double best = 1.0 / spec_cost[0], acc_exp = 0.0, run = 1.0;
+            for (int k = 1; k <= lim; ++k) {
+                run *= (double) conf[(size_t) (k - 1)];
+                acc_exp += run;
+                const double v = (1.0 + acc_exp) / spec_cost[(size_t) k];
+                if (v > best) best = v, keep = k;
+            }
+        } else
+            while (keep < (int) drafts.size() && keep < room - 1 && keep < g_spec_depth && conf[(size_t) keep] >= conf_min &&
+                   (cum *= conf[(size_t) keep]) >= cum_min)
+                ++keep;
         if (keep > 0) {
             drafts.resize((size_t) keep);
             int acc = 0, next = -1;
@@ -251,7 +377,7 @@ bool round(strata::ds4::Model& m, int tok, int room, bool spec, float conf_min, 
             g_rt.verify_d += rt_seq() - rs1;
             ++g_rt.spec_rounds;
             if (g_round_log != nullptr) {   // DS4_ROUND_LOG: tag, drafts offered, accepted, the confidences
-                std::fprintf(g_round_log, "%s\t%d\t%d", g_round_tag.c_str(), keep, acc);
+                std::fprintf(g_round_log, "%s\t%d\t%d\t%.2f", g_round_tag.c_str(), keep, acc, rt_now() - rt1);
                 for (int i = 0; i < keep; ++i) std::fprintf(g_round_log, "\t%.4f", g_round_conf[(size_t) i]);
                 std::fprintf(g_round_log, "\n");
             }
@@ -554,6 +680,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         std::string e;
         const uint64_t bytes = m.slot_save(*buf, e);   // (a state unchanged since it was taken refuses here: nothing
         if (bytes == 0) {                             // changes, its slot stays)
+            std::fprintf(stderr, "ds4 slots: not set aside%s: %s\n", why, e.c_str());
             if (e != "it is already set aside")
                 std::fprintf(stderr, "ds4 slots: setting the conversation aside failed (%s) - it is read from token 0 "
                                      "when it comes back\n", e.c_str());
@@ -934,6 +1061,8 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         bool cool = false;
         int tok = m.sample(r.temperature, r.top_p, r.top_k, r.min_p, r.seed, counter++);
         std::vector<int> got;
+        g_suf.reset(r.ids);
+        const long long suf_r0 = g_suf.rounds, suf_o0 = g_suf.offered, suf_a0 = g_suf.accepted;
         // STAT for the Monitor every 8 tokens and at the end, over this answer so far: the GLM engine's keys (speed, the
         // VRAM hit, promotions a token) and DeepSeek's own - experts a token on the CPU lane, MB a token the storage
         // read (Linux), the n-gram memory's (Engram) read time a token, the drafts' acceptance
@@ -972,6 +1101,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 break;
             }
             std::printf("T %d\n", tok);
+            g_suf.push(tok);
             ++produced;
             if (produced % 8 == 0) stat_line();
             std::fflush(stdout);
@@ -997,7 +1127,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 }
                 d_off += off;
                 d_acc += acc;
-                cool = try_spec && off == 0;
+                cool = try_spec && off == 0 && dspark_cool();
                 std::reverse(got.begin(), got.end());
             }
             tok = got.back();
@@ -1006,6 +1136,10 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         // (a stop within accepted drafts leaves the state past it: the next prompt shares less with it, and goes back to
         //  the checkpoint at this prompt's end)
         stat_line();
+        if (g_suf.on && g_suf.rounds > suf_r0)
+            std::fprintf(stderr, "maya ds4 serve: suffix drafts: %lld rounds, %lld offered, %lld accepted (%.1f%%)\n",
+                         g_suf.rounds - suf_r0, g_suf.offered - suf_o0, g_suf.accepted - suf_a0,
+                         100.0 * (double) (g_suf.accepted - suf_a0) / (double) std::max(1LL, g_suf.offered - suf_o0));
         const double t2 = now_ms();
         std::printf("DONE %lld %zu %.1f %.1f %s %lld %lld %zu 0 0\n", produced, r.ids.size(), t1 - t0, t2 - t1, finish,
                     d_acc, d_off, from);
@@ -1025,6 +1159,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
     // the engine ends (QUIT or the end of its input): the conversation in the model is set aside, and every one in
     // RAM is written to the folder, so the next run reads on from them
     if (slot_max > 0) {
+        std::fprintf(stderr, "ds4 slots: engine ending: %zu tokens in the model, %zu pictures held\n", m.tokens().size(), held.size());
         if (held.empty()) slot_put(" as the engine ended");
         size_t written = 0;
         while (true) {   // (a write can take the folder's least recently used conversation away: the list is asked again)
@@ -1471,17 +1606,23 @@ int main(int argc, char** argv) {
     std::vector<float> lg;
     if (window_given == 0) window = df != nullptr ? 16 : std::max(16, std::min(m.feed_unit(), 1 << 30));
     const double t0 = now_ms();
+    // DS4_DUMP_FROM=N: the first N tokens read as one feed with no logits, the dump from there on (what a read costs what follows it)
+    const size_t dump_from = std::getenv("DS4_DUMP_FROM") != nullptr ? (size_t) std::atoll(std::getenv("DS4_DUMP_FROM")) : 0;
     for (size_t a = 0; a < ids.size();) {
-        const int T = (int) std::min<size_t>((size_t) window, ids.size() - a);
+        // DS4_DUMP_PRE=N: those first tokens read in two feeds, N then the rest (a turn's read after a conversation)
+        static const size_t dump_pre = std::getenv("DS4_DUMP_PRE") != nullptr ? (size_t) std::atoll(std::getenv("DS4_DUMP_PRE")) : 0;
+        const bool head = a < dump_from && dump_from < ids.size();
+        const int T = head ? (int) (a == 0 && dump_pre > 0 && dump_pre < dump_from ? dump_pre : dump_from - a) : (int) std::min<size_t>((size_t) window, ids.size() - a);
         const bool last = a + (size_t) T == ids.size();
         const double tf0 = now_ms();
-        if (!m.feed(ids.data() + a, T, df != nullptr ? T : (last ? 1 : 0), err)) {
+        if (!m.feed(ids.data() + a, T, head ? 0 : df != nullptr ? T : (last ? 1 : 0), err)) {
             std::fprintf(stderr, "maya-ds4: %s\n", err.c_str());
             return 1;
         }
         if (std::getenv("DS4_FEEDLOG") != nullptr)   // each feed's time: the incremental turn (--window W: a long prefix, then a short one)
             std::fprintf(stderr, "feed at %zu: %d tokens in %.0f ms (%.1f tok/s)\n", a, T, now_ms() - tf0, 1000.0 * T / (now_ms() - tf0));
-        if (df != nullptr && m.logits(lg)) std::fwrite(lg.data(), 4, lg.size(), df);
+        if (df != nullptr && !head && m.logits(lg)) std::fwrite(lg.data(), 4, lg.size(), df);
+        if (head && a + (size_t) T == dump_from && std::getenv("DS4_SUFFIX_EXACT") != nullptr) strata::ds4::route_penalty_off();
         a += (size_t) T;
     }
     m.set_images({});
@@ -1505,8 +1646,10 @@ int main(int argc, char** argv) {
     if (n > 0) {
         int tok = m.sample(temp, 1.0f, temp > 0 ? 64 : 1, 0.0f, cli_seed, counter++);
         std::vector<int> got;
+        g_suf.reset(ids);
         for (;;) {
             out.push_back(tok);
+            g_suf.push(tok);
             {
                 const double tn = now_ms();
                 tok_ms.push_back(tn - t_prev);
@@ -1534,7 +1677,7 @@ int main(int argc, char** argv) {
                 d_off += off;
                 d_acc += acc;
                 ++rounds;
-                cool = try_spec && off == 0;
+                cool = try_spec && off == 0 && dspark_cool();
                 std::reverse(got.begin(), got.end());
             }
             tok = got.back();
@@ -1552,6 +1695,9 @@ int main(int argc, char** argv) {
                      s1.verify_ms - s0.verify_ms, (long long) (s1.drafts_offered > 0 ? 0 : 0));
         std::fprintf(stderr, "dspark %s\n", per_position(s0, s1).c_str());
     }
+    if (g_suf.on)
+        std::fprintf(stderr, "suffix drafts: %lld rounds, %lld offered, %lld accepted (%.1f%%)\n", g_suf.rounds, g_suf.offered,
+                     g_suf.accepted, 100.0 * (double) g_suf.accepted / (double) std::max(1LL, g_suf.offered));
     if (std::getenv("DS4_TOKLOG") != nullptr && tok_ms.size() > 8) {   // the decode's tokens after the first (which carries the prompt's tail)
         std::vector<double> v(tok_ms.begin() + 1, tok_ms.end());
         std::sort(v.begin(), v.end());
@@ -1599,6 +1745,7 @@ int main(int argc, char** argv) {
                      (long long) s.store_slots, (long long) s.store_slots_max, (long long) (s.store_evictions - s0.store_evictions),
                      (long long) (s.store_fails - s0.store_fails), (double) (s.store_zc - s0.store_zc) / nt,
                      (long long) s.store_zc_visible);
+        if (s.swap_store != s0.swap_store) std::fprintf(stderr, "cache moves from the RAM store, no read: %lld\n", (long long) (s.swap_store - s0.swap_store));
     }
     if (s.ahead_picks > s0.ahead_picks) {   // lookahead
         const double p = (double) (s.ahead_picks - s0.ahead_picks), c = (double) (s.ahead_cold - s0.ahead_cold);

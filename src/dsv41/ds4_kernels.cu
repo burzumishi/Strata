@@ -507,7 +507,8 @@ __global__ void __launch_bounds__(kThreads) gemv_f32_kernel(const float* __restr
 // ---------------------------------------------------------------- the router
 __global__ void __launch_bounds__(512) route_kernel(const float* __restrict__ logits, const float* __restrict__ bias,
                                                     int n, int k, float route_scale, int* idx, float* w,
-                                                    const float* __restrict__ bias_vl, const VlBits vl) {
+                                                    const float* __restrict__ bias_vl, const VlBits vl,
+                                                    const unsigned long long* __restrict__ vram, float miss_penalty, int exact_norm = 0) {
     __shared__ float sc[1024], bs[1024];
     __shared__ float bv[32];
     __shared__ int bi[32];
@@ -519,7 +520,7 @@ __global__ void __launch_bounds__(512) route_kernel(const float* __restrict__ lo
         const float l = logits[i];
         const float sp = l > 20.0f ? l : log1pf(expf(l));
         sc[i] = sqrtf(sp);
-        bs[i] = sc[i] + bias[i];
+        bs[i] = sc[i] + bias[i] - (vram != nullptr && vram[i] == 0ull ? miss_penalty : 0.0f);
     }
     __syncthreads();
     const int lane = threadIdx.x & 31, wp = threadIdx.x >> 5;
@@ -545,9 +546,41 @@ __global__ void __launch_bounds__(512) route_kernel(const float* __restrict__ lo
         }
         __syncthreads();
     }
+    // DS4_EXACT_NORM: the exact top-k's score sum, in parallel like the picks (bs is free now: refilled without the penalty)
+    __shared__ float se_sh;
+    const bool en_norm = exact_norm > 0 && (miss_penalty > 0.0f || k < exact_norm);
+    if (en_norm) {
+        for (int i = threadIdx.x; i < n; i += blockDim.x) bs[i] = sc[i] + bias[i];
+        if (threadIdx.x == 0) se_sh = 0.0f;
+        __syncthreads();
+        const int ln = threadIdx.x & 31, wq = threadIdx.x >> 5;
+        for (int r = 0; r < exact_norm && r < 16; ++r) {
+            float best = -FLT_MAX;
+            int bix = 0x7fffffff;
+            for (int i = threadIdx.x; i < n; i += blockDim.x)
+                if (bs[i] > best || (bs[i] == best && i < bix)) best = bs[i], bix = i;
+            for (int o = 16; o > 0; o >>= 1) {
+                const float ov = __shfl_xor_sync(0xffffffffu, best, o);
+                const int oi = __shfl_xor_sync(0xffffffffu, bix, o);
+                if (ov > best || (ov == best && oi < bix)) best = ov, bix = oi;
+            }
+            if (ln == 0) bv[wq] = best, bi[wq] = bix;
+            __syncthreads();
+            if (threadIdx.x == 0) {
+                float b = -FLT_MAX;
+                int ix = 0x7fffffff;
+                for (int q = 0; q < (int) (blockDim.x >> 5); ++q)
+                    if (bv[q] > b || (bv[q] == b && bi[q] < ix)) b = bv[q], ix = bi[q];
+                se_sh += sc[ix];
+                bs[ix] = -FLT_MAX;
+            }
+            __syncthreads();
+        }
+    }
     if (threadIdx.x == 0) {
         float s = 0.0f;
         for (int r = 0; r < k; ++r) s += sc[pick[r]];
+        if (en_norm) s = se_sh;   // DS4_EXACT_NORM: weights over the exact top-k's score (the missing ones' share is not spread over their substitutes)
         for (int r = 0; r < k; ++r) {
             idx[(size_t) t * kPicks + r] = pick[r];
             w[(size_t) t * kPicks + r] = sc[pick[r]] / (s + 1e-20f) * route_scale;
@@ -1472,6 +1505,8 @@ __global__ void markov_pick_kernel(const unsigned* slots, int nm, unsigned seq, 
         while ((int) (*(volatile const unsigned*) (slots + (size_t) threadIdx.x * 4 + 2) - seq) < 0) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
             __nanosleep(32);
+#elif defined(__HIP_DEVICE_COMPILE__) && !defined(DS4_SPIN_NO_SLEEP)   // (2026-11-06: HIP waited without sleeping)
+        __builtin_amdgcn_s_sleep(2);
 #endif
         }
     __syncthreads();
@@ -1587,7 +1622,9 @@ __global__ void __launch_bounds__(512) route_publish_kernel(const float* __restr
                                                             float route_scale, const unsigned long long* __restrict__ vram,
                                                             const float* __restrict__ x, int dim, int* idx, float* w,
                                                             unsigned long long* plan_ptr, Req* req,
-                                                            const float* __restrict__ bias_vl, unsigned vl) {
+                                                            const float* __restrict__ bias_vl, unsigned vl,
+                                                            float miss_penalty, const float* __restrict__ pen_fac, int exact_norm = 0, int tail_from = 0, float tail_mul = 1.0f,
+                                                            int prot_j = 0, float prot_mul = 1.0f, float prot_share = 0.0f) {
     __shared__ float sc[1024], bs[1024];
     __shared__ float bv[32];
     __shared__ int bi[32];
@@ -1600,10 +1637,60 @@ __global__ void __launch_bounds__(512) route_publish_kernel(const float* __restr
         const float l = logits[i];
         const float sp = l > 20.0f ? l : log1pf(expf(l));
         sc[i] = sqrtf(sp);
+        // DS4_ROUTE_MISS_PENALTY: an expert off the GPU competes with this much less score, so a strong one is
+        // still picked while a weak one gives way to the next expert already resident. Weights keep the real score.
+        // DS4_STORE_PEN: one in the RAM store costs no disk, so it pays only pen_fac[i] of that.
+        // DS4_TAIL_PEN=R,f: the rows from R on (the drafts the round is least likely to keep) pay f times the penalty (N28)
         bs[i] = sc[i] + bias[i];
     }
     __syncthreads();
     const int lane = threadIdx.x & 31, wp = threadIdx.x >> 5;
+    // DS4_PEN_PROTECT=J,m (V2, 2026-11-07): the token's J strongest experts by the real score pay m times the penalty (m = 0: never
+    // substituted). A substitute for the top-1 does the most harm (t50 H1: an identifier typo); the rest keep the full penalty.
+    // DS4_PEN_PROTECT=J,m,s (2026-11-07, #13 of the ds-wormhole list): with s > 0 only those of the J that DOMINATE the token are protected - their
+    // real score is at least s of the sum of the token's top 6 (the share its weight gets); t54 protecting the top-1 always cost 25 %.
+    __shared__ int prot[16];
+    __shared__ float top_sum;
+    const int pj = (miss_penalty > 0.0f && prot_j > 0) ? (prot_j < 16 ? prot_j : 16) : 0;
+    const int pr = pj > 0 && prot_share > 0.0f ? (pj > 6 ? pj : 6) : pj;   // (the share needs the top 6's sum)
+    if (threadIdx.x == 0) top_sum = 0.0f;
+    for (int r = 0; r < pr; ++r) {
+        float best = -FLT_MAX;
+        int bix = 0x7fffffff;
+        for (int i = threadIdx.x; i < n; i += blockDim.x)
+            if (bs[i] > best || (bs[i] == best && i < bix)) best = bs[i], bix = i;
+        for (int o = 16; o > 0; o >>= 1) {
+            const float ov = __shfl_xor_sync(0xffffffffu, best, o);
+            const int oi = __shfl_xor_sync(0xffffffffu, bix, o);
+            if (ov > best || (ov == best && oi < bix)) best = ov, bix = oi;
+        }
+        if (lane == 0) bv[wp] = best, bi[wp] = bix;
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            float b = -FLT_MAX;
+            int ix = 0x7fffffff;
+            for (int q = 0; q < (int) (blockDim.x >> 5); ++q)
+                if (bv[q] > b || (bv[q] == b && bi[q] < ix)) b = bv[q], ix = bi[q];
+            if (r < pj) prot[r] = ix;
+            if (r < 6) top_sum += sc[ix];
+            bs[ix] = -FLT_MAX;
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0 && prot_share > 0.0f)
+        for (int r = 0; r < pj; ++r)
+            if (sc[prot[r]] < prot_share * top_sum) prot[r] = -1;   // (not dominant: the full penalty)
+    __syncthreads();
+    {
+        const float tail = (tail_from > 0 && t >= tail_from) ? tail_mul : 1.0f;
+        for (int i = threadIdx.x; i < n; i += blockDim.x) {
+            float m = 1.0f;
+            for (int r = 0; r < pj; ++r)
+                if (prot[r] == i) m = prot_mul;
+            bs[i] = sc[i] + bias[i] - (vram[i] == 0ull ? miss_penalty * tail * m * (pen_fac != nullptr ? pen_fac[i] : 1.0f) : 0.0f);
+        }
+    }
+    __syncthreads();
     for (int r = 0; r < k; ++r) {
         float best = -FLT_MAX;
         int bix = 0x7fffffff;
@@ -1626,9 +1713,41 @@ __global__ void __launch_bounds__(512) route_publish_kernel(const float* __restr
         }
         __syncthreads();
     }
+    // DS4_EXACT_NORM: the exact top-k's score sum, in parallel like the picks (bs is free now: refilled without the penalty)
+    __shared__ float se_sh;
+    const bool en_norm = exact_norm > 0 && (miss_penalty > 0.0f || k < exact_norm);
+    if (en_norm) {
+        for (int i = threadIdx.x; i < n; i += blockDim.x) bs[i] = sc[i] + bias[i];
+        if (threadIdx.x == 0) se_sh = 0.0f;
+        __syncthreads();
+        const int ln = threadIdx.x & 31, wq = threadIdx.x >> 5;
+        for (int r = 0; r < exact_norm && r < 16; ++r) {
+            float best = -FLT_MAX;
+            int bix = 0x7fffffff;
+            for (int i = threadIdx.x; i < n; i += blockDim.x)
+                if (bs[i] > best || (bs[i] == best && i < bix)) best = bs[i], bix = i;
+            for (int o = 16; o > 0; o >>= 1) {
+                const float ov = __shfl_xor_sync(0xffffffffu, best, o);
+                const int oi = __shfl_xor_sync(0xffffffffu, bix, o);
+                if (ov > best || (ov == best && oi < bix)) best = ov, bix = oi;
+            }
+            if (ln == 0) bv[wq] = best, bi[wq] = bix;
+            __syncthreads();
+            if (threadIdx.x == 0) {
+                float b = -FLT_MAX;
+                int ix = 0x7fffffff;
+                for (int q = 0; q < (int) (blockDim.x >> 5); ++q)
+                    if (bv[q] > b || (bv[q] == b && bi[q] < ix)) b = bv[q], ix = bi[q];
+                se_sh += sc[ix];
+                bs[ix] = -FLT_MAX;
+            }
+            __syncthreads();
+        }
+    }
     if (threadIdx.x == 0) {
         float s = 0.0f;
         for (int r = 0; r < k; ++r) s += sc[pick[r]];
+        if (en_norm) s = se_sh;   // DS4_EXACT_NORM: weights over the exact top-k's score (the missing ones' share is not spread over their substitutes)
         int cpu = 0;
         for (int r = 0; r < k; ++r) {
             const float wv = sc[pick[r]] / (s + 1e-20f) * route_scale;
@@ -1653,7 +1772,7 @@ __global__ void __launch_bounds__(512) route_publish_kernel(const float* __restr
 // a later layer's m likely picks (route_kernel's choice from its logits) into req->ahead[t][off ..)
 __global__ void __launch_bounds__(512) route_ahead_kernel(const float* __restrict__ logits,
                                                           const float* __restrict__ bias, int n, int m, Req* req,
-                                                          int off) {
+                                                          int off, const unsigned long long* __restrict__ vram, float miss_penalty) {
     __shared__ float bs[1024];
     __shared__ float bv[32];
     __shared__ int bi[32];
@@ -1662,7 +1781,7 @@ __global__ void __launch_bounds__(512) route_ahead_kernel(const float* __restric
     for (int i = threadIdx.x; i < n; i += blockDim.x) {
         const float l = logits[i];
         const float sp = l > 20.0f ? l : log1pf(expf(l));
-        bs[i] = sqrtf(sp) + bias[i];
+        bs[i] = sqrtf(sp) + bias[i] - (vram != nullptr && vram[i] == 0ull ? miss_penalty : 0.0f);
     }
     __syncthreads();
     const int lane = threadIdx.x & 31, wp = threadIdx.x >> 5;
@@ -1690,6 +1809,48 @@ __global__ void __launch_bounds__(512) route_ahead_kernel(const float* __restric
     }
 }
 
+// DS4_HEAT_WANTED: the k picks without the miss penalty into req->wanted[t], so the expert cache's heat follows what
+// the model asks for and not what the penalty left it
+__global__ void __launch_bounds__(512) route_wanted_kernel(const float* __restrict__ logits,
+                                                           const float* __restrict__ bias, int n, int k, Req* req,
+                                                           const float* __restrict__ bias_vl, unsigned vl) {
+    __shared__ float bs[1024];
+    __shared__ float bv[32];
+    __shared__ int bi[32];
+    const int t = blockIdx.x;
+    logits += (size_t) t * 1024;
+    if (bias_vl != nullptr && ((vl >> t) & 1u)) bias = bias_vl;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        const float l = logits[i];
+        const float sp = l > 20.0f ? l : log1pf(expf(l));
+        bs[i] = sqrtf(sp) + bias[i];
+    }
+    __syncthreads();
+    const int lane = threadIdx.x & 31, wp = threadIdx.x >> 5;
+    for (int r = 0; r < k; ++r) {
+        float best = -FLT_MAX;
+        int bix = 0x7fffffff;
+        for (int i = threadIdx.x; i < n; i += blockDim.x)
+            if (bs[i] > best || (bs[i] == best && i < bix)) best = bs[i], bix = i;
+        for (int o = 16; o > 0; o >>= 1) {
+            const float ov = __shfl_xor_sync(0xffffffffu, best, o);
+            const int oi = __shfl_xor_sync(0xffffffffu, bix, o);
+            if (ov > best || (ov == best && oi < bix)) best = ov, bix = oi;
+        }
+        if (lane == 0) bv[wp] = best, bi[wp] = bix;
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            float b = -FLT_MAX;
+            int ix = 0x7fffffff;
+            for (int q = 0; q < (int) (blockDim.x >> 5); ++q)
+                if (bv[q] > b || (bv[q] == b && bi[q] < ix)) b = bv[q], ix = bi[q];
+            req->wanted[t][r] = ix < n ? ix : -1;
+            if (ix < n) bs[ix] = -FLT_MAX;
+        }
+        __syncthreads();
+    }
+}
+
 __global__ void publish_kernel(Req* req, int T, unsigned seq, int na0, int na1) {
     __threadfence_system();
     req->na[0] = na0;
@@ -1704,6 +1865,8 @@ __global__ void wait_seq_kernel(const unsigned* seq_ptr, unsigned seq) {
     while (*(volatile const unsigned*) seq_ptr != seq) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
         __nanosleep(200);
+#elif defined(__HIP_DEVICE_COMPILE__) && !defined(DS4_SPIN_NO_SLEEP)   // (2026-11-06: HIP waited without sleeping)
+        __builtin_amdgcn_s_sleep(2);
 #endif
     }
     __threadfence_system();
@@ -1745,6 +1908,8 @@ __device__ __forceinline__ void wait_at_least(const unsigned* flag, unsigned seq
     while ((int) (*(volatile const unsigned*) flag - seq) < 0) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
         __nanosleep(100);
+#elif defined(__HIP_DEVICE_COMPILE__) && !defined(DS4_SPIN_NO_SLEEP)   // (2026-11-06: HIP waited without sleeping)
+        __builtin_amdgcn_s_sleep(2);
 #endif
     }
 }
@@ -2112,10 +2277,48 @@ attnsplit::AttnSplitScratch split_scratch(cudaStream_t s, int heads) {
 }
 }  // namespace
 
+static thread_local int route_layer_ = 63;
+void route_layer(int il) { route_layer_ = il; }
+// "a-b=p,c=q" over a value for all layers
+static std::vector<float> pen_table(float all, const char* l) {
+    std::vector<float> v(64, all);
+    if (l != nullptr) {
+        int a, b, used;
+        float p;
+        while (*l != 0) {
+            if (std::sscanf(l, "%d-%d=%f%n", &a, &b, &p, &used) != 3) {
+                if (std::sscanf(l, "%d=%f%n", &a, &p, &used) != 2) break;
+                b = a;
+            }
+            for (int i = a; i <= b && i < 64; ++i) v[(size_t) i] = p;
+            l += used;
+            if (*l == ',') ++l;
+        }
+    }
+    return v;
+}
+static bool route_pen_off_ = false;
+void route_penalty_off() { route_pen_off_ = true; }
+float route_penalty(int il) {
+    // DS4_ROUTE_MISS_PENALTY: every layer's; DS4_ROUTE_PEN_LAYERS="a-b=p,c=q": those layers' own (route_layer says which this is)
+    static const std::vector<float> pen_of = [] {
+        const char* e = std::getenv("DS4_ROUTE_MISS_PENALTY");
+        return pen_table(e != nullptr ? (float) std::atof(e) : 0.0f, std::getenv("DS4_ROUTE_PEN_LAYERS"));
+    }();
+    return route_pen_off_ ? 0.0f : pen_of[(size_t) std::clamp(il, 0, 63)];
+}
+float flow_penalty(int il) {
+    // DS4_FLOW_PEN_LAYERS="a-b=p,c=q": a chunk's own penalties, 0 on the other layers (not set: the token path's)
+    static const char* l = std::getenv("DS4_FLOW_PEN_LAYERS");
+    if (l == nullptr) return route_penalty(il);
+    static const std::vector<float> pen_of = pen_table(0.0f, l);
+    return pen_of[(size_t) std::clamp(il, 0, 63)];
+}
+
 void route_publish(const float* logits, const float* bias, int n, int k, int T, float route_scale,
                    const unsigned long long* vram, const float* x, int dim, int* idx, float* w,
                    unsigned long long* plan_ptr, Req* req, unsigned seq, cudaStream_t s, const float* bias_vl,
-                   unsigned vl, int na0, int na1) {
+                   unsigned vl, int na0, int na1, const float* pen_fac) {
 #if defined(STRATA_METAL)
     // selection only: the prefetch schedule (req) is published by the CUDA kernel, and is turned on separately here
     if (strata::dsv41::metal_host::route_publish(logits, bias, n, k, T, route_scale, vram, idx, w, plan_ptr,
@@ -2125,18 +2328,39 @@ void route_publish(const float* logits, const float* bias, int n, int k, int T, 
         return;
     }
 #endif
+    const float miss_penalty = route_penalty(route_layer_);
+    static const int exact_norm = std::getenv("DS4_EXACT_NORM") != nullptr ? std::max(1, std::atoi(std::getenv("DS4_EXACT_NORM")) == 1 ? 6 : std::atoi(std::getenv("DS4_EXACT_NORM"))) : 0;   // (1 = the model's 6)
+    static int tail_from = 0;
+    static float tail_mul = 1.0f;
+    static const bool tail_read = [] {
+        if (const char* v = std::getenv("DS4_TAIL_PEN")) std::sscanf(v, "%d,%f", &tail_from, &tail_mul);
+        return true;
+    }();
+    (void) tail_read;
+    static int prot_j = 0;
+    static float prot_mul = 1.0f;
+    static float prot_share = 0.0f;
+    static const bool prot_read = [] {   // DS4_PEN_PROTECT=J,m (V2): the J strongest experts of each token pay m times the penalty
+        if (const char* v = std::getenv("DS4_PEN_PROTECT")) std::sscanf(v, "%d,%f,%f", &prot_j, &prot_mul, &prot_share);
+        return true;
+    }();
+    (void) prot_read;
     strata_ds4_launch(route_publish_kernel, T, 512, 0, s, logits, bias, n, k, route_scale, vram, x, dim, idx, w, plan_ptr, req,
-                                           vl != 0 ? bias_vl : nullptr, vl);
+                                           vl != 0 ? bias_vl : nullptr, vl, miss_penalty, pen_fac, exact_norm, tail_from, tail_mul, prot_j, prot_mul, prot_share);
+    static const bool heat_wanted = std::getenv("DS4_HEAT_WANTED") != nullptr && std::atoi(std::getenv("DS4_HEAT_WANTED")) != 0;
+    if (req != nullptr && heat_wanted && miss_penalty > 0.0f)
+        strata_ds4_launch(route_wanted_kernel, T, 512, 0, s, logits, bias, n, k, req, vl != 0 ? bias_vl : nullptr, vl);
     if (req != nullptr) strata_ds4_launch(publish_kernel, 1, 1, 0, s, req, T, seq, na0, na1);
 }
-void route_ahead(const float* logits, const float* bias, int n, int m, int T, Req* req, int off, cudaStream_t s) {
+void route_ahead(const float* logits, const float* bias, int n, int m, int T, Req* req, int off, cudaStream_t s,
+                 const unsigned long long* vram, float miss_penalty) {
 #if defined(STRATA_METAL)
     // no prefetch schedule on the Mac path yet: the router publishes no requests, so there is nothing to look ahead for
     (void) logits; (void) bias; (void) n; (void) m; (void) T; (void) req; (void) off; (void) s;
     return;
 #endif
     if (req != nullptr && m > 0 && T > 0 && n <= 1024 && off + m <= kAhead)
-        strata_ds4_launch(route_ahead_kernel, T, 512, 0, s, logits, bias, n, m, req, off);
+        strata_ds4_launch(route_ahead_kernel, T, 512, 0, s, logits, bias, n, m, req, off, vram, miss_penalty);
 }
 void wait_seq(const unsigned* seq_ptr, unsigned seq, cudaStream_t s) {
 #if defined(STRATA_METAL)
@@ -2324,15 +2548,33 @@ void gemv_f32(const float* W, const float* x, int n, int k, int T, float* y, int
     if (T > 0) strata_ds4_launch(gemv_f32_kernel, dim3(cdiv(n, kThreads / 32), T), kThreads, 0, s, W, x, n, k, y, ldy);
 }
 
+// DS4_UNION_PEN: one block.  fac[e] = base[e] (1 without a base), then 0 for every expert off the GPU that a row of this
+// round already picked: the verify window reads it once for all its rows, so the other rows take it without the penalty.
+__global__ void __launch_bounds__(512) union_fac_kernel(const int* __restrict__ idx, int T, int k,
+                                                        const unsigned long long* __restrict__ vram,
+                                                        const float* __restrict__ base, float* fac, int n) {
+    for (int i = threadIdx.x; i < n; i += blockDim.x) fac[i] = base != nullptr ? base[i] : 1.0f;
+    __syncthreads();
+    for (int j = threadIdx.x; j < T * k; j += blockDim.x) {
+        const int e = idx[(size_t) (j / k) * kPicks + j % k];
+        if (e >= 0 && e < n && vram[e] == 0ull) fac[e] = 0.0f;
+    }
+}
+void union_fac(const int* idx, int T, int k, const unsigned long long* vram, const float* base, float* fac, int n,
+               cudaStream_t s) {
+    strata_ds4_launch(union_fac_kernel, 1, 512, 0, s, idx, T, k, vram, base, fac, n);
+}
+
 void route(const float* logits, const float* bias, int n, int k, int T, float route_scale, int* idx, float* w,
-           cudaStream_t s, const float* bias_vl, const VlBits* vl) {
+           cudaStream_t s, const float* bias_vl, const VlBits* vl, const unsigned long long* vram, float miss_penalty) {
     static const VlBits none = {};
 #if defined(STRATA_METAL)
     // route_kernel on the Metal dispatch; the launch below is the fallback
     if (strata::dsv41::metal_host::route(logits, bias, n, k, T, route_scale, idx, w, bias_vl, vl)) return;
 #endif
+    static const int exact_norm = std::getenv("DS4_EXACT_NORM") != nullptr ? std::max(1, std::atoi(std::getenv("DS4_EXACT_NORM")) == 1 ? 6 : std::atoi(std::getenv("DS4_EXACT_NORM"))) : 0;   // (1 = the model's 6)
     strata_ds4_launch(route_kernel, T, 512, 0, s, logits, bias, n, k, route_scale, idx, w, vl != nullptr ? bias_vl : nullptr,
-                                   vl != nullptr ? *vl : none);
+                                   vl != nullptr ? *vl : none, vram, miss_penalty, exact_norm);
 }
 
 void swiglu(const float* g, const float* u, int n, float lim, float* h, cudaStream_t s) {
