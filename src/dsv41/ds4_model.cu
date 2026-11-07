@@ -1105,7 +1105,7 @@ struct Model::Impl {
     }
     // 1: the same letters in other case ("IDO" / "ido"); 2: one the other's prefix ("heap" / "heapp"), leading spaces aside,
     // case aside, the shorter with a letter; 0: anything else (or no texts)
-    static int tie_kind(const TieCfg& c, int a, int b) {
+    static int tie_kind(const TieCfg& c, int a, int b, int prev = -1) {
         if (a < 0 || b < 0 || (size_t) a >= c.txt.size() || (size_t) b >= c.txt.size()) return 0;
         auto norm = [](const std::string& s) {
             size_t k = 0;
@@ -1118,7 +1118,14 @@ struct Model::Impl {
         const std::string& rb = c.txt[(size_t) b];
         // 3 (checked last): both continue the word or path being written - no leading whitespace on either ("nder" / "/re":
         // "/tmp/render" or "/tmp/re/re"); a tie between whole words (" render" / " use") is a choice of wording, not this
-        const bool mid = !ra.empty() && !rb.empty() && !std::isspace((unsigned char) ra[0]) && !std::isspace((unsigned char) rb[0]);
+        // (2026-11-08: "no leading whitespace" alone took punctuation ("." / ".\n\n") and words at a line start ("Let" /
+        // "Need"): 4.6 % of rounds rechecked, 1 token in 23 changed, 24 -> 18 t/s.  Now the token before ends in a letter or
+        // digit (a word or path is being written) and one candidate goes on with one.)
+        auto alnum = [](unsigned char ch) { return std::isalnum(ch) || ch == '_' || ch >= 0x80; };
+        const std::string* pt = prev >= 0 && (size_t) prev < c.txt.size() ? &c.txt[(size_t) prev] : nullptr;
+        const bool in_word = pt != nullptr && !pt->empty() && alnum((unsigned char) pt->back());
+        const bool mid = in_word && !ra.empty() && !rb.empty() && !std::isspace((unsigned char) ra[0]) &&
+                         !std::isspace((unsigned char) rb[0]) && (alnum((unsigned char) ra[0]) || alnum((unsigned char) rb[0]));
         const std::string x = norm(ra), y = norm(rb);
         auto letter = [](const std::string& s) {
             for (char ch : s) if (std::isalpha((unsigned char) ch)) return true;
@@ -8649,7 +8656,7 @@ struct Model::Impl {
                     continue;
                 }
                 const float gap = (L1[a1] - L1[a2]) / tt;
-                const int kind = tie_kind(tc, ch, ch == a1 ? a2 : a1);   // 0 other, 1 case, 2 prefix, 3 mid-word
+                const int kind = tie_kind(tc, ch, ch == a1 ? a2 : a1, tk[r]);   // 0 other, 1 case, 2 prefix, 3 mid-word
                 if (gap < tc.log_gap) {
                     ++tie_st.ties[kind];
                     any = true;
