@@ -122,9 +122,22 @@ class LlamaTools:
         return pat.lstrip("/")
 
     @staticmethod
+    def _braces(pat: str) -> list[str]:
+        """{a,b} alternatives expanded (llama.cpp's glob has none; models write "**/*.{js,json}" anyway and got no match)"""
+        m = re.search(r"\{([^{}]*)\}", pat)
+        if not m:
+            return [pat]
+        out = []
+        for alt in m.group(1).split(","):
+            out += LlamaTools._braces(pat[:m.start()] + alt + pat[m.end():])
+        return out
+
+    @staticmethod
     def _match(rel: str, pat: str | None) -> bool:
         if not pat:
             return True
+        if "{" in pat:
+            return any(LlamaTools._match(rel, p) for p in LlamaTools._braces(pat))
         if "/" not in pat:
             return fnmatch.fnmatch(rel.rsplit("/", 1)[-1], pat)
         if fnmatch.fnmatch(rel, pat):
