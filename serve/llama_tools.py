@@ -5,6 +5,7 @@ answers, so the page's tools panel works against Strata. Off unless the server i
 read_file, file_glob_search, grep_search, exec_shell_command, write_file, edit_file, get_info."""
 from __future__ import annotations
 
+import base64
 import fnmatch
 import os
 import re
@@ -12,6 +13,7 @@ import subprocess
 from pathlib import Path
 
 READ_FILE_MAX = 16 * 1024
+READ_FILE_MAX_BASE64 = 32 * 1024 * 1024   # (llama.cpp SERVER_TOOL_READ_FILE_MAX_SIZE_BASE64)
 SEARCH_MAX = 100
 GREP_MAX = 100
 EXEC_MAX_OUTPUT = 16 * 1024
@@ -184,6 +186,12 @@ class LlamaTools:
         start, end, loc = int(p.get("start_line") or 1), int(p.get("end_line") or -1), bool(p.get("append_loc"))
         if not path.is_file():
             return {"error": f"cannot stat file: {p['path']}"}
+        if p.get("resp_type") == "base64":   # (the x-resp-type header, as llama.cpp's server: read_media's bytes, 32 MB at most)
+            n = path.stat().st_size
+            if n > READ_FILE_MAX_BASE64:
+                return {"error": f"file too large ({n} bytes, max {READ_FILE_MAX_BASE64})"}
+            data = path.read_bytes()
+            return {"base64": base64.b64encode(data).decode("ascii"), "size_bytes": len(data)}
         if path.stat().st_size > READ_FILE_MAX and end == -1:
             return {"error": f"file too large ({path.stat().st_size} bytes, max {READ_FILE_MAX}). Use start_line/end_line to read a portion."}
         out = []

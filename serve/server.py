@@ -7086,6 +7086,10 @@ def make_handler(svc: Service):
             except (ValueError, TypeError):
                 self._json(400, {"error": {"type": "invalid_request_error", "message": "a JSON body {tool, params}"}})
                 return
+            # x-resp-type (llama.cpp: only read_file reads it; the model cannot ask for it): read_media's "base64"
+            params.pop("resp_type", None)
+            if self.headers.get("x-resp-type"):
+                params["resp_type"] = self.headers.get("x-resp-type")
             lt = getattr(svc, "llama_tools", None)
             _ta = json.dumps(params, ensure_ascii=False)
             print(f"[strata] tool {name} {_ta[:300]}{'...' if len(_ta) > 300 else ''} (cwd {self.headers.get('x-tool-cwd') or '-'})", flush=True)
