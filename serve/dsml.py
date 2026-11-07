@@ -20,6 +20,7 @@ split behave for DeepSeek as they do for the other families, and there is one pl
 """
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 
@@ -30,9 +31,16 @@ _OPEN = "<" + DSML
 _CLOSE = "</" + DSML
 _TAG_MAX = 600                  # a tag (a tool name, a parameter name) longer than this is text, not held any further
 
-_CALLS = re.compile(r"<｜DSML｜\s*(?:tool_|function_)?calls\s*>")
-_CALLS_END = re.compile(r"</｜DSML｜\s*(?:tool_|function_)?calls\s*>")
-_INVOKE = re.compile(r'<｜DSML｜\s*invoke\s+name\s*=\s*"([^"]*)"\s*>')
+# (2026-11-08) spelled as deepseek-recipe reads them: the block opens at "<"+DSML whatever the word ("calls", "tool_calls",
+# "tool calls"), either closing ends it, the invoke name in double, single or no quotes, the parameter's attributes in any order
+_CALLS = re.compile(r"<｜DSML｜\s*(?:tool[_ ]|function[_ ])?calls\s*>")
+_CALLS_END = re.compile(r"</｜DSML｜\s*(?:tool[_ ]|function[_ ])?calls\s*>")
+_INVOKE = re.compile(r'<｜DSML｜\s*invoke\s+name\s*=\s*(?:"([^"]*)"|\'([^\']*)\'|([^\s>"\']+))\s*>')
+_PARAM_TAG = re.compile(r"<｜DSML｜\s*parameter\b([^<>]*)>")
+_ATTR = re.compile(r'([A-Za-z_]+)\s*=\s*(?:"([^"]*)"|\'([^\']*)\'|([^\s>"\']+))')
+# a '<' inside a value: marked while the value goes through the Qwen form (a value holding "</parameter>" or "</tool_call>" -
+# XML, a template - cut the call short), put back in the call's arguments
+LT_MARK = "\U000F0E30"
 _INVOKE_END = re.compile(r"</｜DSML｜\s*invoke\s*>")
 _PARAM = re.compile(r'<｜DSML｜\s*parameter\s+name\s*=\s*"([^"]*)"(?:\s+string\s*=\s*"(true|false)")?\s*>')
 _PARAM_END = re.compile(r"</｜DSML｜\s*parameter\s*>")
@@ -95,10 +103,14 @@ class DsmlTranslator:
         return "".join(out)
 
     def _text(self, text: str, out: list[str]) -> None:
+        if self.blocks_closed and self.state == "text":
+            return                              # after the call block: deepseek-recipe's ContentAfterFinished, skipped
         if self.state in ("calls", "invoke"):
-            if text.strip() == "":
-                return                          # the layout between tags
-            # stray text inside the block: it is shown as text, and the block goes on
+            # (2026-11-08) the layout between tags, and any stray text there, is skipped, as deepseek-recipe skips it: shown,
+            # it went into the Qwen form where it stopped the streamed arguments (the UI ran write_file with {})
+            return
+        if self.state == "param":
+            text = text.replace("<", LT_MARK)
         out.append(text)
 
     def _tag(self, outl: list[str]):
@@ -150,17 +162,21 @@ class DsmlTranslator:
         if m:
             if self.state == "invoke":          # the previous call's closing tag was left out
                 out("</function>\n</tool_call>\n")
+            name = next(g for g in m.groups() if g is not None)
             self.buf = s[gt + 1:]
-            self.state, self.tool = "invoke", m.group(1)
-            out(f"<tool_call>\n<function={m.group(1)}>\n")
+            self.state, self.tool = "invoke", name
+            out(f"<tool_call>\n<function={name}>\n")
             return True
-        m = _PARAM.fullmatch(head)
-        if m and self.state in ("calls", "invoke"):
+        m = _PARAM_TAG.fullmatch(head)
+        attrs = {a.group(1).lower(): a.group(a.lastindex) for a in _ATTR.finditer(m.group(1))} if m else {}
+        if m and "name" in attrs and self.state in ("calls", "invoke"):
             self.buf = s[gt + 1:]
             self.state = "param"
             if self.on_param is not None:
-                self.on_param(self.tool, m.group(1), m.group(2) != "false")
-            out(f"<parameter={m.group(1)}>\n")
+                st = attrs.get("string", "").lower()
+                # (2026-11-08) no attribute: the schema says (it used to mean string, so start_line came as "5")
+                self.on_param(self.tool, attrs["name"], True if st == "true" else False if st == "false" else None)
+            out(f"<parameter={attrs['name']}>\n")
             return True
         return None
 
@@ -169,16 +185,47 @@ class DsmlOutputParser(OutputParser):
     """OutputParser for DeepSeek-V4.1: the model's DSML calls are read as the template-form calls they are."""
 
     def __init__(self, *args, **kwargs):
+        # (2026-11-08) no streamed arguments: a call goes out whole, its arguments as parse_tool_call read them.  Streamed, the
+        # pieces could differ from the final parse (a value the scan did not take), and clients run what was streamed: the
+        # web UI ran write_file with {} while the server held the right arguments.
+        kwargs["stream_tools"] = False
         super().__init__(*args, **kwargs)
         self.dsml = DsmlTranslator(self._on_param)
+        self._json_strings: set[tuple[str, str]] = set()   # (tool, parameter) written string="false" on a string field
+        self._left_reasoning = False
         # The 2-bit sets often write the whole answer after <think> and stop (EOS) without </think>: everything would be reasoning and
         # the reply empty (P2003 install test, 4 of 4 prompts).  The reasoning text is kept here; finish() hands it over as the answer
         # when the turn ended on a stop with no answer and no call.
         self._reasoning: list[str] = []
         self._answered = False
 
+    def _unmark(self, v):
+        if isinstance(v, str):
+            return v.replace(LT_MARK, "<")
+        if isinstance(v, list):
+            return [self._unmark(x) for x in v]
+        if isinstance(v, dict):
+            return {k: self._unmark(x) for k, x in v.items()}
+        return v
+
     def _watch(self, evs):
+        if self.state != "reasoning":
+            self._left_reasoning = True
         for ev in evs:
+            if ev.text and LT_MARK in ev.text:
+                ev.text = ev.text.replace(LT_MARK, "<")
+            if ev.kind == "tool_call" and ev.call is not None and isinstance(ev.call.arguments, dict):
+                args = self._unmark(ev.call.arguments)
+                for (tool, name) in list(self._json_strings):
+                    if tool == ev.call.name and isinstance(args.get(name), str):
+                        try:      # string="false" on a string field: the value is JSON (deepseek-recipe decodes it)
+                            dec = json.loads(args[name])
+                            if isinstance(dec, str):
+                                args[name] = dec
+                        except ValueError:
+                            pass
+                self._json_strings = {k for k in self._json_strings if k[0] != ev.call.name}
+                ev.call.arguments = args
             if ev.kind == "reasoning":
                 self._reasoning.append(ev.text)
             elif ev.kind in ("tool_start", "tool_call") or (ev.kind == "content" and ev.text.strip()):
@@ -186,7 +233,14 @@ class DsmlOutputParser(OutputParser):
         return evs
 
     def _on_param(self, tool, name, is_string) -> None:
-        """string="true": the value is a string whatever it looks like ("123", "true"), as the template wrote it."""
+        """string="true": the value is a string whatever it looks like ("123", "true"), as the template wrote it.
+        string="false" on a field the schema calls a string: its value is JSON, decoded when the call is read.
+        No attribute (None): the schema decides."""
+        if is_string is False:
+            spec = self.schemas.get(tool) or {}
+            if (((spec.get("parameters") or {}).get("properties") or {}).get(name) or {}).get("type") == "string":
+                self._json_strings.add((tool, name))
+            return
         if not is_string:
             return
         spec = self.schemas.get(tool)
@@ -226,7 +280,9 @@ class DsmlOutputParser(OutputParser):
         out = self._watch(super().feed(rest) if rest else [])
         out += self._watch(super().finish(reason))
         text = "".join(self._reasoning).strip()
-        if reason in (None, "stop") and text and not self._answered:
+        # (2026-11-08) only when the thinking never ended: after a </think> (or the budget's wrap-up) an empty answer is empty -
+        # it used to send the whole thinking, wrap-up sentence included, as the answer
+        if reason in (None, "stop") and text and not self._answered and not self._left_reasoning:
             # no </think> and no answer: the text IS the answer.  A streaming client has already seen it as reasoning and now gets
             # it as content; the non-streaming collectors (server.py) drop the identical reasoning.
             self._answered = True

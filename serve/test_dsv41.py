@@ -200,7 +200,13 @@ class Translator(unittest.TestCase):
 
     def test_a_value_that_looks_like_a_tag(self):
         raw = call(("write", [("text", "<b>bold</b> and < 3", True)]))
-        self.assertIn("<parameter=text>\n<b>bold</b> and < 3\n</parameter>", self.all_at_once(raw))
+        # (2026-11-08) a '<' in a value is marked in the Qwen form (DsmlOutputParser puts it back): no value ends the call early
+        from serve.dsml import LT_MARK
+        self.assertIn("<parameter=text>\n<b>bold</b> and < 3\n</parameter>".replace("<b>", LT_MARK + "b>").replace("</b>", LT_MARK + "/b>")
+                      .replace("< 3", LT_MARK + " 3"), self.all_at_once(raw))
+        p = DsmlOutputParser(thinking=False, tools=[{"name": "write", "parameters": {"type": "object", "properties": {"text": {"type": "string"}}}}])
+        evs = p.feed(raw) + p.finish("stop")
+        self.assertEqual([e.call.arguments for e in evs if e.kind == "tool_call"], [{"text": "<b>bold</b> and < 3"}])
 
     def test_a_missing_closing_tag_is_closed(self):
         raw = '<｜DSML｜ calls>\n<｜DSML｜ invoke name="f">\n<｜DSML｜ parameter name="a" string="true">x</｜DSML｜ invoke>'
@@ -228,8 +234,8 @@ class Parser(unittest.TestCase):
             calls = [e.call for e in evs if e.kind == "tool_call"]
             self.assertEqual([(c.name, c.arguments) for c in calls],
                              [("get_weather", {"city": "Zagreb", "days": 3}), ("lookup", {"id": "123"})])
-            self.assertEqual("".join(e.text for e in evs if e.kind == "tool_args"),
-                             '{"city":"Zagreb","days":3}{"id":"123"}')
+            # (2026-11-08) DeepSeek's calls go out whole: no streamed pieces that could differ from the final parse
+            self.assertEqual("".join(e.text for e in evs if e.kind == "tool_args"), "")
 
     def test_a_string_value_stays_a_string_even_when_the_schema_says_nothing(self):
         evs = self.run_parser(call(("lookup", [("id", "007", True)])), thinking=False)

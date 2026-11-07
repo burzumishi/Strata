@@ -14,6 +14,13 @@ from pathlib import Path
 
 READ_FILE_MAX = 16 * 1024
 READ_FILE_MAX_BASE64 = 32 * 1024 * 1024   # (llama.cpp SERVER_TOOL_READ_FILE_MAX_SIZE_BASE64)
+
+
+def _truthy(v) -> bool:
+    """A boolean parameter as a model sends it: true/false, or the strings "true"/"false"/"1"/"0" (bool("false") was True)."""
+    if isinstance(v, str):
+        return v.strip().lower() in ("true", "1", "yes", "on")
+    return bool(v)
 SEARCH_MAX = 100
 GREP_MAX = 100
 EXEC_MAX_OUTPUT = 16 * 1024
@@ -184,7 +191,7 @@ class LlamaTools:
 
     def t_read_file(self, p, cwd, _):
         path = self._path(p["path"], cwd)
-        start, end, loc = int(p.get("start_line") or 1), int(p.get("end_line") or -1), bool(p.get("append_loc"))
+        start, end, loc = int(p.get("start_line") or 1), int(p.get("end_line") or -1), _truthy(p.get("append_loc"))
         if not path.is_file():
             return {"error": f"cannot stat file: {p['path']}"}
         if p.get("resp_type") == "base64":   # (the x-resp-type header, as llama.cpp's server: read_media's bytes, 32 MB at most)
@@ -251,7 +258,7 @@ class LlamaTools:
             return {"error": f"invalid regex: {e}"}
         if not base.exists():
             return {"error": f"path does not exist: {p['path']}"}
-        ctx, nums = int(p.get("context_lines") or 0), bool(p.get("return_line_numbers"))
+        ctx, nums = int(p.get("context_lines") or 0), _truthy(p.get("return_line_numbers"))
         inc, exc = self._norm_glob(p.get("include")), self._norm_glob(p.get("exclude"))
         files = [(base, base.name)] if base.is_file() else \
             [(base / rel, rel) for rel, _d in self._walk(base, False, True, 0)
