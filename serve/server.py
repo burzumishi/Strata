@@ -8040,8 +8040,9 @@ def make_handler(svc: Service):
                 props["model_path"] = svc.engine.model_path
             version = getattr(svc.engine, "info", {}).get("version")
             if version:
-                # (2026-11-07) our build: ds-wormhole, its commit, then the engine it runs
-                props["build_info"] = f"ds-wormhole {_WORMHOLE_REV} (Strata {version})" if _WORMHOLE_REV else f"ds-wormhole (Strata {version})"
+                # (2026-11-07) our build: dsv41f-strix-halo (wormhole), its commit, then the engine it runs
+                props["build_info"] = (f"dsv41f-strix-halo (wormhole) {_WORMHOLE_REV} · Strata {version}" if _WORMHOLE_REV
+                                       else f"dsv41f-strix-halo (wormhole) · Strata {version}")
             # (llama.cpp's web UI) as its router, so the page shows the model picker, here with the one model served
             if "model=" not in (self.path.split("?", 1)[1] if "?" in self.path else ""):
                 props["role"] = "router"
