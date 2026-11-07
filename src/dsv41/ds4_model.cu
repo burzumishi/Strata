@@ -1068,7 +1068,7 @@ struct Model::Impl {
     std::vector<strata::dsv41k::SpecList> h_specq = std::vector<strata::dsv41k::SpecList>(kWin);
     // near ties (verify(): DS4_TIE_LOG / DS4_TIE_RECHECK / DS4_TIE_VOCAB / DS4_TIE_TRACE)
     struct TieCfg {
-        float log_gap = 0.0f, fix_gap = 0.0f;
+        float log_gap = 0.0f, fix_gap = 0.0f, mid_gap = 0.0f;   // mid_gap: DS4_TIE_MID, the mid-word class's own gap
         bool ortho_only = false;
         std::vector<std::string> txt;   // the token texts (DS4_TIE_VOCAB: bench/v41/tie_vocab.py)
         std::FILE* trace = nullptr;     // DS4_TIE_TRACE=file: position, row, gap, kind, token, rival
@@ -1078,6 +1078,8 @@ struct Model::Impl {
             TieCfg t;
             if (const char* e = std::getenv("DS4_TIE_LOG")) t.log_gap = std::strtof(e, nullptr);
             if (const char* e = std::getenv("DS4_TIE_RECHECK")) t.fix_gap = std::strtof(e, nullptr);
+            if (const char* e = std::getenv("DS4_TIE_MID")) t.mid_gap = std::strtof(e, nullptr);
+            if (t.mid_gap > t.log_gap) t.log_gap = t.mid_gap;
             if (t.fix_gap > t.log_gap) t.log_gap = t.fix_gap;
             if (const char* e = std::getenv("DS4_TIE_VOCAB")) {
                 std::ifstream f(e, std::ios::binary);
@@ -1112,21 +1114,26 @@ struct Model::Impl {
             for (char& ch : o) ch = (char) std::tolower((unsigned char) ch);
             return o;
         };
-        const std::string x = norm(c.txt[(size_t) a]), y = norm(c.txt[(size_t) b]);
+        const std::string& ra = c.txt[(size_t) a];
+        const std::string& rb = c.txt[(size_t) b];
+        // 3 (checked last): both continue the word or path being written - no leading whitespace on either ("nder" / "/re":
+        // "/tmp/render" or "/tmp/re/re"); a tie between whole words (" render" / " use") is a choice of wording, not this
+        const bool mid = !ra.empty() && !rb.empty() && !std::isspace((unsigned char) ra[0]) && !std::isspace((unsigned char) rb[0]);
+        const std::string x = norm(ra), y = norm(rb);
         auto letter = [](const std::string& s) {
             for (char ch : s) if (std::isalpha((unsigned char) ch)) return true;
             return false;
         };
-        if (x.empty() || y.empty() || !letter(x) || !letter(y)) return 0;
+        if (x.empty() || y.empty() || !letter(x) || !letter(y)) return mid ? 3 : 0;
         if (x == y) {   // (a leading space alone is a word boundary, not a case slip)
             auto strip = [](const std::string& s) { size_t k = 0; while (k < s.size() && s[k] == ' ') ++k; return s.substr(k); };
             return strip(c.txt[(size_t) a]) != strip(c.txt[(size_t) b]) ? 1 : 0;
         }
         const std::string& sh = x.size() < y.size() ? x : y;
         const std::string& lo = x.size() < y.size() ? y : x;
-        return lo.compare(0, sh.size(), sh) == 0 ? 2 : 0;
+        return lo.compare(0, sh.size(), sh) == 0 ? 2 : mid ? 3 : 0;
     }
-    struct TieStats { long long rounds = 0, rows = 0, tie_rounds = 0, ties[3] = {0, 0, 0}, fixed = 0, changed = 0, tail[4] = {0, 0, 0, 0}; } tie_st;
+    struct TieStats { long long rounds = 0, rows = 0, tie_rounds = 0, ties[4] = {0, 0, 0, 0}, fixed = 0, changed = 0, tail[4] = {0, 0, 0, 0}; } tie_st;
     std::vector<float> tie_lg;
     bool drafts_q = false;
     float dq_temp = 0.0f, dq_top_p = 1.0f, dq_min_p = 0.0f;
@@ -8638,11 +8645,11 @@ struct Model::Impl {
                     const double rel = std::exp(-(double) down);
                     ++tie_st.tail[rel < 0.01 ? 0 : rel < 0.05 ? 1 : rel < 0.1 ? 2 : 3];
                     if (tc.trace != nullptr && rel < 0.1)
-                        std::fprintf(tc.trace, "%lld\t%d\t%.3f\t3\t%d\t%d\n", (long long) (p0 + r), r, down, ch, a1);
+                        std::fprintf(tc.trace, "%lld\t%d\t%.3f\t9\t%d\t%d\n", (long long) (p0 + r), r, down, ch, a1);   // (kind 9: a tail draw)
                     continue;
                 }
                 const float gap = (L1[a1] - L1[a2]) / tt;
-                const int kind = tie_kind(tc, ch, ch == a1 ? a2 : a1);   // 0 other, 1 case, 2 prefix
+                const int kind = tie_kind(tc, ch, ch == a1 ? a2 : a1);   // 0 other, 1 case, 2 prefix, 3 mid-word
                 if (gap < tc.log_gap) {
                     ++tie_st.ties[kind];
                     any = true;
@@ -8650,7 +8657,8 @@ struct Model::Impl {
                         std::fprintf(tc.trace, "%lld\t%d\t%.3f\t%d\t%d\t%d\n", (long long) (p0 + r), r, gap, kind, ch,
                                      ch == a1 ? a2 : a1);
                 }
-                if (r_tie < 0 && tc.fix_gap > 0.0f && gap < tc.fix_gap && (!tc.ortho_only || kind > 0)) {
+                const bool fire = kind == 3 ? gap < tc.mid_gap : gap < tc.fix_gap && (!tc.ortho_only || kind > 0);
+                if (r_tie < 0 && (tc.fix_gap > 0.0f || tc.mid_gap > 0.0f) && fire) {
                     r_tie = r;
                     c_tie = ch;
                 }
@@ -8658,10 +8666,10 @@ struct Model::Impl {
             if (any) ++tie_st.tie_rounds;
             if (tc.log_gap > 0.0f && tie_st.rounds % 500 == 0)
                 std::fprintf(stderr, "ds4 ties (gap %.2f): %lld rounds, %lld rows; rounds with a tie %.2f %%; rows: other %.2f %%, "
-                             "case %.3f %%, prefix %.3f %%; rechecked %lld, changed %lld; tail draws (p/p_top) <0.01 %.3f %%, "
+                             "case %.3f %%, prefix %.3f %%, mid-word %.3f %%; rechecked %lld, changed %lld; tail draws (p/p_top) <0.01 %.3f %%, "
                              "<0.05 %.3f %%, <0.1 %.3f %%, >=0.1 %.3f %%\n", tc.log_gap, tie_st.rounds,
                              tie_st.rows, 100.0 * tie_st.tie_rounds / tie_st.rounds, 100.0 * tie_st.ties[0] / tie_st.rows,
-                             100.0 * tie_st.ties[1] / tie_st.rows, 100.0 * tie_st.ties[2] / tie_st.rows, tie_st.fixed,
+                             100.0 * tie_st.ties[1] / tie_st.rows, 100.0 * tie_st.ties[2] / tie_st.rows, 100.0 * tie_st.ties[3] / tie_st.rows, tie_st.fixed,
                              tie_st.changed, 100.0 * tie_st.tail[0] / tie_st.rows, 100.0 * tie_st.tail[1] / tie_st.rows,
                              100.0 * tie_st.tail[2] / tie_st.rows, 100.0 * tie_st.tail[3] / tie_st.rows);
         }
