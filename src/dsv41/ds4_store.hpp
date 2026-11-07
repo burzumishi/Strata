@@ -73,6 +73,9 @@ public:
         // 2026-11-07 (P3, DS4_STORE_MAPREAD): where the file range lies in this process's mapping of the model; a range wholly in the page cache
         // is then copied from there (buffered) instead of read again from the disk unbuffered (the reader's j.map path, ds4_pool.hpp)
         std::function<const void*(int file, uint64_t off)> map_at;
+        // 2026-11-07 (the memory SWITCH, DS4_STORE_LEND): slots past the arena that live in memory the prompt path owns (its pinned
+        // staging): lent to the store while the model writes, taken back (reclaim) before a prompt is read. At most this many.
+        size_t loan_capacity = 0;
         size_t reserve = 192;              // slots kept evictable (not visible) for the window's demand and guesses
         int vis_percent = 100;             // the share of experts the GPU may take (by a fixed hash): the rest stay the CPU lane's, so both lanes work
     };
@@ -96,7 +99,7 @@ public:
         }
         if (arena_ == nullptr) arena_ = (uint8_t*) os::range_reserve(arena_bytes_);
         if (arena_ == nullptr) return false;
-        slots_.reset(new Slot[nmax_]);
+        slots_.reset(new Slot[nmax_ + c.loan_capacity]);
         where_.resize(geo_.size());
         heat_.resize(geo_.size());
         hits_in_layer_.assign(geo_.size(), 0);
@@ -166,6 +169,7 @@ public:
     const uint8_t* blob(int slot) const { return slots_[(size_t) slot].base; }
     /// The device address of the slot's blob (0: the arena is not mapped for the GPU)
     unsigned long long dev_blob(int slot) const {
+        if ((size_t) slot >= nmax_) return loan_dev_[(size_t) slot - nmax_];   // (a lent slot: its own device address)
         const size_t c = (size_t) slot / kChunk;
         if (c >= chunk_dev_.size() || chunk_dev_[c] == nullptr) return 0;
         return (unsigned long long) ((uint8_t*) chunk_dev_[c] + (slots_[(size_t) slot].base - (uint8_t*) chunks_[c].first));
@@ -367,7 +371,8 @@ public:
     size_t sync(std::vector<Vis>& ev, const std::function<bool(int, int)>& gpu_ok) {
         std::lock_guard<std::mutex> lk(mu_);
         size_t nvis = 0, nfree = 0;
-        for (size_t i = 0; i < nalloc_; ++i) {
+        for (size_t i = 0; i < nmax_ + nloan_; ++i) {
+            if (i >= nalloc_ && (i < nmax_ || !loan_on_)) continue;   // (the arena's slots, and the lent ones while lent)
             Slot& sp = slots_[i];
             if (sp.state.load(std::memory_order_acquire) == kLoading && sp.left.load(std::memory_order_acquire) == 0) {
                 try_ready(sp);
@@ -395,8 +400,9 @@ public:
         if (nfree < cfg_.reserve && nvis > 0) {
             std::vector<std::pair<double, size_t>> cand;
             cand.reserve(nvis);
-            for (size_t i = 0; i < nalloc_; ++i)
-                if (slots_[i].visible && slots_[i].state.load(std::memory_order_acquire) == kReady) cand.push_back({score(slots_[i]), i});
+            for (size_t i = 0; i < nmax_ + nloan_; ++i)
+                if ((i < nalloc_ || (i >= nmax_ && loan_on_)) && slots_[i].visible &&
+                    slots_[i].state.load(std::memory_order_acquire) == kReady) cand.push_back({score(slots_[i]), i});
             const size_t want = std::min(cand.size(), cfg_.reserve - nfree);
             std::partial_sort(cand.begin(), cand.begin() + (long) want, cand.end());
             for (size_t k = 0; k < want; ++k) {
@@ -448,6 +454,65 @@ public:
         return done;
     }
     size_t shrunk() const { return shrunk_; }
+    /// The SWITCH: `bytes` of pinned memory at `host` (`dev` for the GPU) become lent slots, idle until lend().  Returns how many.
+    size_t add_loan(uint8_t* host, unsigned long long dev, size_t bytes) {
+        std::lock_guard<std::mutex> lk(mu_);
+        size_t n = 0;
+        for (size_t off = 0; off + slot_bytes_ <= bytes && nloan_ < cfg_.loan_capacity; off += slot_bytes_, ++n) {
+            Slot& sp = slots_[nmax_ + nloan_];
+            sp.base = host + off + kSlack;
+            sp.state.store(kFree, std::memory_order_release);
+            loan_dev_.push_back(dev + off + kSlack);
+            ++nloan_;
+        }
+        return n;
+    }
+    /// The model writes: the lent slots may take experts (the decode's misses fill them, no reads of their own)
+    void lend() {
+        std::lock_guard<std::mutex> lk(mu_);
+        loan_on_ = nloan_ > 0;
+    }
+    bool lent() const { return loan_on_; }
+    size_t loan_slots() const { return nloan_; }
+    /// A prompt comes: every lent slot given back - its expert forgotten (ev: the ones the GPU could read, dev 0, for the
+    /// caller to apply to the device's table and to wait for the GPU before the memory is used again). Returns how many held one.
+    size_t reclaim(std::vector<Vis>& ev) {
+        if (!loan_on_) return 0;
+        for (;;) {   // (reads into a lent slot still on their way: their guesses cancelled, then waited for)
+            bool busy = false;
+            {
+                std::lock_guard<std::mutex> lk(mu_);
+                for (size_t i = nmax_; i < nmax_ + nloan_; ++i) {
+                    Slot& sp = slots_[i];
+                    if (sp.state.load(std::memory_order_acquire) != kLoading) continue;
+                    sp.cancel.store(true);
+                    if (sp.left.load(std::memory_order_acquire) > 0) busy = true;
+                    else {
+                        try_ready(sp);
+                        if (sp.state.load(std::memory_order_acquire) == kLoading) finish(sp);
+                    }
+                }
+            }
+            if (!busy) break;
+            io_->wait_any(1000);
+        }
+        std::lock_guard<std::mutex> lk(mu_);
+        size_t held = 0;
+        for (size_t i = nmax_; i < nmax_ + nloan_; ++i) {
+            Slot& sp = slots_[i];
+            if (sp.layer >= 0 && sp.expert >= 0) {
+                if (where_[(size_t) sp.layer][(size_t) sp.expert] == (int) i) where_[(size_t) sp.layer][(size_t) sp.expert] = -1;
+                if (sp.visible) ev.push_back({sp.layer, sp.expert, 0ull});
+                ++held;
+            }
+            sp.layer = sp.expert = -1;
+            sp.visible = sp.prefetch = false;
+            sp.pin = 0;
+            sp.state.store(kFree, std::memory_order_release);
+        }
+        loan_on_ = false;
+        return held;
+    }
     /// An expert VRAM took over: no longer a visible slot
     void unmark(int layer, int e) {
         if (layer < 0 || layer >= (int) where_.size()) return;
@@ -457,7 +522,7 @@ public:
     }
     size_t visible_count() const {
         size_t n = 0;
-        for (size_t i = 0; i < nalloc_; ++i) n += slots_[i].visible ? 1 : 0;
+        for (size_t i = 0; i < nmax_ + nloan_; ++i) n += (i < nalloc_ || i >= nmax_) && slots_[i].visible ? 1 : 0;
         return n;
     }
 
@@ -580,9 +645,13 @@ private:
                 return (int) i;
             }
         if (grow()) return take_slot(demand);
+        if (loan_on_)   // (the SWITCH: a free lent slot before giving up an expert)
+            for (size_t i = nmax_; i < nmax_ + nloan_; ++i)
+                if (slots_[i].state.load(std::memory_order_acquire) == kFree) return (int) i;
         int best = -1;
         double bv = 0;
-        for (size_t i = 0; i < nalloc_; ++i) {
+        for (size_t i = 0; i < nmax_ + nloan_; ++i) {
+            if (i >= nalloc_ && (i < nmax_ || !loan_on_)) continue;
             Slot& sp = slots_[i];
             if (sp.state.load(std::memory_order_acquire) == kLoading && sp.left.load(std::memory_order_acquire) == 0) {
                 try_ready(sp);
@@ -600,7 +669,7 @@ private:
             }
         }
         if (best < 0) return -1;
-        free_hint_ = std::min<size_t>(free_hint_, (size_t) best);
+        if ((size_t) best < nalloc_) free_hint_ = std::min<size_t>(free_hint_, (size_t) best);
         return best;
     }
 
@@ -610,6 +679,9 @@ private:
     size_t slot_bytes_ = 0, nmax_ = 0, nalloc_ = 0, free_hint_ = 0, arena_bytes_ = 0;
     uint8_t* arena_ = nullptr;
     bool arena_pinned_ = false;
+    size_t nloan_ = 0;                          // (the SWITCH) lent slots, slots_[nmax_ .. nmax_ + nloan_)
+    bool loan_on_ = false;
+    std::vector<unsigned long long> loan_dev_;
     size_t shrunk_ = 0;
     std::unique_ptr<Slot[]> slots_;
     std::vector<std::pair<void*, size_t>> chunks_;

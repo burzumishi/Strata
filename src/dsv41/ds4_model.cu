@@ -5767,12 +5767,35 @@ struct Model::Impl {
         }
         bool direct = true;
         for (os::fd_t f : pk.dfds) direct = direct && f != os::kBadFd;
+        // the SWITCH (DS4_STORE_LEND=1, with DS4_STORE_GPU): room for the prompt path's pinned staging as lent slots
+        size_t lend_bytes = 0;
+        const bool want_lend = store_gpu && std::getenv("DS4_STORE_LEND") != nullptr && std::atoi(std::getenv("DS4_STORE_LEND")) != 0;
+        if (want_lend)
+            for (auto& cp : chunks)
+                if (cp && cp->stage) lend_bytes += (size_t) cp->S * cp->stage_stride;
+        if (lend_bytes > 0) cfg.loan_capacity = lend_bytes / std::max<size_t>(1, L[0].blob) + 16;
         auto st = std::make_unique<ExpertStore>();
         if (!st->init(cfg, geo, pk.dfds, pk.pfds)) {
             std::fprintf(stderr, "ds4: --ssd-cache: the store could not start\n");
             return;
         }
         store = std::move(st);
+        if (lend_bytes > 0 && store->gpu_mapped()) {
+            size_t n = 0;
+            for (auto& cp : chunks) {
+                if (!cp || !cp->stage) continue;
+                void* dp = nullptr;
+                cudaSetDevice(devs[0].id);
+                if (cudaHostGetDevicePointer(&dp, cp->stage, 0) != cudaSuccess || dp == nullptr) {
+                    (void) cudaGetLastError();
+                    continue;
+                }
+                n += store->add_loan(cp->stage, (unsigned long long) dp, (size_t) cp->S * cp->stage_stride);
+            }
+            store_lend_on = n > 0;
+            std::fprintf(stderr, "ds4: RAM store: %zu slots (%.1f GB) of the prompt path's staging lent while the model writes (DS4_STORE_LEND)\n",
+                         n, n * (double) store->slot_bytes() / 1e9);
+        }
         // (the router lookahead's guesses are not read ahead with the store: measured 4.5 against 4.7 tok/s, 62% of the guesses are right and
         // the SSD is the narrow part; DS4_AHEAD=1 turns them on)
         if (std::getenv("DS4_AHEAD") == nullptr) ahead_mode = 0;
@@ -5884,6 +5907,29 @@ struct Model::Impl {
         if (!store || !store->gpu_mapped()) return;
         std::vector<ExpertStore::Vis> ev;
         store->sync(ev, [&](int layer, int e) { return L[(size_t) layer].slot[(size_t) e] < 0; });
+        store_apply(ev);
+    }
+    // 2026-11-07 (the memory SWITCH, DS4_STORE_LEND=1): the prompt path's pinned staging lent to the store while the model writes
+    // (its misses fill the lent slots, no reads of their own) and taken back before a prompt is read: the lent experts forgotten,
+    // the device's table rewritten, the GPU waited for, so the prompt path finds its staging as it left it.
+    bool store_lend_on = false;
+    void store_lend() {
+        if (store_lend_on && store && !store->lent()) store->lend();
+    }
+    void store_reclaim() {
+        if (!store_lend_on || !store || !store->lent()) return;
+        std::vector<ExpertStore::Vis> ev;
+        const size_t held = store->reclaim(ev);
+        store_apply(ev);
+        for (Dev& d : devs) {
+            cudaSetDevice(d.id);
+            cudaDeviceSynchronize();
+        }
+        static int said = 0;
+        if (said++ < 3) std::fprintf(stderr, "ds4: RAM store: %zu lent slots taken back (%zu held an expert) for the prompt\n",
+                                     store->loan_slots(), held);
+    }
+    void store_apply(std::vector<ExpertStore::Vis>& ev) {
         if (ev.empty()) return;
         std::vector<char> dirty(L.size(), 0);
         for (const auto& v : ev) {
@@ -9808,6 +9854,7 @@ struct Model::Impl {
     // n tokens at positions pos .. in chunks of equal size (at most `chunk`), pipelined over the groups; the logits of
     // the last min(logits_rows, 16) rows (logits_rows > 16: a run of one chunk, every row's into chunk_logits)
     bool forward_chunks(const int* tk, int n, int logits_rows, std::string& err, int snap_slot = -1) {
+        store_reclaim();   // (the SWITCH: the staging back to the prompt path before it reads)
         if (n < 1) return true;
         flow_used.store(true);
         std::lock_guard<std::mutex> warm_lk(warm_mu);   // (the warm-up, if it is running, finishes first)
@@ -10215,6 +10262,7 @@ struct Model::Impl {
     }
 
     bool forward(const int* tk, int T, int logits_rows, std::string& err, int seed_rows = -1) {
+        store_lend();      // (the SWITCH: the model writes, the prompt path's staging lent to the store)
 #if defined(STRATA_METAL)
         struct BusyAll {   // DS4_BUSY_ALL: the GPU is held busy for the whole step (the host gaps between its bursts too)
             bool on;
