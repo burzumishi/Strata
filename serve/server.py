@@ -6456,6 +6456,9 @@ def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel
     # 2026-11-07 (llama.cpp's web UI sends timings_per_token: its live t/s reads each chunk's timings; we sent them only in
     # the last one, so the counter stayed empty until the end): a running predicted_n / predicted_ms every few pieces
     live = {"on": bool(req.get("timings_per_token")), "n": 0, "t0": None, "sent": 0.0}
+    # (2026-11-07) llama.cpp's reasoning_format "none" (its web UI's "Disable reasoning parsing"): no reasoning_content, the
+    # model's text as it is - its thinking, </think>, the answer - all in content
+    raw_reasoning = {"in": bool(thinking)} if req.get("reasoning_format") == "none" else None
 
     def live_timings(c):
         if not live["on"]:
@@ -6496,7 +6499,14 @@ def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel
             yield c
         elif kind == "event":
             ev: Event = x
-            if ev.kind == "reasoning" and ev.text:
+            if raw_reasoning and ev.kind in ("reasoning", "content", "tool_start", "tool_call") and \
+                    raw_reasoning["in"] and ev.kind != "reasoning":
+                # (reasoning_format "none") the thinking is over: its end tag, as the model wrote it, then the rest
+                raw_reasoning["in"] = False
+                yield chunk({"content": THINK_END})
+            if ev.kind == "reasoning" and ev.text and raw_reasoning:
+                yield live_timings(chunk({"content": ev.text}))
+            elif ev.kind == "reasoning" and ev.text:
                 yield live_timings(with_lp(chunk({"reasoning_content": ev.text}), "reasoning_content"))
             elif ev.kind == "content" and ev.text:
                 yield live_timings(with_lp(chunk({"content": ev.text}), "content"))
@@ -7171,7 +7181,19 @@ def make_handler(svc: Service):
                 res = server.call(tool, params, float(hub.settings["timeout_s"]))
             except Exception as e:   # (McpError and friends: the web UI shows the text)
                 res = {"content": [{"type": "text", "text": f"error: {e}"}], "isError": True}
-            self._json(200, res)
+            # (2026-11-07) llama.cpp's /tools answer shape, which its web UI reads: {"plain_text_response"} or {"error"}; an image
+            # the tool returned goes as a data: line, which the UI lifts into an attachment the model sees
+            parts = []
+            for c in (res.get("content") or []) if isinstance(res, dict) else []:
+                if not isinstance(c, dict):
+                    continue
+                if c.get("type") == "text":
+                    parts.append(str(c.get("text") or ""))
+                elif c.get("type") in ("image", "audio") and c.get("data"):
+                    parts.append(f"data:{c.get('mimeType') or 'image/png'};base64,{c['data']}")
+            text = "\n".join(parts)
+            self._json(200, {"error": text or "the tool failed"} if isinstance(res, dict) and res.get("isError")
+                       else {"plain_text_response": text})
 
         def _cors_proxy(self, method):
             """llama.cpp's /cors-proxy?url=...: the web UI reaches an MCP server through this one. Off unless --ui-mcp-proxy
@@ -7247,6 +7269,10 @@ def make_handler(svc: Service):
 
         def do_DELETE(self):
             path = self.path.split("?")[0].rstrip("/")
+            if path == "/models":   # (2026-11-07, llama.cpp's web UI, router) never deletes a model file from here
+                self._json(501, {"error": {"type": "not_supported_error", "message":
+                                           "this server runs one model and does not delete model files"}})
+                return
             if path != "/v1/stream":
                 self._json(404, {"error": {"message": "not found"}})
                 return
@@ -7278,6 +7304,10 @@ def make_handler(svc: Service):
             self.send_header("X-Content-Type-Options", "nosniff")
             if rel == "index.html" or rel == "sw.js":
                 self.send_header("Cache-Control", "no-cache")
+            if f.suffix == ".html":
+                # (2026-11-07) the old page's rule, kept for this one: no frame of it loads an address (its previews are
+                # sandboxed srcdoc frames, which frame-src does not stop)
+                self.send_header("Content-Security-Policy", PAGE_CSP)
             self.end_headers()
             self.wfile.write(body)
             return True
@@ -7721,6 +7751,10 @@ def make_handler(svc: Service):
                 if body["id"] == getattr(svc, "active_cid", None):
                     svc.end_reasoning_now = True
                 self._json(200, {"id": body["id"], "action": "reasoning_end", "success": True})   # (the UI checks success)
+                return
+            if path == "/models":   # (2026-11-07, llama.cpp's web UI, router: download from Hugging Face) not here
+                self._json(501, {"error": {"type": "not_supported_error", "message":
+                                           "this server runs one model and does not download others"}})
                 return
             if path in ("/models/load", "/models/unload"):   # (llama.cpp's web UI, router) one model, always loaded
                 try:

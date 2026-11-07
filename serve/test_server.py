@@ -7,6 +7,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import re
 import os
 import shutil
 import socket
@@ -3494,9 +3495,12 @@ class WebApp(unittest.TestCase):
         code, ctype, body = self.get("/")
         self.assertEqual(code, 200)
         self.assertIn("text/html", ctype)
-        self.assertIn(b"\"web/app.js\"", body)   # relative since #82 (works behind a path-prefixed proxy)
-        for path, want in (("/web/app.js", "javascript"), ("/web/app.css", "text/css"), ("/web/tokens.css", "text/css"),
-                           ("/web/components.css", "text/css"), ("/web/sprite.svg", "image/svg+xml")):
+        # (2026-11-07) the page is llama.cpp's web UI (serve/web/llamacpp): relative paths, so it works behind a path prefix too
+        self.assertIn(b"./_app/immutable/", body)
+        assets = sorted(set(re.findall(rb"\./(_app/immutable/[^\"']+\.(?:js|css))", body)))
+        self.assertTrue(assets)
+        for path, want in [("/" + a.decode(), "javascript" if a.endswith(b".js") else "text/css") for a in assets] + \
+                          [("/favicon.svg", "image/svg+xml")]:
             with self.subTest(path=path):
                 code, ctype, _ = self.get(path)
                 self.assertEqual(code, 200)
