@@ -5106,6 +5106,8 @@ class Service:
         empty thinking block).  The engine (--tail-role-token) checkpoints in front of that turn."""
         effort = kwargs.get("reasoning_effort")
         off = kwargs.get("enable_thinking") is False
+        if kwargs.get("add_generation_prompt") is False:   # (continue_final_message: rendered as it is)
+            return self.template.render(messages, tools=tools, **kwargs)
         if not self.effort_end or (not off and effort in (None, "", "xhigh", "high")):
             return self.template.render(messages, tools=tools, **kwargs)
         base = {k: v for k, v in kwargs.items() if k not in ("reasoning_effort", "enable_thinking")}
@@ -5191,6 +5193,11 @@ class Service:
         """-> (ids, thinking, max_new). An unset or non-positive max_new (some clients send -1) means "unlimited":
         the rest of the context.  `force` (forced_call): without thinking the reply starts with it, so it ends the
         prompt; with thinking, Service.run writes it once the thinking is over."""
+        # 2026-11-07 (llama.cpp's web UI "Continue"): continue_final_message - the last assistant message is the start of
+        # the reply: rendered without its end token and without a new generation prompt, so the model goes on from it
+        if req and req.get("continue_final_message") and messages and messages[-1].get("role") == "assistant":
+            messages = messages[:-1] + [dict(messages[-1], wo_eos=True)]
+            kwargs = dict(kwargs, add_generation_prompt=False)
         # `cancel` (#1999): set when the client hangs up; the downloads, the wait for the turn and the encodes stop
         # between pictures and raise ClientGone
         # Cached tool images are references in browser history, never arbitrary file paths or huge base64 strings.
@@ -7901,7 +7908,9 @@ def make_handler(svc: Service):
             props = {"default_generation_settings": {"n_ctx": svc.reported_ctx(), "params": params},
                      "total_slots": max(1, int(getattr(svc.engine, "batch", 0) or 0)),   # #1004: the batch slots
                      "model_alias": svc.model, "chat_template": svc.template.source,
-                     "chat_template_caps": svc.template.caps,
+                     # (llama.cpp's web UI offers the levels listed here: DeepSeek's template takes low / high / max)
+                     "chat_template_caps": dict(svc.template.caps, **({"reasoning_effort_levels": ["low", "high", "max"]}
+                                                                       if svc.model_arch == "deepseek41" else {})),
                      "modalities": {"vision": svc.vision is not None}, "models_autoload": hasattr(svc.engine, "restart"),
                      "is_sleeping": not svc.loaded()}
             if getattr(svc.engine, "model_path", None):

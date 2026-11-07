@@ -138,7 +138,9 @@ EFFORT = {"none": None, "off": None, "minimal": None, "disabled": None, "false":
 # DeepSeek-V4.1's template takes low, medium, high (its default) and max, or a whole number 1..100 (the "Reasoning
 # Effort: N" line of its prompt).  use_family("deepseek41") switches the table; the other families keep the one above.
 EFFORT_DEEPSEEK = {"none": None, "off": None, "minimal": None, "disabled": None, "false": None,
-                   "low": "low", "medium": "medium", "high": "high", "xhigh": "max", "max": "max", "maximum": "max"}
+                   "low": "low", "medium": 62, "high": "high", "xhigh": "max", "max": "max", "maximum": "max"}
+# (2026-11-07: DeepSeek's template takes low (50), high (75), max (100) or a number 1..100; "medium" was refused, so a client
+#  asking for it - Claude Code's thinking budgets of 2K-8K, OpenAI's medium - got an error: it is 62 now, between low and high)
 _EFFORT_QWEN = dict(EFFORT)
 _NUMERIC_EFFORT = False
 
@@ -175,7 +177,7 @@ def budget_effort(tokens) -> dict:
         n = int(tokens)
     except (TypeError, ValueError):
         return {}
-    return {"reasoning_effort": "low" if n < 2048 else "medium" if n < 8192 else EFFORT["high"]}
+    return {"reasoning_effort": EFFORT["low"] if n < 2048 else EFFORT["medium"] if n < 8192 else EFFORT["high"]}
 
 
 def _has_image(content) -> bool:
