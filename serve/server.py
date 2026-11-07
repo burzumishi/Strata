@@ -5736,6 +5736,11 @@ class Service:
                                             recover_prompt = focused_recovery_prompt(self.tok, ids, raw_ids)
                                             if recover_prompt is not None:
                                                 break
+                                if (getattr(self, "end_reasoning_now", False) and parser.state == "reasoning" and parser.clean
+                                        and not detok.pending()):
+                                    self.end_reasoning_now = False   # the web UI's "skip thinking": wrap up and answer now
+                                    wrap = True
+                                    break
                                 if budget and parser.state == "reasoning":
                                     thought += 1
                                     # at a clean point: no tag held back, no character split across tokens
@@ -6406,6 +6411,7 @@ def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel
     """`run`: the events to send instead of Service.run's (run_with_mcp); its ("mcp", {...}) items become chunks with
     an empty delta and a `strata_mcp` field, which only the web app reads.  `force`: see Service.run."""
     cid, created = "chatcmpl-" + uuid.uuid4().hex[:24], int(time.time())
+    svc.active_cid, svc.end_reasoning_now = cid, False   # (llama.cpp's "skip thinking": /v1/chat/completions/control)
     model = svc.model_for(req)
     # llama.cpp's flag, and its default: a client that wants prompt progress asks for it, and nothing changes for one
     # that does not.  Strata already sends a keep-alive comment on every PP line, so this only fills that line in.
@@ -7043,10 +7049,10 @@ def make_handler(svc: Service):
 
         def _ui_tools(self):
             """llama.cpp's GET /tools: the server's tools, here the MCP hub's (--mcp-config), in its format."""
+            out = list(svc.llama_tools.listing()) if getattr(svc, "llama_tools", None) else []
             hub = svc.mcp
             if not hub:
-                return []
-            out = []
+                return out
             for t in hub.template_tools():
                 out.append({"display_name": t["name"], "tool": t["name"], "type": "mcp", "permissions": {"write": False},
                             "uses_cwd": False, "definition": {"type": "function", "function": t}})
@@ -7060,6 +7066,28 @@ def make_handler(svc: Service):
                 params = body.get("params") if isinstance(body.get("params"), dict) else {}
             except (ValueError, TypeError):
                 self._json(400, {"error": {"type": "invalid_request_error", "message": "a JSON body {tool, params}"}})
+                return
+            lt = getattr(svc, "llama_tools", None)
+            if lt is not None and lt.has(name):   # llama.cpp's own tools (--tools): its answers, its streaming
+                cwd = self.headers.get("x-tool-cwd") or None
+                if body.get("stream"):
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/event-stream")
+                    self.send_header("Cache-Control", "no-cache")
+                    self.end_headers()
+                    def push(chunk):
+                        self.wfile.write(b"data: " + json.dumps({"chunk": chunk}).encode() + b"\n\n")
+                        self.wfile.flush()
+                    res = lt.call(name, params, cwd, push)
+                    done = {"done": True}
+                    if res.get("error"):
+                        done["error"] = res["error"]
+                    elif res.get("plain_text_response") is not None:
+                        push(res["plain_text_response"])
+                    self.wfile.write(b"data: " + json.dumps(done).encode() + b"\n\n")
+                    self.wfile.flush()
+                    return
+                self._json(200, lt.call(name, params, cwd))
                 return
             hub = svc.mcp
             route = hub.routes().get(name) if hub else None
@@ -7540,6 +7568,18 @@ def make_handler(svc: Service):
                 return
             if path == "/settings":
                 self._settings()
+                return
+            if path == "/v1/chat/completions/control":   # (llama.cpp's web UI) {"id", "action": "reasoning_end"}
+                try:
+                    body = json.loads(self._body() or b"{}")
+                except ValueError:
+                    body = {}
+                if body.get("action") != "reasoning_end" or not body.get("id"):
+                    self._json(400, {"error": {"type": "invalid_request_error", "message": "unknown control action" if body.get("id") else "missing completion id"}})
+                    return
+                if body["id"] == getattr(svc, "active_cid", None):
+                    svc.end_reasoning_now = True
+                self._json(200, {"id": body["id"], "action": "reasoning_end"})
                 return
             if path == "/tools":        # (llama.cpp's web UI) run a server tool: the MCP hub's
                 self._ui_tool_call()
@@ -9144,6 +9184,8 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
     ap.add_argument("--no-api-key", action="store_true",
                     help="serve on the network without an API key (anyone who can reach the port can use the model; "
                          "also \"api_key\": \"none\" in the config). Warns once, never refuses")
+    ap.add_argument("--tools", help="llama.cpp's built-in tools for the chat page: NAME,NAME or all (read_file, file_glob_search, "
+                    "grep_search, exec_shell_command, write_file, edit_file, get_info); they act on this machine; also \"tools\" in the config")
     ap.add_argument("--ui-mcp-proxy", action="store_true", help="the chat page (llama.cpp's web UI) may reach MCP servers through /cors-proxy (an open proxy for whoever reaches this port; also \"ui_mcp_proxy\": true in the config)")
     ap.add_argument("--mcp-config", help="a JSON file with MCP servers in Claude Desktop's format ({\"mcpServers\": "
                                          "{...}}); the web app's chat can use their tools (also \"mcp_servers\" in "
@@ -9517,6 +9559,13 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
         print("[strata] Host check off: any name reaches this server (allowed_hosts \"*\")" if "*" in svc.allowed_hosts
               else f"[strata] also answers to the host names {', '.join(svc.allowed_hosts)} (allowed_hosts)", flush=True)
     svc.api_monitor = a.api_monitor or cfg.get("api_monitor") is True
+    if a.tools or cfg.get("tools"):
+        from serve.llama_tools import LlamaTools
+        svc.llama_tools = LlamaTools([x.strip() for x in str(a.tools or cfg.get("tools")).split(",") if x.strip()])
+        print(f"[strata] llama.cpp server tools on: {', '.join(svc.llama_tools.names)} (they read, write and run on this machine)",
+              flush=True)
+    else:
+        svc.llama_tools = None
     svc.ui_mcp_proxy = a.ui_mcp_proxy or cfg.get("ui_mcp_proxy") is True or os.environ.get("STRATA_UI_MCP_PROXY") == "1"
     if svc.api_monitor:
         print("[strata] API request monitor on (/api-monitor): the last 100 requests' prompts and answers are kept in "
