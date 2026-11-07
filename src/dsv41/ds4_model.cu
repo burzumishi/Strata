@@ -1126,7 +1126,7 @@ struct Model::Impl {
         const std::string& lo = x.size() < y.size() ? y : x;
         return lo.compare(0, sh.size(), sh) == 0 ? 2 : 0;
     }
-    struct TieStats { long long rounds = 0, rows = 0, tie_rounds = 0, ties[3] = {0, 0, 0}, fixed = 0, changed = 0; } tie_st;
+    struct TieStats { long long rounds = 0, rows = 0, tie_rounds = 0, ties[3] = {0, 0, 0}, fixed = 0, changed = 0, tail[4] = {0, 0, 0, 0}; } tie_st;
     std::vector<float> tie_lg;
     bool drafts_q = false;
     float dq_temp = 0.0f, dq_top_p = 1.0f, dq_min_p = 0.0f;
@@ -8632,7 +8632,15 @@ struct Model::Impl {
                     if (L1[v] > L1[a1]) { a2 = a1; a1 = v; }
                     else if (a2 < 0 || L1[v] > L1[a2]) a2 = v;
                 const int ch = r < m ? drafts[(size_t) r] : next;
-                if (a2 < 0 || (ch != a1 && ch != a2)) continue;
+                if (a2 < 0) continue;
+                if (ch != a1 && ch != a2) {   // a draw from the tail: how far below the top (min_p's measure: p(ch) / p(top))
+                    const float down = (L1[a1] - L1[ch]) / tt;
+                    const double rel = std::exp(-(double) down);
+                    ++tie_st.tail[rel < 0.01 ? 0 : rel < 0.05 ? 1 : rel < 0.1 ? 2 : 3];
+                    if (tc.trace != nullptr && rel < 0.1)
+                        std::fprintf(tc.trace, "%lld\t%d\t%.3f\t3\t%d\t%d\n", (long long) (p0 + r), r, down, ch, a1);
+                    continue;
+                }
                 const float gap = (L1[a1] - L1[a2]) / tt;
                 const int kind = tie_kind(tc, ch, ch == a1 ? a2 : a1);   // 0 other, 1 case, 2 prefix
                 if (gap < tc.log_gap) {
@@ -8650,10 +8658,12 @@ struct Model::Impl {
             if (any) ++tie_st.tie_rounds;
             if (tc.log_gap > 0.0f && tie_st.rounds % 500 == 0)
                 std::fprintf(stderr, "ds4 ties (gap %.2f): %lld rounds, %lld rows; rounds with a tie %.2f %%; rows: other %.2f %%, "
-                             "case %.3f %%, prefix %.3f %%; rechecked %lld, changed %lld\n", tc.log_gap, tie_st.rounds,
+                             "case %.3f %%, prefix %.3f %%; rechecked %lld, changed %lld; tail draws (p/p_top) <0.01 %.3f %%, "
+                             "<0.05 %.3f %%, <0.1 %.3f %%, >=0.1 %.3f %%\n", tc.log_gap, tie_st.rounds,
                              tie_st.rows, 100.0 * tie_st.tie_rounds / tie_st.rounds, 100.0 * tie_st.ties[0] / tie_st.rows,
                              100.0 * tie_st.ties[1] / tie_st.rows, 100.0 * tie_st.ties[2] / tie_st.rows, tie_st.fixed,
-                             tie_st.changed);
+                             tie_st.changed, 100.0 * tie_st.tail[0] / tie_st.rows, 100.0 * tie_st.tail[1] / tie_st.rows,
+                             100.0 * tie_st.tail[2] / tie_st.rows, 100.0 * tie_st.tail[3] / tie_st.rows);
         }
         if (r_tie >= 0) {
             // q: the penalised row's distribution (temperature only), its 64 most likely tokens

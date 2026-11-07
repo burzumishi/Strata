@@ -2348,6 +2348,7 @@ class StrataEngine:
         # an image request takes the same sampling keys as text (#75: it used to decode greedily whatever was asked)
         head = f"GENI {int(max_new)}{self.sampling_keys(sampling or {})} {embeddings}" if embeddings else \
             f"GEN {int(max_new)}{self.sampling_keys(sampling or {})}"
+        print(f"[strata] sampling:{self.sampling_keys(sampling or {}) or ' (engine defaults)'}", flush=True)   # (2026-11-07)
         if prefill_only:                                 # split serving (serve/split.py): read the prompt, make no token
             if embeddings or int(max_new) != 0:
                 raise ValueError("prefill_only is a text prompt and max_new 0")
@@ -7071,6 +7072,17 @@ def make_handler(svc: Service):
                 body = json.loads(self._body() or b"{}")
                 name = str(body.get("tool") or "")
                 params = body.get("params") if isinstance(body.get("params"), dict) else {}
+                # 2026-11-07: a model now and then wraps its arguments once more, {"parameters": "<json object>"}: unwrap it
+                # (it got "missing parameter: 'path'" and had to call again)
+                if set(params) == {"parameters"}:
+                    inner = params["parameters"]
+                    if isinstance(inner, str):
+                        try:
+                            inner = json.loads(inner)
+                        except ValueError:
+                            inner = None
+                    if isinstance(inner, dict):
+                        params = inner
             except (ValueError, TypeError):
                 self._json(400, {"error": {"type": "invalid_request_error", "message": "a JSON body {tool, params}"}})
                 return
