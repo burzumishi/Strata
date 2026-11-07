@@ -2357,7 +2357,9 @@ void route_publish(const float* logits, const float* bias, int n, int k, int T, 
         return;
     }
 #endif
-    const float miss_penalty = route_penalty(route_layer_) * g_pen_scale;
+    // (the scale is the trunk's only: the drafter's 63 = 100 keeps it off the experts DS4_MTP_VRAM never loads - scaling it
+    // to 0 sent the drafter to them: the "unspecified launch failure" of the first recheck)
+    const float miss_penalty = route_penalty(route_layer_) * (route_layer_ == 63 ? 1.0f : g_pen_scale);
     static const int exact_norm = std::getenv("DS4_EXACT_NORM") != nullptr ? std::max(1, std::atoi(std::getenv("DS4_EXACT_NORM")) == 1 ? 6 : std::atoi(std::getenv("DS4_EXACT_NORM"))) : 0;   // (1 = the model's 6)
     static int tail_from = 0;
     static float tail_mul = 1.0f;

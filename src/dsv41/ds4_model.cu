@@ -51,6 +51,7 @@ extern "C" void ds4_busy_end();
 #include <atomic>
 #include <chrono>
 #include <climits>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -1065,6 +1066,68 @@ struct Model::Impl {
     // checks it is its own)
     strata::dsv41k::SpecList* d_specq = nullptr;
     std::vector<strata::dsv41k::SpecList> h_specq = std::vector<strata::dsv41k::SpecList>(kWin);
+    // near ties (verify(): DS4_TIE_LOG / DS4_TIE_RECHECK / DS4_TIE_VOCAB / DS4_TIE_TRACE)
+    struct TieCfg {
+        float log_gap = 0.0f, fix_gap = 0.0f;
+        bool ortho_only = false;
+        std::vector<std::string> txt;   // the token texts (DS4_TIE_VOCAB: bench/v41/tie_vocab.py)
+        std::FILE* trace = nullptr;     // DS4_TIE_TRACE=file: position, row, gap, kind, token, rival
+    };
+    static const TieCfg& tie_cfg() {
+        static const TieCfg c = [] {
+            TieCfg t;
+            if (const char* e = std::getenv("DS4_TIE_LOG")) t.log_gap = std::strtof(e, nullptr);
+            if (const char* e = std::getenv("DS4_TIE_RECHECK")) t.fix_gap = std::strtof(e, nullptr);
+            if (t.fix_gap > t.log_gap) t.log_gap = t.fix_gap;
+            if (const char* e = std::getenv("DS4_TIE_VOCAB")) {
+                std::ifstream f(e, std::ios::binary);
+                uint32_t n = 0;
+                if (f.read((char*) &n, 4))
+                    for (uint32_t i = 0; i < n; ++i) {
+                        uint16_t len = 0;
+                        if (!f.read((char*) &len, 2)) break;
+                        std::string s(len, '\0');
+                        if (len > 0 && !f.read(s.data(), len)) break;
+                        t.txt.push_back(std::move(s));
+                    }
+                t.ortho_only = !t.txt.empty();
+                std::fprintf(stderr, "ds4 ties: %zu token texts from %s\n", t.txt.size(), e);
+            }
+            if (const char* e = std::getenv("DS4_TIE_TRACE")) t.trace = std::fopen(e, "a");
+            if (t.log_gap > 0.0f)
+                std::fprintf(stderr, "ds4 ties: counting gap < %.2f, recheck < %.2f%s\n", t.log_gap, t.fix_gap,
+                             t.ortho_only ? " (orthographic rivals only)" : "");
+            return t;
+        }();
+        return c;
+    }
+    // 1: the same letters in other case ("IDO" / "ido"); 2: one the other's prefix ("heap" / "heapp"), leading spaces aside,
+    // case aside, the shorter with a letter; 0: anything else (or no texts)
+    static int tie_kind(const TieCfg& c, int a, int b) {
+        if (a < 0 || b < 0 || (size_t) a >= c.txt.size() || (size_t) b >= c.txt.size()) return 0;
+        auto norm = [](const std::string& s) {
+            size_t k = 0;
+            while (k < s.size() && s[k] == ' ') ++k;
+            std::string o = s.substr(k);
+            for (char& ch : o) ch = (char) std::tolower((unsigned char) ch);
+            return o;
+        };
+        const std::string x = norm(c.txt[(size_t) a]), y = norm(c.txt[(size_t) b]);
+        auto letter = [](const std::string& s) {
+            for (char ch : s) if (std::isalpha((unsigned char) ch)) return true;
+            return false;
+        };
+        if (x.empty() || y.empty() || !letter(x) || !letter(y)) return 0;
+        if (x == y) {   // (a leading space alone is a word boundary, not a case slip)
+            auto strip = [](const std::string& s) { size_t k = 0; while (k < s.size() && s[k] == ' ') ++k; return s.substr(k); };
+            return strip(c.txt[(size_t) a]) != strip(c.txt[(size_t) b]) ? 1 : 0;
+        }
+        const std::string& sh = x.size() < y.size() ? x : y;
+        const std::string& lo = x.size() < y.size() ? y : x;
+        return lo.compare(0, sh.size(), sh) == 0 ? 2 : 0;
+    }
+    struct TieStats { long long rounds = 0, rows = 0, tie_rounds = 0, ties[3] = {0, 0, 0}, fixed = 0, changed = 0; } tie_st;
+    std::vector<float> tie_lg;
     bool drafts_q = false;
     float dq_temp = 0.0f, dq_top_p = 1.0f, dq_min_p = 0.0f;
     int dq_top_k = 0;
@@ -8542,35 +8605,73 @@ struct Model::Impl {
             next = m < n ? h_idx[m] : sample_row(n, temperature, top_p, top_k, min_p, seed, counter + (uint64_t) n, nullptr);
         }
         drafts_q = false;
-        // 2026-11-07 (DS4_TIE_RECHECK=g): the first row of this round whose chosen token had a rival within g (the gap of their
-        // logits over the temperature: p2/p1 > e^-g) is computed again with the exact routing (penalty 0: its missing experts
-        // read) and its token drawn again. The typos ("heapppush", "CONTENido") come from such near-ties the penalty tips over;
-        // ties are rare, so this costs a one-token step now and then instead of protecting experts on every token.
-        static const float tie_gap = std::getenv("DS4_TIE_RECHECK") ? std::strtof(std::getenv("DS4_TIE_RECHECK"), nullptr) : 0.0f;
+        // 2026-11-07 (near ties; DS4_TIE_LOG=g counts, DS4_TIE_RECHECK=g corrects). The typos ("heapppush", "CONTENido") are
+        // near-ties the miss penalty tips over: the chosen token and a rival within g (their logit gap over the temperature).
+        // DS4_TIE_LOG: per round, the rows (up to the first rejection) whose token had such a rival, and of which kind - an
+        // ORTHOGRAPHIC rival (DS4_TIE_VOCAB: the same text in other case, or one the other's prefix/extension) or another;
+        // nothing computed again. DS4_TIE_RECHECK: the first such row (orthographic only when DS4_TIE_VOCAB is set) is
+        // computed again with the exact routing (the trunk's penalty 0, its missing experts read) and its token decided by
+        // the speculative rule with q = the penalised row: kept with probability min(1, p_exact / p_penalised), else a draw
+        // from max(0, p_exact - p_penalised) - so the token is distributed as the exact model's and changes only as far as
+        // the substitutes moved it (drawing again from the same row would decide nothing). Greedy: the exact argmax.
+        const TieCfg& tc = tie_cfg();
         int r_tie = -1, c_tie = -1;
-        if (tie_gap > 0.0f) {
+        if (tc.log_gap > 0.0f || tc.fix_gap > 0.0f) {
             const int rows = m + 1;
-            std::vector<float> lg((size_t) rows * V);
-            CK(cudaMemcpyAsync(lg.data(), hd.logits, lg.size() * 4, cudaMemcpyDeviceToHost, hd.st));
+            tie_lg.resize((size_t) rows * V);
+            CK(cudaMemcpyAsync(tie_lg.data(), hd.logits, tie_lg.size() * 4, cudaMemcpyDeviceToHost, hd.st));
             CK(cudaStreamSynchronize(hd.st));
             const float tt = temperature > 0.0f ? temperature : 1.0f;
-            for (int r = 0; r < rows && r_tie < 0; ++r) {
-                const float* L1 = lg.data() + (size_t) r * V;
+            ++tie_st.rounds;
+            tie_st.rows += rows;
+            bool any = false;
+            for (int r = 0; r < rows; ++r) {
+                const float* L1 = tie_lg.data() + (size_t) r * V;
                 int a1 = 0, a2 = -1;
                 for (int v = 1; v < V; ++v)
                     if (L1[v] > L1[a1]) { a2 = a1; a1 = v; }
                     else if (a2 < 0 || L1[v] > L1[a2]) a2 = v;
                 const int ch = r < m ? drafts[(size_t) r] : next;
-                if ((ch == a1 || ch == a2) && (L1[a1] - L1[a2]) / tt < tie_gap) {
+                if (a2 < 0 || (ch != a1 && ch != a2)) continue;
+                const float gap = (L1[a1] - L1[a2]) / tt;
+                const int kind = tie_kind(tc, ch, ch == a1 ? a2 : a1);   // 0 other, 1 case, 2 prefix
+                if (gap < tc.log_gap) {
+                    ++tie_st.ties[kind];
+                    any = true;
+                    if (tc.trace != nullptr)
+                        std::fprintf(tc.trace, "%lld\t%d\t%.3f\t%d\t%d\t%d\n", (long long) (p0 + r), r, gap, kind, ch,
+                                     ch == a1 ? a2 : a1);
+                }
+                if (r_tie < 0 && tc.fix_gap > 0.0f && gap < tc.fix_gap && (!tc.ortho_only || kind > 0)) {
                     r_tie = r;
                     c_tie = ch;
                 }
             }
+            if (any) ++tie_st.tie_rounds;
+            if (tc.log_gap > 0.0f && tie_st.rounds % 500 == 0)
+                std::fprintf(stderr, "ds4 ties (gap %.2f): %lld rounds, %lld rows; rounds with a tie %.2f %%; rows: other %.2f %%, "
+                             "case %.3f %%, prefix %.3f %%; rechecked %lld, changed %lld\n", tc.log_gap, tie_st.rounds,
+                             tie_st.rows, 100.0 * tie_st.tie_rounds / tie_st.rounds, 100.0 * tie_st.ties[0] / tie_st.rows,
+                             100.0 * tie_st.ties[1] / tie_st.rows, 100.0 * tie_st.ties[2] / tie_st.rows, tie_st.fixed,
+                             tie_st.changed);
         }
-        static long tie_rounds = 0, tie_hits = 0, tie_changed = 0;
-        ++tie_rounds;
         if (r_tie >= 0) {
-            ++tie_hits;
+            // q: the penalised row's distribution (temperature only), its 64 most likely tokens
+            strata::dsv41k::SpecList& q = h_specq[0];
+            if (temperature > 0.0f) {
+                const float* L1 = tie_lg.data() + (size_t) r_tie * V;
+                std::vector<int> ix(V);
+                for (int v = 0; v < V; ++v) ix[(size_t) v] = v;
+                std::partial_sort(ix.begin(), ix.begin() + 64, ix.end(), [&](int a, int b) { return L1[a] > L1[b]; });
+                double z = 0.0;
+                for (int v = 0; v < V; ++v) z += std::exp((double) (L1[v] - L1[ix[0]]) / temperature);
+                q.n = 64;
+                for (int i = 0; i < 64; ++i) {
+                    q.ids[i] = ix[(size_t) i];
+                    q.p[i] = std::exp((double) (L1[ix[(size_t) i]] - L1[ix[0]]) / temperature) / z;
+                }
+            }
+            ++tie_st.fixed;
             rollback(p0, T, r_tie);   // (rows before the tie kept; the tied row is computed again)
             if (r_tie > 0 && !seed_drafter(p0, r_tie, 0, err)) return false;
             strata::ds4::set_penalty_scale(0.0f);
@@ -8578,11 +8679,31 @@ struct Model::Impl {
             strata::ds4::set_penalty_scale(1.0f);
             if (!ok2) return false;
             penalize_rows(hd, hd.logits, 1, tk + 1, r_tie);
-            next = sample_row(0, temperature, top_p, top_k, min_p, seed, counter + (uint64_t) r_tie + 17, nullptr);
-            if (next != c_tie) ++tie_changed;
+            if (temperature <= 0.0f) {
+                next = sample_row(0, 0.0f, top_p, top_k, min_p, seed, counter + (uint64_t) r_tie, nullptr);
+            } else {
+                h_idx[0] = c_tie;
+                CK(cudaMemcpyAsync(d_ints + 32, h_idx, 4, cudaMemcpyHostToDevice, hd.st));
+                CK(cudaMemcpyAsync(d_specq, &q, sizeof(q), cudaMemcpyHostToDevice, hd.st));
+                strata::dsv41k::SamplerParams sp;
+                sp.greedy = false;
+                sp.temperature = temperature;
+                sp.top_p = top_p;
+                sp.top_k = top_k;
+                sp.min_p = min_p;
+                sp.seed = seed;
+                sp.counter = counter + (uint64_t) r_tie;
+                strata::dsv41k::sample_verify(hd.logits, 1, V, sp, d_specq, d_ints + 32, d_ints + 16, hd.st);
+                CK(cudaMemcpyAsync(h_idx, d_ints + 16, 4, cudaMemcpyDeviceToHost, hd.st));
+                CK(cudaStreamSynchronize(hd.st));
+                next = h_idx[0];
+                drafts_q = false;   // (d_specq row 0 now holds this q, not the drafter's)
+            }
+            if (next != c_tie) ++tie_st.changed;
             m = r_tie;
-            if (tie_hits <= 3 || tie_hits % 100 == 0)
-                std::fprintf(stderr, "ds4 tie recheck: %ld of %ld rounds rechecked, %ld tokens changed\n", tie_hits, tie_rounds, tie_changed);
+            if (tie_st.fixed <= 3 || tie_st.fixed % 50 == 0)
+                std::fprintf(stderr, "ds4 tie recheck: %lld of %lld rounds rechecked, %lld tokens changed\n", tie_st.fixed,
+                             tie_st.rounds, tie_st.changed);
         } else {
             rollback(p0, T, m + 1);
             if (!seed_drafter(p0, m + 1, 0, err)) return false;
