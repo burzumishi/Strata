@@ -413,6 +413,7 @@ struct Req {
     // 2026-11-07: penalty_repeat / penalty_freq / penalty_present / penalty_last_n (the server sent them; they were dropped here)
     float pen_rep = 1.0f, pen_freq = 0.0f, pen_pres = 0.0f;
     int pen_n = 64;
+    bool prefill_only = false;   // 2026-11-07: prefill=1 - read the prompt, keep its state, make no token (a cache warm-up)
     std::string file;   // GENI: the pictures
     std::vector<int> ids;
 };
@@ -514,6 +515,7 @@ bool parse_gen(const std::string& line, Req& r, bool geni) {
         else if (k == "penalty_freq") r.pen_freq = std::strtof(v.c_str(), nullptr);
         else if (k == "penalty_present") r.pen_pres = std::strtof(v.c_str(), nullptr);
         else if (k == "penalty_last_n") r.pen_n = std::max(0, std::atoi(v.c_str()));
+        else if (k == "prefill") r.prefill_only = std::atoi(v.c_str()) != 0;
     }
     return !r.ids.empty() && (!geni || !r.file.empty());
 }
@@ -1060,6 +1062,11 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         held = std::move(pics);
         m.checkpoint(0);
         if (!continued && slot_max > 0) m.pin();   // (a new run of prompts: where it may be rendered again from)
+        if (r.prefill_only) {   // (the prompt is read and its state kept: the next request that starts with it reuses it)
+            std::printf("DONE 0 %zu %.1f 0.0 stop 0 0 %zu 0 0\n", r.ids.size(), now_ms() - t0, from);
+            std::fflush(stdout);
+            continue;
+        }
         const double t1 = now_ms();
         long long produced = 0;
         const char* finish = "length";

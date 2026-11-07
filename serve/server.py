@@ -8096,11 +8096,38 @@ def make_handler(svc: Service):
             finally:
                 items.close()
 
+        def _prefill_warm(self, req):
+            """2026-11-07 (the web UI's "Pre-fill KV cache after response"): the conversation is rendered as the NEXT request
+            will start - a placeholder user turn after it, cut where that turn begins (DeepSeek's template drops an answered
+            turn's reasoning once a user turn follows, so rendering it as it stands would not be the next prompt's start) -
+            and the engine reads it with no token made (GEN 0 prefill=1), behind the request FIFO. Errors are only logged."""
+            try:
+                messages, tools, kw = openai_to_messages(svc.with_shared(dict(req), "openai"))
+                kw = {k: v for k, v in kw.items() if k != "add_generation_prompt"}
+                marker = "\u2063ds-wormhole-next-turn\u2063"
+                text = svc.template.render(messages + [{"role": "user", "content": marker}], tools=tools,
+                                           add_generation_prompt=False, **kw)
+                cut = text.rfind(marker)
+                cut = text.rfind("<\uff5cUser\uff5c>", 0, cut) if cut >= 0 else -1
+                if cut <= 0:
+                    return
+                ids = svc.tok.encode(text[:cut], parse_special=True)
+                cancel = threading.Event()
+                t0 = time.time()
+                with svc._inference_fifo(None, cancel):
+                    for _ in svc.engine.generate(ids, 0, {}, cancel, prefill_only=True):
+                        pass
+                print(f"[strata] pre-fill: the next turn's start read ({len(ids)} tokens, {time.time() - t0:.1f} s)", flush=True)
+            except Exception as e:
+                print(f"[strata] pre-fill skipped: {type(e).__name__}: {e}", flush=True)
+
         def _openai(self, req):
             # 2026-11-07: llama.cpp's n_predict 0 (its web UI's "Pre-fill KV cache after response") means "read the prompt, write
             # nothing"; this server read no n_predict and took no limit as "the rest of the context": a full second answer after
             # every reply. Until the engine has a prompt-only read, it is answered empty at once.
             if req.get("n_predict") == 0 and not req.get("stream") and req.get("max_tokens") is None:
+                if svc.model_arch == "deepseek41" and hasattr(svc.engine, "generate"):
+                    self._prefill_warm(req)   # (the engine reads the next turn's start now; see _prefill_warm)
                 self._json(200, {"id": "chatcmpl-prefill", "object": "chat.completion", "created": int(time.time()),
                                  "model": svc.model, "choices": [{"index": 0, "finish_reason": "length",
                                                                   "message": {"role": "assistant", "content": ""}}],
