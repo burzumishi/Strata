@@ -8397,7 +8397,7 @@ struct Model::Impl {
                 return;
             }
         }
-        CK(cudaMemcpyAsync(d_pen, h_pen.data(), need * 4, cudaMemcpyHostToDevice, d.st));
+        if (cudaMemcpyAsync(d_pen, h_pen.data(), need * 4, cudaMemcpyHostToDevice, d.st) != cudaSuccess) return;
         penalize(logits, g.vocab, rows, d_pen + rows + 1, d_pen + rows + 1 + N, d_pen, pen_rp, pen_fp, pen_pp, d.st);
         cudaStreamSynchronize(d.st);   // (h_pen is written again by the next call)
     }
