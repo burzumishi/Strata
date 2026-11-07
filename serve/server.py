@@ -7140,6 +7140,57 @@ def make_handler(svc: Service):
                 self.wfile.flush()
             self.wfile.write(b"0\r\n\r\n")
 
+        def _stream_replay(self):
+            import urllib.parse
+            from serve.streams import REGISTRY
+            q = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+            conv = (q.get("conv_id") or [""])[0]
+            if not conv:
+                self._json(400, {"error": {"type": "invalid_request_error", "message": "Missing conversation id in path"}})
+                return
+            session = REGISTRY.get(conv)
+            if session is None:
+                self._json(404, {"error": {"type": "not_found_error", "message": "Stream not found or expired"}})
+                return
+            try:
+                start = max(0, int((q.get("from") or ["0"])[0]))
+            except ValueError:
+                start = 0
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("X-Accel-Buffering", "no")
+            self.end_headers()
+            alive = [True]
+
+            def sink(b):
+                try:
+                    self.wfile.write(b)
+                    self.wfile.flush()
+                    return True
+                except OSError:
+                    alive[0] = False
+                    return False
+            session.read_from(start, sink, lambda: alive[0])
+
+        def do_DELETE(self):
+            path = self.path.split("?")[0].rstrip("/")
+            if path != "/v1/stream":
+                self._json(404, {"error": {"message": "not found"}})
+                return
+            if not self._authorized():
+                return
+            import urllib.parse
+            from serve.streams import REGISTRY
+            conv = (urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query).get("conv_id") or [""])[0]
+            if not conv:
+                self._json(400, {"error": {"type": "invalid_request_error", "message": "Missing conversation id in path"}})
+                return
+            REGISTRY.stop(conv)   # (the user's Stop: the generation cancelled, its bytes dropped)
+            self.send_response(204)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
         def _llama_ui(self, path):
             """llama.cpp's web UI: "" -> index.html, and any file of its build directory. False when the path is not one of them."""
             rel = "index.html" if path == "" else path.lstrip("/")
@@ -7172,6 +7223,24 @@ def make_handler(svc: Service):
             if path == "/cors-proxy":
                 if self._authorized():
                     self._cors_proxy("GET")
+                return
+            if path == "/models/sse":   # (llama.cpp's web UI, router) model status events: one model, always loaded
+                if self._authorized():
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/event-stream")
+                    self.send_header("Cache-Control", "no-cache")
+                    self.end_headers()
+                    try:
+                        while True:
+                            self.wfile.write(b": keep-alive\n\n")
+                            self.wfile.flush()
+                            time.sleep(15)
+                    except OSError:
+                        pass
+                return
+            if path == "/v1/stream":   # (llama.cpp's web UI) replay a kept stream from byte `from`, then live
+                if self._authorized():
+                    self._stream_replay()
                 return
             if path.startswith("/tool-media/"):
                 if not self._authorized():
@@ -7581,6 +7650,29 @@ def make_handler(svc: Service):
                     svc.end_reasoning_now = True
                 self._json(200, {"id": body["id"], "action": "reasoning_end"})
                 return
+            if path in ("/models/load", "/models/unload"):   # (llama.cpp's web UI, router) one model, always loaded
+                try:
+                    name = str(json.loads(self._body() or b"{}").get("model") or "")
+                except (ValueError, AttributeError):
+                    name = ""
+                ours = {svc.model, svc.model_for({})} if hasattr(svc, "model_for") else {svc.model}
+                if path == "/models/load" and (not name or name in ours):
+                    self._json(200, {"success": True})
+                else:
+                    self._json(400, {"error": {"type": "invalid_request_error", "code": 400,
+                                               "message": "this server serves one model, loaded at start"}})
+                return
+            if path == "/v1/streams/lookup":   # (llama.cpp's web UI) {"conversation_ids": [...]}: the kept streams
+                from serve.streams import REGISTRY
+                try:
+                    ids = json.loads(self._body() or b"{}").get("conversation_ids") or []
+                except (ValueError, AttributeError):
+                    ids = None
+                if not isinstance(ids, list):
+                    self._json(400, {"error": {"type": "invalid_request_error", "message": "invalid body"}})
+                    return
+                self._json(200, REGISTRY.lookup([str(x) for x in ids]))
+                return
             if path == "/tools":        # (llama.cpp's web UI) run a server tool: the MCP hub's
                 self._ui_tool_call()
                 return
@@ -7817,6 +7909,9 @@ def make_handler(svc: Service):
             version = getattr(svc.engine, "info", {}).get("version")
             if version:
                 props["build_info"] = "Strata " + str(version)
+            # (llama.cpp's web UI) as its router, so the page shows the model picker, here with the one model served
+            if "model=" not in (self.path.split("?", 1)[1] if "?" in self.path else ""):
+                props["role"] = "router"
             self._json(200, props)
 
         def _control_body(self) -> bool:
@@ -8041,7 +8136,13 @@ def make_handler(svc: Service):
             stop_strings(req)                                 # ... and so is a bad stop / stop_sequences
             check_request_sampling(req)                       # ... and a sampling field of the wrong type
             cancel = threading.Event()
-            self._watch_client(cancel)                       # #430 #431 (#1999: before prepare, which can take long)
+            # 2026-11-07 (llama.cpp's web UI): a streamed request with X-Conversation-Id goes on when its page goes away,
+            # its bytes kept for /v1/stream (serve/streams.py); the hang-up watch then must not stop it
+            conv = (self.headers.get("X-Conversation-Id") or "").strip() if req.get("stream") else ""
+            self._watch_client(threading.Event() if conv else cancel)   # #430 #431 (#1999: before prepare)
+            if conv:
+                with svc.status_lock:
+                    svc.active_cancels.add(cancel)
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force, req=req, cancel=cancel)
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
             run = run_with_mcp(svc, svc.mcp, messages, tools, kw, ids, thinking, max_new, max_req, req, cancel,
@@ -8053,6 +8154,21 @@ def make_handler(svc: Service):
             if not req.get("stream"):
                 return self._json(200, openai_collect(chunks))
             self._sse()
+            if conv:
+                from serve.streams import REGISTRY, Tee
+                session = REGISTRY.start(conv, cancel)
+                real_wfile, self.wfile = self.wfile, Tee(self.wfile, session)
+                try:
+                    self._openai_stream_body(chunks, cancel)
+                finally:
+                    self.wfile = real_wfile
+                    session.finish()
+                    with svc.status_lock:
+                        svc.active_cancels.discard(cancel)
+                return
+            self._openai_stream_body(chunks, cancel)
+
+        def _openai_stream_body(self, chunks, cancel):
             try:
                 for c in chunks:
                     if c is None:
