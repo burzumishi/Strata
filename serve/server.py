@@ -7036,8 +7036,115 @@ def make_handler(svc: Service):
             self._json(401, {"error": {"type": "authentication_error", "message": "missing or wrong telemetry key"}})
             return False
 
+        _LLAMA_UI = ROOT / "serve" / "web" / "llamacpp"
+        _LLAMA_TYPES = {".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8",
+                        ".json": "application/json", ".webmanifest": "application/manifest+json", ".svg": "image/svg+xml",
+                        ".png": "image/png", ".ico": "image/x-icon", ".woff2": "font/woff2", ".woff": "font/woff", ".txt": "text/plain"}
+
+        def _ui_tools(self):
+            """llama.cpp's GET /tools: the server's tools, here the MCP hub's (--mcp-config), in its format."""
+            hub = svc.mcp
+            if not hub:
+                return []
+            out = []
+            for t in hub.template_tools():
+                out.append({"display_name": t["name"], "tool": t["name"], "type": "mcp", "permissions": {"write": False},
+                            "uses_cwd": False, "definition": {"type": "function", "function": t}})
+            return out
+
+        def _ui_tool_call(self):
+            """llama.cpp's POST /tools {"tool", "params"}: the MCP result as the tool gives it ({content, isError})."""
+            try:
+                body = json.loads(self._body() or b"{}")
+                name = str(body.get("tool") or "")
+                params = body.get("params") if isinstance(body.get("params"), dict) else {}
+            except (ValueError, TypeError):
+                self._json(400, {"error": {"type": "invalid_request_error", "message": "a JSON body {tool, params}"}})
+                return
+            hub = svc.mcp
+            route = hub.routes().get(name) if hub else None
+            if route is None:
+                self._json(404, {"error": {"type": "not_found_error", "message": f"no tool named {name!r}"}})
+                return
+            server, tool = route
+            try:
+                res = server.call(tool, params, float(hub.settings["timeout_s"]))
+            except Exception as e:   # (McpError and friends: the web UI shows the text)
+                res = {"content": [{"type": "text", "text": f"error: {e}"}], "isError": True}
+            self._json(200, res)
+
+        def _cors_proxy(self, method):
+            """llama.cpp's /cors-proxy?url=...: the web UI reaches an MCP server through this one. Off unless --ui-mcp-proxy
+            (an open proxy for whoever reaches this port); headers named x-llama-server-proxy-header-NAME go on as NAME."""
+            if not getattr(svc, "ui_mcp_proxy", False):
+                self._json(403, {"error": {"type": "permission_error", "message": "the MCP proxy is off (--ui-mcp-proxy)"}})
+                return
+            import urllib.parse, urllib.request
+            q = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+            url = (q.get("url") or [""])[0]
+            u = urllib.parse.urlsplit(url)
+            if u.scheme not in ("http", "https") or not u.hostname or u.password:
+                self._json(400, {"error": {"type": "invalid_request_error", "message": "url: an http(s) URL without a password"}})
+                return
+            pre = "x-llama-server-proxy-header-"
+            hdr = {k[len(pre):]: v for k, v in self.headers.items() if k.lower().startswith(pre) and len(k) > len(pre)}
+            data = self._body() if method == "POST" else None
+            req = urllib.request.Request(url, data=data, method=method, headers=hdr)
+            try:
+                r = urllib.request.urlopen(req, timeout=600)
+                status = r.status
+            except urllib.error.HTTPError as e:
+                r, status = e, e.code
+            except Exception as e:
+                self._json(502, {"error": {"type": "api_error", "message": f"proxy: {e}"}})
+                return
+            self.send_response(status)
+            for k, v in r.headers.items():
+                if k.lower() in ("content-type", "mcp-session-id", "mcp-protocol-version", "cache-control"):
+                    self.send_header(k, v)
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            while True:   # (streams too: an MCP server may answer with text/event-stream)
+                chunk = r.read1(65536) if hasattr(r, "read1") else r.read(65536)
+                if not chunk:
+                    break
+                self.wfile.write(b"%x\r\n" % len(chunk) + chunk + b"\r\n")
+                self.wfile.flush()
+            self.wfile.write(b"0\r\n\r\n")
+
+        def _llama_ui(self, path):
+            """llama.cpp's web UI: "" -> index.html, and any file of its build directory. False when the path is not one of them."""
+            rel = "index.html" if path == "" else path.lstrip("/")
+            if ".." in rel.split("/") or "\\" in rel:
+                return False
+            f = self._LLAMA_UI / rel
+            if not f.is_file():
+                return False
+            body = f.read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Type", self._LLAMA_TYPES.get(f.suffix, "application/octet-stream"))
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("X-Content-Type-Options", "nosniff")
+            if rel == "index.html" or rel == "sw.js":
+                self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            self.wfile.write(body)
+            return True
+
         def do_GET(self):
             path = self.path.split("?")[0].rstrip("/")
+            # 2026-11-07 (ds-wormhole): the chat page is llama.cpp's web UI (b12032, built at ~/llama.cpp/build/tools/ui/dist,
+            # copied to serve/web/llamacpp); it replaces the old index.html. Its files are served as they lie; the API paths are untouched.
+            if self._llama_ui(path):
+                return
+            if path == "/tools":
+                if self._authorized():
+                    self._json(200, self._ui_tools())
+                return
+            if path == "/cors-proxy":
+                if self._authorized():
+                    self._cors_proxy("GET")
+                return
             if path.startswith("/tool-media/"):
                 if not self._authorized():
                     return
@@ -7433,6 +7540,12 @@ def make_handler(svc: Service):
                 return
             if path == "/settings":
                 self._settings()
+                return
+            if path == "/tools":        # (llama.cpp's web UI) run a server tool: the MCP hub's
+                self._ui_tool_call()
+                return
+            if path == "/cors-proxy":   # (llama.cpp's web UI, its MCP client) only with --ui-mcp-proxy
+                self._cors_proxy("POST")
                 return
             if path == "/config":
                 self._config_post()
@@ -9031,6 +9144,7 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
     ap.add_argument("--no-api-key", action="store_true",
                     help="serve on the network without an API key (anyone who can reach the port can use the model; "
                          "also \"api_key\": \"none\" in the config). Warns once, never refuses")
+    ap.add_argument("--ui-mcp-proxy", action="store_true", help="the chat page (llama.cpp's web UI) may reach MCP servers through /cors-proxy (an open proxy for whoever reaches this port; also \"ui_mcp_proxy\": true in the config)")
     ap.add_argument("--mcp-config", help="a JSON file with MCP servers in Claude Desktop's format ({\"mcpServers\": "
                                          "{...}}); the web app's chat can use their tools (also \"mcp_servers\" in "
                                          "the config)")
@@ -9403,6 +9517,7 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
         print("[strata] Host check off: any name reaches this server (allowed_hosts \"*\")" if "*" in svc.allowed_hosts
               else f"[strata] also answers to the host names {', '.join(svc.allowed_hosts)} (allowed_hosts)", flush=True)
     svc.api_monitor = a.api_monitor or cfg.get("api_monitor") is True
+    svc.ui_mcp_proxy = a.ui_mcp_proxy or cfg.get("ui_mcp_proxy") is True or os.environ.get("STRATA_UI_MCP_PROXY") == "1"
     if svc.api_monitor:
         print("[strata] API request monitor on (/api-monitor): the last 100 requests' prompts and answers are kept in "
               "memory" + ("" if svc.api_key else "; anyone who can reach this server can read them (no API key)"),
