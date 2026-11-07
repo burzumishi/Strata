@@ -199,6 +199,15 @@ class DsmlOutputParser(OutputParser):
         if self.scall is not None and self.scall.name == tool:
             self.sdeclared[name] = "string"
 
+    # 2026-11-07: DeepSeek ends its thinking with a special TOKEN (</think>, one id), as deepseek-recipe's parser reads it: that
+    # id always ends it, and the same text written with ordinary tokens never does.  The generation loop says which one this
+    # delta is (end_is_special); #537's quote rule (a </think> after a quote or backtick, for Qwen) does not apply: the
+    # template writes the answer right after the tag, so it took `ls`</think>Run... for a quote and the answer came twice.
+    end_is_special: bool | None = None   # None: a text-only caller (no ids): a </think> is the end, as the token nearly always is
+
+    def _quoted_think_end(self, i: int) -> bool | None:
+        return False if self.end_is_special is None else not self.end_is_special
+
     def feed(self, delta: str):
         return self._watch(super().feed(self.dsml.feed(delta)))
 

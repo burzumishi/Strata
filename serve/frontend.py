@@ -61,7 +61,11 @@ class ChatTemplate:
         messages = [m for i, m in enumerate(messages)
                     if i == len(messages) - 1 or os.environ.get("STRATA_KEEP_EMPTY_TURNS") == "1" or not (isinstance(m, dict) and m.get("role") == "assistant"
                                                       and not _text_of(m.get("content")).strip()
-                                                      and not _has_image(m.get("content")) and not m.get("tool_calls"))]
+                                                      and not _has_image(m.get("content")) and not m.get("tool_calls")
+                                                      # (2026-11-07) a turn with its reasoning is not empty: DeepSeek's
+                                                      # encoder renders it (<think>R</think><eos>) - a reply stopped while
+                                                      # thinking - and dropping it merged the user turns around it
+                                                      and not (_KEEP_THINKING_TURNS and str(m.get("reasoning_content") or "").strip()))]
         return self.template.render(messages=messages, tools=tools, add_generation_prompt=add_generation_prompt,
                                     **kwargs)
 
@@ -143,11 +147,13 @@ EFFORT_DEEPSEEK = {"none": None, "off": None, "minimal": None, "disabled": None,
 #  asking for it - Claude Code's thinking budgets of 2K-8K, OpenAI's medium - got an error: it is 62 now, between low and high)
 _EFFORT_QWEN = dict(EFFORT)
 _NUMERIC_EFFORT = False
+_KEEP_THINKING_TURNS = False   # (2026-11-07, deepseek41: render a reasoning-only reply, as DeepSeek's encoder does)
 
 
 def use_family(family: str | None) -> None:
     """The reasoning-effort words of the model family this server runs (module state, like ENV_TO_USER)."""
-    global _NUMERIC_EFFORT
+    global _NUMERIC_EFFORT, _KEEP_THINKING_TURNS
+    _KEEP_THINKING_TURNS = family == "deepseek41"
     EFFORT.clear()
     EFFORT.update(EFFORT_DEEPSEEK if family == "deepseek41" else _EFFORT_QWEN)
     _NUMERIC_EFFORT = family == "deepseek41"

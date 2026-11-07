@@ -89,8 +89,9 @@ DEFS = {
     "get_info": ("Get Runtime Info", False, True, _fn(
         "get_info", "Returns runtime info: the OS name/version and the current working directory", {}, [])),
 }
-USES_CWD = {"file_glob_search": False, "grep_search": False, "exec_shell_command": True, "get_info": True,
-            "read_file": False, "write_file": False, "edit_file": False}
+# (2026-11-07) all of them, as llama.cpp's server marks them (server-tools.cpp): relative paths resolve against x-tool-cwd here too
+USES_CWD = {"file_glob_search": True, "grep_search": True, "exec_shell_command": True, "get_info": True,
+            "read_file": True, "write_file": True, "edit_file": True}
 
 
 class LlamaTools:

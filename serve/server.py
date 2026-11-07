@@ -62,7 +62,7 @@ sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
 from serve.frontend import (THINK_END, ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
                             forced_call, images_of, literal_tags, mark_think_literals, openai_to_messages, require_messages,
-                            tool_choice_of, unmark_think_literals)
+                            tool_choice_of, unmark_think_literals, _text_of)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
 from serve import runconfig  # noqa: E402
 from serve.webfiles import subtree_file as web_subtree_file  # noqa: E402
@@ -282,7 +282,7 @@ def focused_recovery_prompt(tok, ids, generated):
 
 LOOPBACK_NAMES = ("localhost", "127.0.0.1", "::1")
 QUEUE_BEAT_S = 10.0         # a request waiting for the single turn sends a keep-alive this often (#1619)
-KEEPALIVE_S = 10.0          # a held-back tool argument leaves the stream quiet: ping at least this often
+KEEPALIVE_S = 2.5           # a held-back tool argument leaves the stream quiet: ping at least this often   (2026-11-07: 10 -> 2.5, under the llama.cpp web UI's 3 s stall kick)
 # Anthropic clients add /v1/messages to their base URL themselves. A base URL that already ends in /v1 (copied from an OpenAI-style
 # setup) makes them post /v1/v1/messages; these two paths mean the same as the real ones. Nothing else is aliased.
 V1_V1_ALIASES = {"/v1/v1/messages": "/v1/messages", "/v1/v1/messages/count_tokens": "/v1/messages/count_tokens"}
@@ -5196,8 +5196,14 @@ class Service:
         prompt; with thinking, Service.run writes it once the thinking is over."""
         # 2026-11-07 (llama.cpp's web UI "Continue"): continue_final_message - the last assistant message is the start of
         # the reply: rendered without its end token and without a new generation prompt, so the model goes on from it
+        cont = None
         if req and req.get("continue_final_message") and messages and messages[-1].get("role") == "assistant":
-            messages = messages[:-1] + [dict(messages[-1], wo_eos=True)]
+            last = messages[-1]
+            # (2026-11-07, deepseek-recipe's prefix rule) where the continued message stands: in its answer when it has text or
+            # calls (the parser then starts in the answer, not in the thinking the template has closed), else in its thinking
+            cont = "content" if (_text_of(last.get("content")).strip() or last.get("tool_calls")) else \
+                ("reasoning" if str(last.get("reasoning_content") or "").strip() else None)
+            messages = messages[:-1] + [dict(last, wo_eos=True)]
             kwargs = dict(kwargs, add_generation_prompt=False)
         # `cancel` (#1999): set when the client hangs up; the downloads, the wait for the turn and the encodes stop
         # between pictures and raise ClientGone
@@ -5221,6 +5227,11 @@ class Service:
                         part["source"] = str(image)
         fetched = self._note_unreadable_tool_images(messages, cancel)
         ids = encoded_ids = self.encode_prompt(messages, tools, kwargs)
+        if cont == "reasoning" and self.family == "deepseek41" and kwargs.get("enable_thinking", True) is not False:
+            # a message stopped while thinking: its thinking goes on, so no end-of-thinking after it (the template closes it)
+            te = self.tok.encode("</think>", parse_special=True)
+            if len(te) == 1 and ids and ids[-1] == te[0]:
+                ids = encoded_ids = ids[:-1]
         if force and kwargs.get("enable_thinking", True) is False:
             ids = ids + self.tok.encode(force, parse_special=True)
         self.embeddings.path = None
@@ -5331,7 +5342,8 @@ class Service:
                 req["strata_prefix"] = {"messages": lead}
         if req is not None and req.get("strata_prefix") is not None:
             req["strata_prefix"] = self.resolve_prefix(req["strata_prefix"], messages, tools, kwargs, ids, bool(images) or ds_pics)
-        return ids, kwargs.get("enable_thinking", True) is not False, max_new
+        thinking = kwargs.get("enable_thinking", True) is not False and cont != "content"
+        return ids, thinking, max_new
 
     @staticmethod
     def deepseek_shared_start(messages) -> int:
@@ -5524,6 +5536,11 @@ class Service:
         parser = self.parser_cls(thinking=thinking, tools=with_history_tools(tools, sampling), stream_tools=True,
                                  recover=self.tool_call_recovery, declared_only=declared_only)
         detok, n, finish = Detokenizer(self.tok), 0, "length"
+        # (2026-11-07) DeepSeek-V4.1's </think> id, for the official ExtraEndOfThinking rule below; None for other families
+        extra_think_end = None
+        if type(parser).__name__ == "DsmlOutputParser":
+            _te = self.tok.encode("</think>", parse_special=True)
+            extra_think_end = _te[0] if len(_te) == 1 else None
         run_tok, run_len, repeated = None, 0, False     # #606: the current run of one repeated token
         thinking_n = 0                                  # tokens written while thinking (Responses' reasoning_tokens)
         stop_list = stop_strings(sampling)
@@ -5713,7 +5730,17 @@ class Service:
                                     repeated = True     # #606: a degenerate output, not an answer: end it here
                                     break
                                 piece = detok.push(t)
+                                if t == extra_think_end and parser.state == "content":
+                                    # 2026-11-07, DeepSeek-V4.1: the end-of-thinking TOKEN after the thinking has ended - as
+                                    # deepseek-recipe's parser does (ExtraEndOfThinking, a SkipInvalid segment): skipped,
+                                    # never shown; what is around it stays the answer. The same text written with ordinary
+                                    # tokens is not this id and stays content.
+                                    st["extra_think_end"] = st.get("extra_think_end", 0) + 1
+                                    print("[strata] an extra end-of-thinking token in the answer: skipped (as the official parser)",
+                                          flush=True)
+                                    continue
                                 tail = (tail + piece)[-2:]
+                                parser.end_is_special = t == extra_think_end
                                 evs = cut(parser.feed(piece))
                                 self._note(n, evs, st, rate)
                                 last_print = self._progress(last_print, st=st)
@@ -5848,6 +5875,7 @@ class Service:
                                     n += 1
                                     raw_ids.append(t)
                                     thinking_n += parser.state in ("reasoning", "rcall")
+                                    parser.end_is_special = t == extra_think_end
                                     evs = cut(parser.feed(detok.push(t)))
                                     self._note(n, evs, st, rate)
                                     for ev in evs:
@@ -5878,6 +5906,7 @@ class Service:
                             n += 1
                             raw_ids.append(t)
                             thinking_n += parser.state in ("reasoning", "rcall")
+                            parser.end_is_special = t == extra_think_end
                             evs = cut(parser.feed(detok.push(t)))
                             self._note(n, evs, st, rate)
                             for ev in evs:
@@ -6424,6 +6453,21 @@ def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel
     # llama.cpp's flag, and its default: a client that wants prompt progress asks for it, and nothing changes for one
     # that does not.  Strata already sends a keep-alive comment on every PP line, so this only fills that line in.
     want_progress = bool(req.get("return_progress"))
+    # 2026-11-07 (llama.cpp's web UI sends timings_per_token: its live t/s reads each chunk's timings; we sent them only in
+    # the last one, so the counter stayed empty until the end): a running predicted_n / predicted_ms every few pieces
+    live = {"on": bool(req.get("timings_per_token")), "n": 0, "t0": None, "sent": 0.0}
+
+    def live_timings(c):
+        if not live["on"]:
+            return c
+        now = time.monotonic()
+        if live["t0"] is None:
+            live["t0"] = now
+        live["n"] += 1
+        if now - live["sent"] >= 0.5 and now > live["t0"]:
+            live["sent"] = now
+            c["timings"] = {"predicted_n": live["n"], "predicted_ms": round((now - live["t0"]) * 1000, 1)}
+        return c
 
     def chunk(delta, finish=None):
         return {"id": cid, "object": "chat.completion.chunk", "created": created, "model": model,
@@ -6453,9 +6497,9 @@ def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel
         elif kind == "event":
             ev: Event = x
             if ev.kind == "reasoning" and ev.text:
-                yield with_lp(chunk({"reasoning_content": ev.text}), "reasoning_content")
+                yield live_timings(with_lp(chunk({"reasoning_content": ev.text}), "reasoning_content"))
             elif ev.kind == "content" and ev.text:
-                yield with_lp(chunk({"content": ev.text}), "content")
+                yield live_timings(with_lp(chunk({"content": ev.text}), "content"))
             elif ev.kind == "tool_start":
                 streamed[ev.call.id] = calls
                 calls += 1
@@ -7676,7 +7720,7 @@ def make_handler(svc: Service):
                     return
                 if body["id"] == getattr(svc, "active_cid", None):
                     svc.end_reasoning_now = True
-                self._json(200, {"id": body["id"], "action": "reasoning_end"})
+                self._json(200, {"id": body["id"], "action": "reasoning_end", "success": True})   # (the UI checks success)
                 return
             if path in ("/models/load", "/models/unload"):   # (llama.cpp's web UI, router) one model, always loaded
                 try:
