@@ -56,6 +56,7 @@ class DsmlTranslator:
         self.state = "text"        # text | calls (inside the block) | invoke | param (inside a value)
         self.tool = None
         self.on_param = on_param
+        self.blocks_closed = 0
 
     @property
     def held(self) -> str:
@@ -135,6 +136,7 @@ class DsmlTranslator:
                     out("</function>\n</tool_call>\n")
                 self.buf = s[gt + 1:]
                 self.state = "text"
+                self.blocks_closed += 1   # (2026-11-07: deepseek-recipe ends the reply here, see DsmlOutputParser.finished)
                 return True
             return None
         if self.state == "param":
@@ -208,7 +210,15 @@ class DsmlOutputParser(OutputParser):
     def _quoted_think_end(self, i: int) -> bool | None:
         return False if self.end_is_special is None else not self.end_is_special
 
+    @property
+    def finished(self) -> bool:
+        """2026-11-07: a call block has closed - deepseek-recipe's Finished stage: the reply ends there, and what the model
+        writes after it (an extra </think>, more answer) is ContentAfterFinished, skipped.  The generation loop stops."""
+        return self.dsml.blocks_closed > 0 and not self.dsml.held
+
     def feed(self, delta: str):
+        if self.finished:
+            return []
         return self._watch(super().feed(self.dsml.feed(delta)))
 
     def finish(self, reason: str | None = None):

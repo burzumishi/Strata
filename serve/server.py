@@ -5727,6 +5727,11 @@ class Service:
                                 if trace is not None and trace["first_token_s"] is None:
                                     with self.status_lock:
                                         trace["first_token_s"] = round(time.perf_counter() - trace["_clock"], 3)
+                                if getattr(parser, "finished", False):
+                                    # (2026-11-07, DeepSeek) the call block closed on the previous token: the reply ends there,
+                                    # as deepseek-recipe's parser ends it (Finished); the model's next tokens are not generated
+                                    finish = "stop"
+                                    break
                                 if t in self.stop_ids:
                                     if force and parser.state == "reasoning" and parser.buf == THINK_END:
                                         opens = True    # #537: the held </think> was the end: the call opens there
@@ -6498,6 +6503,10 @@ def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel
             c["choices"][0]["logprobs"] = {key: got}
         return c
     calls = 0
+    # (2026-11-07) llama.cpp numbers the calls of each batch from 0: its web UI closes a batch when text comes between calls
+    # and adds the calls it already has to the next batch's indexes - our running count made holes, empty calls ("Allow use of
+    # ?", "Unknown tool:")
+    base = {"n": 0, "text_since": False}
     streamed = {}                                  # tool call id -> index, for calls sent piece by piece
     finished = set()                               # ... and the ones whose final tool_call came (#211)
     for kind, x in run if run is not None else svc.run(ids, thinking, tools, max_new, req, cancel, force=force, declared_only=True):
@@ -6517,6 +6526,8 @@ def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel
                 # (reasoning_format "none") the thinking is over: its end tag, as the model wrote it, then the rest
                 raw_reasoning["in"] = False
                 yield chunk({"content": THINK_END})
+            if ev.kind in ("reasoning", "content") and ev.text and calls > base["n"]:
+                base["n"], base["text_since"] = calls, True      # a new batch starts after this text
             if ev.kind == "reasoning" and ev.text and raw_reasoning:
                 yield live_timings(chunk({"content": ev.text}))
             elif ev.kind == "reasoning" and ev.text:
@@ -6524,7 +6535,7 @@ def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel
             elif ev.kind == "content" and ev.text:
                 yield live_timings(with_lp(chunk({"content": ev.text}), "content"))
             elif ev.kind == "tool_start":
-                streamed[ev.call.id] = calls
+                streamed[ev.call.id] = calls - base["n"]
                 calls += 1
                 yield chunk({"tool_calls": [{"index": streamed[ev.call.id], "id": ev.call.id, "type": "function",
                                              "function": {"name": ev.call.name, "arguments": ""}}]})
@@ -6533,7 +6544,7 @@ def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel
             elif ev.kind == "tool_call" and ev.call.id in streamed:
                 finished.add(ev.call.id)
             elif ev.kind == "tool_call":
-                yield chunk({"tool_calls": [{"index": calls, "id": ev.call.id, "type": "function",
+                yield chunk({"tool_calls": [{"index": calls - base["n"], "id": ev.call.id, "type": "function",
                                              "function": {"name": ev.call.name,
                                                           "arguments": json.dumps(ev.call.arguments, ensure_ascii=False)}}]})
                 calls += 1
