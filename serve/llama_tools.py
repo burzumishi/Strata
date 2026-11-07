@@ -202,17 +202,23 @@ class LlamaTools:
         if not base.is_dir():
             return {"error": f"not a directory: {p['path']}"}
         inc, exc = self._norm_glob(p.get("include") or "**"), self._norm_glob(p.get("exclude"))
-        entries = []
+        matches = []
         for rel, isdir in self._walk(base, kind in ("dir", "all"), kind in ("file", "all"), int(p.get("max_depth") or 0)):
             if inc not in (None, "**") and not self._match(rel, inc):
                 continue
             if exc and self._match(rel, exc):
                 continue
-            entries.append(rel + ("/" if isdir else ""))
-            if len(entries) >= limit:
+            matches.append((rel, isdir))
+            if len(matches) > 10000:   # (a time budget of sorts: a listing of / would go on for long)
                 break
-        text = "\n".join(entries) + ("\n" if entries else "") + (f"[results truncated at {limit}]" if len(entries) >= limit else "")
-        return {"plain_text_response": text or "no matches", "entries": entries, "base": str(base)}
+        shown = matches[:limit]
+        # llama.cpp's answer: the text the model reads, and entries {path, type} + an absolute base for the web UI's picker
+        text = "".join(r + ("/" if d else "") + "\n" for r, d in shown) + f"\n---\nTotal matches: {len(matches)}\n"
+        if len(matches) > limit:
+            text += (f"[{limit} results limit reached ({len(matches)} total matches). Refine the glob pattern to narrow "
+                     "the search.]\n")
+        return {"plain_text_response": text, "entries": [{"path": r, "type": "dir" if d else "file"} for r, d in shown],
+                "base": str(base.resolve())}
 
     def t_grep_search(self, p, cwd, _):
         base = self._path(p["path"], cwd)
