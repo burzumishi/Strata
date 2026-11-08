@@ -21,6 +21,7 @@ split behave for DeepSeek as they do for the other families, and there is one pl
 from __future__ import annotations
 
 import json
+import sys
 import re
 from pathlib import Path
 
@@ -181,6 +182,9 @@ class DsmlTranslator:
         return None
 
 
+RAW_KEEP = 1500   # chars of the model's raw output kept for the empty-call note
+
+
 class DsmlOutputParser(OutputParser):
     """OutputParser for DeepSeek-V4.1: the model's DSML calls are read as the template-form calls they are."""
 
@@ -208,6 +212,15 @@ class DsmlOutputParser(OutputParser):
             return {k: self._unmark(x) for k, x in v.items()}
         return v
 
+    def _empty_call_note(self, name: str) -> None:
+        """(2026-11-09) a call with no arguments to a tool whose schema has parameters: the model's raw text is logged, so
+        the form it wrote can be read (a client saw arguments {} for a call whose URL the model had written)."""
+        props = (((self.schemas.get(name) or {}).get("parameters") or {}).get("properties") or {})
+        if props:
+            raw = getattr(self, "_raw", "")
+            print(f"[strata] tool call {name} with no arguments (its schema has {sorted(props)}); the model's last "
+                  f"{len(raw)} chars: {raw!r}", file=sys.stderr, flush=True)
+
     def _watch(self, evs):
         if self.state != "reasoning":
             self._left_reasoning = True
@@ -226,6 +239,8 @@ class DsmlOutputParser(OutputParser):
                             pass
                 self._json_strings = {k for k in self._json_strings if k[0] != ev.call.name}
                 ev.call.arguments = args
+                if not args:
+                    self._empty_call_note(ev.call.name)
             if ev.kind == "reasoning":
                 self._reasoning.append(ev.text)
             elif ev.kind in ("tool_start", "tool_call") or (ev.kind == "content" and ev.text.strip()):
@@ -280,6 +295,7 @@ class DsmlOutputParser(OutputParser):
     def feed(self, delta: str):
         if self.finished:
             return []
+        self._raw = (getattr(self, "_raw", "") + delta)[-RAW_KEEP:]   # (2026-11-09) the model's own text, for _empty_call_note
         return self._watch(super().feed(self.dsml.feed(delta)))
 
     def finish(self, reason: str | None = None):
