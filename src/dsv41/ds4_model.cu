@@ -3556,16 +3556,62 @@ struct Model::Impl {
                         stride = std::max(stride, align256(unit(member(l, m))));
                     }
             const size_t A = (size_t) c.A, AI = (size_t) c.AI, ss = (size_t) o.max_context + 64;
-            bool ok = dalloc(d, c.h, C * H * D, err) && dalloc(d, c.x, C * D, err) && dalloc(d, c.acc, C * D, err) &&
-                      dalloc(d, c.x16, C * D, err) && dalloc(d, c.qr, C * g.q_lora, err) &&
+            // 2026-11-08 (ds-wormhole): DS4_CHUNK_LEND=1 (with DS4_STORE_LEND and DS4_STORE_GPU, one integrated GPU) - the chunk's
+            // big scratch (its rows' residual streams, the FFN's, the attention slab's and the indexer's scores: ~1.5 GB at 8192
+            // rows) from ONE pinned coherent host region, the store arena's kind of memory, which the SWITCH lends to the store
+            // while the model writes like the staging (on this APU it is the same RAM; its contents are thrown away at the next
+            // chunk anyway).  The order of `big` is the order of the take() calls below.
+            size_t pool_off = 0;
+            bool pool_on = false;
+#if defined(STRATA_USE_HIP)
+            if (chunk_lend_wanted() && devs.size() == 1 && unified) {
+                const size_t big[] = {C * H * D * 4, C * D * 4, C * D * 4, C * D * 2, A * HQ * 4, A * HQ * 4, A * HQ * 2,
+                                      A * OG * g.o_lora * 4, A * OG * g.o_lora * 2, AI * ss * 4, C * FF * 4, C * FF * 4,
+                                      C * FF * 2, (C + kH16Pad) * FF * 2, C * D * 4};
+                size_t need = 0;
+                for (size_t b : big) need += align256(b);
+                if (chunk_pool != nullptr && chunk_pool_bytes >= need) pool_on = true;   // (a halved chunk's retry: the same region)
+                else if (chunk_pool == nullptr) {
+                    void* v = nullptr;
+                    if (hipHostMalloc(&v, need, hipHostMallocDefault) == hipSuccess) {
+                        std::memset(v, 0, need);
+                        chunk_pool = (uint8_t*) v;
+                        chunk_pool_bytes = need;
+                        d.host_slot_allocs.push_back(v);   // (hipHostFree at the end)
+                        pool_on = true;
+                    } else {
+                        (void) cudaGetLastError();
+                        std::fprintf(stderr, "ds4: DS4_CHUNK_LEND: hipHostMalloc of %.2f GB failed: the chunk's scratch stays on the device\n", need / 1e9);
+                    }
+                }
+            }
+#endif
+            auto take = [&](auto& p, size_t n) -> bool {
+                using T = std::remove_pointer_t<std::remove_reference_t<decltype(p)>>;
+                if (!pool_on) return dalloc(d, p, n, err);
+                const size_t b = align256(n * sizeof(T));
+                if (pool_off + b > chunk_pool_bytes) {
+                    err = "DS4_CHUNK_LEND: the chunk's scratch outgrew its region";
+                    return false;
+                }
+                p = (T*) (chunk_pool + pool_off);
+                pool_off += b;
+                return true;
+            };
+            bool ok = take(c.h, C * H * D) && take(c.x, C * D) && take(c.acc, C * D) && take(c.x16, C * D) &&
+                      take(c.q, A * HQ) && take(c.o, A * HQ) && take(c.o16, A * HQ) && take(c.oa, A * OG * g.o_lora) &&
+                      take(c.oa16, A * OG * g.o_lora) && take(c.scores, AI * ss) && take(c.sg, C * FF) && take(c.su, C * FF) &&
+                      take(c.sh16, C * FF) && take(c.h16, (C + kH16Pad) * FF) && take(c.y, C * D);
+            if (ok && pool_on && chunk_lend_said++ == 0)
+                std::fprintf(stderr, "ds4: DS4_CHUNK_LEND: the chunk's scratch (%.2f GB) in pinned host memory, lent to the store while the model writes\n",
+                             pool_off / 1e9);
+            ok = ok && dalloc(d, c.qr, C * g.q_lora, err) &&
                       dalloc(d, c.qr16, C * g.q_lora, err) && dalloc(d, c.kvr, C * HD, err) &&
                       dalloc(d, c.ckr, C * HD, err) && dalloc(d, c.cgr, C * HD, err) &&
                       dalloc(d, c.latent, (C + 2) * HD, err) && dalloc(d, c.lat16, (C + 2) * HD, err) &&
                       dalloc(d, c.ikr, (C + 2) * g.ix_hd, err) && dalloc(d, c.ext, ((size_t) g.win + C) * HD, err) &&
-                      dalloc(d, c.q, A * HQ, err) && dalloc(d, c.o, A * HQ, err) && dalloc(d, c.o16, A * HQ, err) &&
-                      dalloc(d, c.oa, A * OG * g.o_lora, err) && dalloc(d, c.oa16, A * OG * g.o_lora, err) &&
                       dalloc(d, c.iq, AI * g.ix_heads * g.ix_hd, err) && dalloc(d, c.iw, C * 64, err) &&
-                      dalloc(d, c.scores, AI * ss, err) && dalloc(d, c.bm, AI * bm_stride(), err) &&
+                      dalloc(d, c.bm, AI * bm_stride(), err) &&
                       dalloc(d, c.topk, C * topk_stride(), err) && dalloc(d, c.cand, C * cand_stride(), err) &&
                       dalloc(d, c.mix, C * 32, err) && dalloc(d, c.a_pre, C * 8, err) && dalloc(d, c.a_post, C * 8, err) &&
                       dalloc(d, c.a_comb, C * 64, err) && dalloc(d, c.f_pre, C * 8, err) &&
@@ -3574,9 +3620,7 @@ struct Model::Impl {
                       dalloc(d, c.ridx_w, C * kPicks, err) && dalloc(d, c.rw_w, C * kPicks, err) &&
                       dalloc(d, c.rw, C * kPicks, err) && dalloc(d, c.bounds, 2048, err) &&
                       dalloc(d, c.row_tok, C * kPicks, err) && dalloc(d, c.pos, C * kPicks, err) &&
-                      dalloc(d, c.sg, C * FF, err) && dalloc(d, c.su, C * FF, err) && dalloc(d, c.sh16, C * FF, err) &&
-                      dalloc(d, c.h16, (C + kH16Pad) * FF, err) && dalloc(d, c.y, C * D, err) && dalloc(d, c.w16, c.w16_elems, err) &&
-                      halloc(c.bounds_pin, 2048, err);
+                      dalloc(d, c.w16, c.w16_elems, err) && halloc(c.bounds_pin, 2048, err);
             if (!ok) return false;
             if (has_first && !dalloc(d, c.emb, C * D, err)) return false;
             if (has_eg) {
@@ -5850,9 +5894,11 @@ struct Model::Impl {
         // the SWITCH (DS4_STORE_LEND=1, with DS4_STORE_GPU): room for the prompt path's pinned staging as lent slots
         size_t lend_bytes = 0;
         const bool want_lend = store_gpu && std::getenv("DS4_STORE_LEND") != nullptr && std::atoi(std::getenv("DS4_STORE_LEND")) != 0;
-        if (want_lend)
+        if (want_lend) {
             for (auto& cp : chunks)
                 if (cp && cp->stage) lend_bytes += (size_t) cp->S * cp->stage_stride;
+            lend_bytes += chunk_pool_bytes;   // (DS4_CHUNK_LEND: the chunk's scratch too)
+        }
         if (lend_bytes > 0) cfg.loan_capacity = lend_bytes / std::max<size_t>(1, L[0].blob) + 16;
         auto st = std::make_unique<ExpertStore>();
         if (!st->init(cfg, geo, pk.dfds, pk.pfds)) {
@@ -5872,9 +5918,20 @@ struct Model::Impl {
                 }
                 n += store->add_loan(cp->stage, (unsigned long long) dp, (size_t) cp->S * cp->stage_stride);
             }
-            store_lend_on = n > 0;
-            std::fprintf(stderr, "ds4: RAM store: %zu slots (%.1f GB) of the prompt path's staging lent while the model writes (DS4_STORE_LEND)\n",
-                         n, n * (double) store->slot_bytes() / 1e9);
+            size_t nc = 0;
+            if (chunk_pool != nullptr) {   // (DS4_CHUNK_LEND)
+                void* dp = nullptr;
+                cudaSetDevice(devs[0].id);
+                if (cudaHostGetDevicePointer(&dp, chunk_pool, 0) == cudaSuccess && dp != nullptr)
+                    nc = store->add_loan(chunk_pool, (unsigned long long) dp, chunk_pool_bytes);
+                else
+                    (void) cudaGetLastError();
+                chunk_lent = nc > 0;
+            }
+            store_lend_on = n + nc > 0;
+            std::fprintf(stderr, "ds4: RAM store: %zu slots (%.1f GB) of the prompt path's staging%s lent while the model writes (DS4_STORE_LEND)\n",
+                         n + nc, (n + nc) * (double) store->slot_bytes() / 1e9,
+                         nc > 0 ? (" and " + std::to_string(nc) + " of its chunk scratch (DS4_CHUNK_LEND)").c_str() : "");
         }
         // (the router lookahead's guesses are not read ahead with the store: measured 4.5 against 4.7 tok/s, 62% of the guesses are right and
         // the SSD is the narrow part; DS4_AHEAD=1 turns them on)
@@ -5892,7 +5949,8 @@ struct Model::Impl {
             } else {
                 zc_stride = (store->max_blob() + 4095) & ~(size_t) 4095;
                 cudaSetDevice(devs[0].id);
-                if (cudaMalloc((void**) &zc_stage_buf, zc_stride * kPicks) != cudaSuccess) {
+                // (DS4_STORE_GPU: the plan points into the store and the staging is never read - 2026-11-08: not allocated, ~90 MB)
+                if (!store_gpu && cudaMalloc((void**) &zc_stage_buf, zc_stride * kPicks) != cudaSuccess) {
                     (void) cudaGetLastError();
                     zc_stage_buf = nullptr;
                     for (Layer& l : L) l.zc.clear();
@@ -5908,7 +5966,7 @@ struct Model::Impl {
             if (store_gpu && store->gpu_mapped())
                 std::fprintf(stderr, "ds4: DS4_STORE_GPU=1: the store's ready experts are GPU experts (in the device's table, read in place), async windows up to %d\n", async_max_t);
             std::fprintf(stderr, "ds4: RAM store: the GPU takes its slots over PCIe (%s), %zu slots kept evictable\n",
-                         zc_stage_buf != nullptr ? "copied into a staging area at the PCIe rate first" : "off", cfg.reserve);
+                         zc_stage_buf != nullptr ? "copied into a staging area at the PCIe rate first" : store_gpu ? "read in place" : "off", cfg.reserve);
         }
     }
     // the profile's hottest experts (VRAM's left out) read into the store before the first token (DS4_STORE_PRELOAD=0: not)
@@ -5993,8 +6051,23 @@ struct Model::Impl {
     // (its misses fill the lent slots, no reads of their own) and taken back before a prompt is read: the lent experts forgotten,
     // the device's table rewritten, the GPU waited for, so the prompt path finds its staging as it left it.
     bool store_lend_on = false;
+    // 2026-11-08 (ds-wormhole) DS4_CHUNK_LEND=1: the chunk's big scratch in one pinned host region (alloc_chunks), lent with the staging
+    uint8_t* chunk_pool = nullptr;
+    size_t chunk_pool_bytes = 0;
+    bool chunk_lent = false;
+    int chunk_lend_said = 0;
+    static bool chunk_lend_wanted() {
+        auto on = [](const char* k) { const char* v = std::getenv(k); return v != nullptr && std::atoi(v) != 0; };
+        return on("DS4_CHUNK_LEND") && on("DS4_STORE_LEND") && on("DS4_STORE_GPU");
+    }
     void store_lend() {
-        if (store_lend_on && store && !store->lent()) store->lend();
+        if (!store_lend_on || !store || store->lent()) return;
+        if (chunk_lent)   // (the prompt's last kernels may still read or write the scratch: done before the store may fill it)
+            for (Dev& d : devs) {
+                cudaSetDevice(d.id);
+                cudaDeviceSynchronize();
+            }
+        store->lend();
     }
     void store_reclaim() {
         if (!store_lend_on || !store || !store->lent()) return;
