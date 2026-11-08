@@ -1140,9 +1140,10 @@ struct Model::Impl {
         const std::string& lo = x.size() < y.size() ? y : x;
         return lo.compare(0, sh.size(), sh) == 0 ? 2 : mid ? 3 : 0;
     }
-    struct TieStats { long long rounds = 0, rows = 0, tie_rounds = 0, ties[4] = {0, 0, 0, 0}, fixed = 0, changed = 0, tail[4] = {0, 0, 0, 0}; } tie_st;
+    struct TieStats { long long rounds = 0, rows = 0, tie_rounds = 0, ties[4] = {0, 0, 0, 0}, fixed = 0, changed = 0, tail[4] = {0, 0, 0, 0}, prefetched = 0; } tie_st;
     std::vector<float> tie_lg;
     std::vector<float> last_draft_conf;   // the last draft block's confidences (draft -> verify)
+    std::vector<std::vector<int16_t>> win_wanted;   // [trunk layer][row * k + i]: the last verify window's wanted experts
     long long draft_fires = 0;
     bool drafts_q = false;
     float dq_temp = 0.0f, dq_top_p = 1.0f, dq_min_p = 0.0f;
@@ -8037,6 +8038,14 @@ struct Model::Impl {
                 const bool dsk = disk_skip_w > 0.0f && !l.mtp && li >= disk_skip_from && li < g.nl;
                 static const bool heat_wanted = std::getenv("DS4_HEAT_WANTED") != nullptr && std::atoi(std::getenv("DS4_HEAT_WANTED")) != 0 &&
                                                 std::getenv("DS4_ROUTE_MISS_PENALTY") != nullptr && std::atof(std::getenv("DS4_ROUTE_MISS_PENALTY")) > 0.0;
+                // (2026-11-08) a verify window's wanted experts, row by row: a recheck reads its row's missing ones all at once first
+                if (spec_win && heat_wanted && li < g.nl) {
+                    if (win_wanted.size() < (size_t) g.nl) win_wanted.resize((size_t) g.nl);
+                    std::vector<int16_t>& ww = win_wanted[(size_t) li];
+                    ww.assign((size_t) T * l.k_exp, -1);
+                    for (int t = 0; t < T; ++t)
+                        for (int i = 0; i < l.k_exp; ++i) ww[(size_t) t * l.k_exp + i] = (int16_t) r.wanted[t][i];
+                }
                 for (int t = 0; t < T; ++t) {
                     if (heat_wanted)   // (the heat from what the router wanted; an expert the penalty turned away may still come in)
                         for (int i = 0; i < l.k_exp; ++i) {
@@ -8749,6 +8758,25 @@ struct Model::Impl {
                 }
             }
             ++tie_st.fixed;
+            // (2026-11-08) the row's wanted experts that are not in graphics memory, read all at once (the exact pass then finds
+            // them in the store instead of waiting on each layer's reads in turn: a recheck cost ~0.6 s, latency, not bandwidth)
+            static const bool pre = std::getenv("DS4_RECHECK_PREFETCH") == nullptr || std::atoi(std::getenv("DS4_RECHECK_PREFETCH")) != 0;
+            if (pre && store) {
+                int asked = 0;
+                for (int il = 0; il < g.nl && il < (int) win_wanted.size(); ++il) {
+                    const Layer& l = L[(size_t) il];
+                    const std::vector<int16_t>& ww = win_wanted[(size_t) il];
+                    for (int i = 0; i < l.k_exp; ++i) {
+                        const size_t at = (size_t) r_tie * l.k_exp + i;
+                        if (at >= ww.size()) break;
+                        const int e = ww[at];
+                        if (e < 0 || e >= l.n_exp || l.slot[(size_t) e] >= 0) continue;
+                        store->prefetch(l.il, e);
+                        ++asked;
+                    }
+                }
+                tie_st.prefetched += asked;
+            }
             rollback(p0, T, r_tie);   // (rows before the tie kept; the tied row is computed again)
             if (r_tie > 0 && !seed_drafter(p0, r_tie, 0, err)) return false;
             strata::ds4::set_penalty_scale(0.0f);
@@ -8779,8 +8807,8 @@ struct Model::Impl {
             if (next != c_tie) ++tie_st.changed;
             m = r_tie;
             if (tie_st.fixed <= 3 || tie_st.fixed % 50 == 0)
-                std::fprintf(stderr, "ds4 tie recheck: %lld of %lld rounds rechecked, %lld tokens changed\n", tie_st.fixed,
-                             tie_st.rounds, tie_st.changed);
+                std::fprintf(stderr, "ds4 tie recheck: %lld of %lld rounds rechecked, %lld tokens changed, %lld experts read ahead\n",
+                             tie_st.fixed, tie_st.rounds, tie_st.changed, tie_st.prefetched);
         } else {
             rollback(p0, T, m + 1);
             if (!seed_drafter(p0, m + 1, 0, err)) return false;
