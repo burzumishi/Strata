@@ -8204,7 +8204,8 @@ struct Model::Impl {
         Dev& d = devs[(size_t) d_dev];
         cudaSetDevice(d.id);
         const int nt = (int) g.d_targets.size(), D = g.dim, HD = g.hd;
-        if (dump_d != nullptr) {   // DS4_DSPARK_DUMP: 'S', the first position, the rows, then the taps
+        static const bool dump_light = std::getenv("DS4_DSPARK_DUMP_LIGHT") != nullptr;   // (2026-11-08: no taps, rings, hidden)
+        if (dump_d != nullptr && !dump_light) {   // DS4_DSPARK_DUMP: 'S', the first position, the rows, then the taps
             for (Dev& e : devs) {
                 cudaSetDevice(e.id);
                 CK(cudaStreamSynchronize(e.st));
@@ -8382,6 +8383,33 @@ struct Model::Impl {
             finish(e.ao, T, D, D, fn, e.st);
             if (!head_share(e, m, e.ao, T, err, !mk)) return false;
         }
+        // (2026-11-08, W6c data) DS4_DSPARK_BASE_TOPK=K with DS4_DSPARK_DUMP: before the markov bias, each row's K best base logits
+        // ('B' record: p0, y, T, K, then per row K ids, K values, the row's logsumexp) - to retrain the markov head on our trunk
+        static const int base_topk = std::getenv("DS4_DSPARK_BASE_TOPK") ? std::atoi(std::getenv("DS4_DSPARK_BASE_TOPK")) : 0;
+        if (dump_d != nullptr && base_topk > 0) {
+            CK(cudaStreamSynchronize(hd.st));
+            std::vector<float> rows((size_t) T * V);
+            CK(cudaMemcpy(rows.data(), hd.logits, rows.size() * 4, cudaMemcpyDeviceToHost));
+            const int K = std::min(base_topk, V);
+            const int64_t hdr[5] = {'B', p0, y, T, K};
+            std::fwrite(hdr, 8, 5, dump_d);
+            std::vector<int> ix(V);
+            for (int i = 0; i < T; ++i) {
+                const float* r = rows.data() + (size_t) i * V;
+                for (int v = 0; v < V; ++v) ix[(size_t) v] = v;
+                std::partial_sort(ix.begin(), ix.begin() + K, ix.end(), [&](int a, int b2) { return r[a] > r[b2]; });
+                double z = 0.0;
+                const float mx = r[ix[0]];
+                for (int v = 0; v < V; ++v) z += std::exp((double) (r[v] - mx));
+                const float lse = mx + (float) std::log(z);
+                std::vector<float> vals((size_t) K);
+                for (int k = 0; k < K; ++k) vals[(size_t) k] = r[ix[(size_t) k]];
+                std::fwrite(ix.data(), 4, (size_t) K, dump_d);
+                std::fwrite(vals.data(), 4, (size_t) K, dump_d);
+                std::fwrite(&lse, 4, 1, dump_d);
+            }
+            std::fflush(dump_d);
+        }
         h_idx[0] = y;
         if (mk) {
             // the markov steps over the group: each member its rows of the bias and its share's argmax, every member
@@ -8449,8 +8477,9 @@ struct Model::Impl {
             std::fwrite(hdr, 8, 4, dump_d);
             std::fwrite(tok + 1, 4, (size_t) T, dump_d);
             std::fwrite(cf, 4, (size_t) T, dump_d);
-            std::fwrite(xs.data(), 4, xs.size(), dump_d);
-            for (int i = 0; i < g.n_mtp; ++i) {
+            static const bool dump_light = std::getenv("DS4_DSPARK_DUMP_LIGHT") != nullptr;
+            if (!dump_light) std::fwrite(xs.data(), 4, xs.size(), dump_d);
+            for (int i = 0; i < (dump_light ? 0 : g.n_mtp); ++i) {
                 std::fwrite(h_dump_ring + (size_t) i * rs, 2, rs, dump_d);
                 std::fwrite(h_dump + (size_t) i * hs, 4, hs, dump_d);
             }
