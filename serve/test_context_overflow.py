@@ -83,7 +83,11 @@ class ContextOverflow(unittest.TestCase):
                             self.assertEqual(error["code"], "context_length_exceeded")
                             self.assertEqual(error["param"], "input")
                         else:
-                            self.assertEqual(set(error), {"type", "message"})
+                            # (chat completions also carries llama.cpp's n_prompt_tokens / n_ctx, which its web UI reads)
+                            extra = {"n_prompt_tokens", "n_ctx"} if path == "/v1/chat/completions" else set()
+                            self.assertEqual(set(error), {"type", "message"} | extra)
+                            if extra:
+                                self.assertEqual((error["n_prompt_tokens"], error["n_ctx"]), (prompt, CTX))
 
     def test_default_service_shortens_an_overshooting_budget_in_every_dialect(self):
         # the Service default (fit_max_tokens on): a prompt that fits is answered, streaming or not; the prompt that

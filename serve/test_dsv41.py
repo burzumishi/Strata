@@ -243,6 +243,22 @@ class Parser(unittest.TestCase):
         evs = self.run_parser(call(("lookup", [("id", "7", False)])), thinking=False)
         self.assertEqual([e.call.arguments for e in evs if e.kind == "tool_call"], [{"id": 7}])
 
+    def test_string_true_on_a_field_the_schema_types_otherwise(self):
+        # the model writes string="true" for every parameter (yesterday's web session: timeout="10", edits="[...]"): the
+        # schema decides when it types the field as a number, boolean, array or object; a string field stays the text
+        tools = [{"name": "t", "parameters": {"type": "object", "properties": {
+            "n": {"type": "integer"}, "f": {"type": "number"}, "b": {"type": "boolean"}, "edits": {"type": "array"},
+            "o": {"type": "object"}, "s": {"type": "string"}, "u": {}}}}]
+        raw = call(("t", [("n", "10", True), ("f", "1.5", True), ("b", "true", True), ("edits", '[{"a": 1}]', True),
+                          ("o", '{"k": "v"}', True), ("s", "007", True), ("u", "7", True)]))
+        p = DsmlOutputParser(thinking=False, tools=tools)
+        evs = p.feed(raw) + p.finish("stop")
+        self.assertEqual([e.call.arguments for e in evs if e.kind == "tool_call"],
+                         [{"n": 10, "f": 1.5, "b": True, "edits": [{"a": 1}], "o": {"k": "v"}, "s": "007", "u": "7"}])
+        # not a number: the text, as written
+        evs = DsmlOutputParser(thinking=False, tools=tools).feed(call(("t", [("n", "ten", True)])))
+        self.assertEqual([e.call.arguments for e in evs if e.kind == "tool_call"], [{"n": "ten"}])
+
     def test_a_non_string_value_is_json(self):
         evs = self.run_parser(call(("lookup", [("id", '{"a": [1, 2]}', False)])), thinking=False)
         self.assertEqual([e.call.arguments for e in evs if e.kind == "tool_call"], [{"id": {"a": [1, 2]}}])

@@ -65,6 +65,7 @@ from serve.frontend import (THINK_END, ChatTemplate, Event, OutputParser, anthro
                             tool_choice_of, unmark_think_literals, _text_of)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
 from serve import runconfig  # noqa: E402
+from serve import llama_tools  # noqa: E402
 from serve.webfiles import subtree_file as web_subtree_file  # noqa: E402
 from strata_control import engine_component  # noqa: E402
 from strata_control import tls  # noqa: E402
@@ -407,6 +408,15 @@ class MockEngine:
 
 class EngineDied(RuntimeError):
     """The engine process ended in the middle of a request (issue #27: on Linux, the out-of-memory killer)."""
+
+
+class ContextOverflow(ValueError):
+    """A prompt (plus max_tokens) that does not fit the context: a 400 as before, and llama.cpp's n_prompt_tokens / n_ctx
+    in the error, which its web UI reads to say how far over the limit the conversation is."""
+
+    def __init__(self, message: str, n_prompt_tokens: int, n_ctx: int):
+        super().__init__(message)
+        self.n_prompt_tokens, self.n_ctx = int(n_prompt_tokens), int(n_ctx)
 
 
 class EngineStarting(RuntimeError):
@@ -5323,18 +5333,18 @@ class Service:
                 # A prompt refused for the context is not kept (#567): the client cannot resend it unchanged.  The
                 # other refusals (engine starting, images) keep it: the same prompt comes back and its encode is reused.
                 self.forget_prompt(encoded_ids)
-                raise ValueError("request exceeds the context window: "
+                raise ContextOverflow("request exceeds the context window: "
                                  f"prompt ({len(ids)} tokens) leaves no room to answer in the context "
-                                 f"({ctx}); requests are never truncated")
+                                 f"({ctx}); requests are never truncated", len(ids), ctx)
             max_new = room
         elif max_new > room:
             if not self.fit_max_tokens:
                 self.forget_prompt(encoded_ids)
-                raise ValueError("request exceeds the context window: "
+                raise ContextOverflow("request exceeds the context window: "
                                  f"prompt ({len(ids)} tokens) + max tokens ({max_new}) exceeds the context "
                                  f"({ctx}); requests are never truncated. Send a smaller "
                                  f"max_tokens (at most {max(0, room)} here), or add \"fit_max_tokens\": true to the "
-                                 "model's strata-<model>.json to shorten it to the room left (#545)")
+                                 "model's strata-<model>.json to shorten it to the room left (#545)", len(ids), ctx)
             print(f"[strata] max_tokens {max_new} shortened to {max(1, room)}: the prompt ({len(ids)} tokens) leaves that much "
                   f"of the context ({ctx}); \"fit_max_tokens\": false answers 400 instead", flush=True)
             max_new = max(1, room)          # a shorter completion beats a 400 (the default)
@@ -7150,17 +7160,9 @@ def make_handler(svc: Service):
                 body = json.loads(self._body() or b"{}")
                 name = str(body.get("tool") or "")
                 params = body.get("params") if isinstance(body.get("params"), dict) else {}
-                # 2026-11-07: a model now and then wraps its arguments once more, {"parameters": "<json object>"}: unwrap it
-                # (it got "missing parameter: 'path'" and had to call again)
-                if set(params) == {"parameters"}:
-                    inner = params["parameters"]
-                    if isinstance(inner, str):
-                        try:
-                            inner = json.loads(inner)
-                        except ValueError:
-                            inner = None
-                    if isinstance(inner, dict):
-                        params = inner
+                # 2026-11-07: a model now and then wraps its arguments once more, {"parameters": "<json object>"} (or "arguments"):
+                # unwrap it (it got "missing parameter: 'path'" and had to call again)
+                params = llama_tools.unwrap_params(params)
             except (ValueError, TypeError):
                 self._json(400, {"error": {"type": "invalid_request_error", "message": "a JSON body {tool, params}"}})
                 return
@@ -7933,7 +7935,10 @@ def make_handler(svc: Service):
                 if path == "/v1/responses":
                     self._json(400, responses_error_body(str(e)))
                 else:
-                    self._json(400, {"error": {"type": "invalid_request_error", "message": str(e)}})
+                    err = {"type": "invalid_request_error", "message": str(e)}
+                    if isinstance(e, ContextOverflow) and path == "/v1/chat/completions":
+                        err.update(n_prompt_tokens=e.n_prompt_tokens, n_ctx=e.n_ctx)
+                    self._json(400, {"error": err})
             except ModelBusy as e:
                 self._json(409, {"error": {"type": "model_busy", "message": str(e)}})
             except QueueWaitExpired as e:

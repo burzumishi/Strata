@@ -248,6 +248,13 @@ class DsmlOutputParser(OutputParser):
             return
         params = dict(spec.get("parameters") or {})
         props = dict(params.get("properties") or {})
+        # (2026-11-08) string="true" on a field the schema types as a number, boolean, array or object (the model writes it
+        # for every parameter: timeout="10", edits="[...]"): the schema decides, so the tool gets an integer / an array,
+        # not the text of one.  Only a type that cannot be a string; a value that does not parse stays the text.
+        declared = (props.get(name) or {}).get("type")
+        kinds = declared if isinstance(declared, list) else [declared]
+        if declared and "string" not in kinds and all(k in ("integer", "number", "boolean", "array", "object", "null") for k in kinds):
+            return
         if (props.get(name) or {}).get("type") != "string":
             props[name] = {**(props.get(name) or {}), "type": "string"}
             params["properties"] = props

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import base64
 import fnmatch
+import json
 import os
 import re
 import subprocess
@@ -26,6 +27,23 @@ GREP_MAX = 100
 EXEC_MAX_OUTPUT = 16 * 1024
 EXEC_MAX_TIMEOUT = 60
 JUNK = {".git", "node_modules", "build", "dist", "__pycache__", ".venv", "venv", ".cache", "target", ".idea", ".vscode"}
+
+
+def unwrap_params(params: dict) -> dict:
+    """A model now and then wraps all its arguments once more, {"parameters": "<json object>"} or {"arguments": ...}
+    (a JSON text or an object): the object inside is the arguments.  Anything else is returned as it is."""
+    if isinstance(params, dict) and len(params) == 1:
+        key = next(iter(params))
+        if key in ("parameters", "arguments"):
+            inner = params[key]
+            if isinstance(inner, str):
+                try:
+                    inner = json.loads(inner)
+                except ValueError:
+                    return params
+            if isinstance(inner, dict):
+                return inner
+    return params
 
 
 def _fn(name, desc, props, required):
@@ -290,6 +308,7 @@ class LlamaTools:
             import time
             end = time.monotonic() + timeout
             os.set_blocking(proc.stdout.fileno(), False)
+            exited = False
             while True:
                 chunk = proc.stdout.read(4096) or b""
                 if chunk:
@@ -298,8 +317,10 @@ class LlamaTools:
                         out += chunk[:room]
                         if on_chunk:
                             on_chunk(chunk[:room].decode("utf-8", "replace"))
-                elif proc.poll() is not None:
+                elif exited:
                     break
+                elif proc.poll() is not None:
+                    exited = True       # one more read: it may have written its last bytes between the read and its exit
                 else:
                     time.sleep(0.02)
                 if time.monotonic() > end:
