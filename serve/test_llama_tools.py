@@ -33,3 +33,34 @@ class Exec(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# 2026-11-08: web_search / fetch_url, offline (no network in the tests)
+def test_parse_ddg_results_and_redirect():
+    from serve.llama_tools import parse_ddg
+    page = ('<div class="result results_links"><a rel="nofollow" class="result__a" '
+            'href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fa%3Fb%3D1&amp;rut=x">An <b>Example</b></a>'
+            '<a class="result__snippet" href="#">Some &amp; text</a></div>'
+            '<div class="result result--ad"><a class="result__a" href="//duckduckgo.com/y.js?ad=1">Ad</a></div>')
+    assert parse_ddg(page) == [{"title": "An Example", "url": "https://example.com/a?b=1", "snippet": "Some & text"}]
+
+
+def test_html_text_drops_scripts_and_keeps_blocks():
+    from serve.llama_tools import html_text
+    title, text = html_text("<html><head><title>T  1</title><style>x{}</style></head><body><nav>menu</nav>"
+                            "<p>Hello <b>world</b></p><script>bad()</script><ul><li>a</li><li>b</li></ul></body></html>")
+    assert title == "T 1"
+    assert "bad" not in text and "menu" not in text and "x{}" not in text
+    assert text.splitlines()[0] == "Hello world" and "- a" in text and "- b" in text
+
+
+def test_fetch_url_only_http():
+    from serve.llama_tools import LlamaTools
+    r = LlamaTools(["all"]).call("fetch_url", {"url": "file:///etc/passwd"})
+    assert "error" in r and "http" in r["error"]
+
+
+def test_web_tools_listed():
+    from serve.llama_tools import LlamaTools
+    names = [x["tool"] for x in LlamaTools(["all"]).listing()]
+    assert "web_search" in names and "fetch_url" in names

@@ -2,7 +2,7 @@
 answers, so the page's tools panel works against Strata. Off unless the server is started with --tools NAME,NAME|all
 (they read, write and run things on this machine for whoever reaches the port).
 
-read_file, file_glob_search, grep_search, exec_shell_command, write_file, edit_file, get_info."""
+read_file, file_glob_search, grep_search, exec_shell_command, write_file, edit_file, get_info; and ours: web_search, fetch_url."""
 from __future__ import annotations
 
 import base64
@@ -11,8 +11,17 @@ import json
 import os
 import re
 import subprocess
+import urllib.parse
+import urllib.request
+from html import unescape
+from html.parser import HTMLParser
 from pathlib import Path
 
+WEB_RESULTS, WEB_RESULTS_MAX = 8, 20
+FETCH_CHARS, FETCH_CHARS_MAX = 20000, 100000
+FETCH_BYTES_MAX = 4 * 1024 * 1024
+WEB_TIMEOUT_S = 20
+WEB_UA = "Mozilla/5.0 (X11; Linux x86_64) strata-web-tools/1.0"
 READ_FILE_MAX = 16 * 1024
 READ_FILE_MAX_BASE64 = 32 * 1024 * 1024   # (llama.cpp SERVER_TOOL_READ_FILE_MAX_SIZE_BASE64)
 
@@ -113,11 +122,97 @@ DEFS = {
                        "required": ["old_text", "new_text"]}}}, ["path", "edits"])),
     "get_info": ("Get Runtime Info", False, True, _fn(
         "get_info", "Returns runtime info: the OS name/version and the current working directory", {}, [])),
+    # 2026-11-08 (ds-wormhole, not llama.cpp's): the internet, with the standard library only (no key, no package)
+    "web_search": ("Web search", False, False, _fn(
+        "web_search", "Search the web (DuckDuckGo) and return the top results: title, URL and snippet. "
+                      "Use fetch_url to read a result.",
+        {"query": {"type": "string", "description": "What to search for"},
+         "max_results": {"type": "integer", "description": f"How many results (default {WEB_RESULTS}, max {WEB_RESULTS_MAX})"}},
+        ["query"])),
+    "fetch_url": ("Fetch URL", False, False, _fn(
+        "fetch_url", "Download a web page (http/https) and return its readable text (HTML reduced to text), "
+                     "or the body of a plain text / JSON resource.",
+        {"url": {"type": "string", "description": "The http(s) URL"},
+         "max_chars": {"type": "integer", "description": f"At most this many characters of text (default {FETCH_CHARS}, max {FETCH_CHARS_MAX})"}},
+        ["url"])),
 }
 # (2026-11-07) all of them, as llama.cpp's server marks them (server-tools.cpp): relative paths resolve against x-tool-cwd here too
 USES_CWD = {"file_glob_search": True, "grep_search": True, "exec_shell_command": True, "get_info": True,
-            "read_file": True, "write_file": True, "edit_file": True}
+            "read_file": True, "write_file": True, "edit_file": True, "web_search": False, "fetch_url": False}
 
+
+
+class _Text(HTMLParser):
+    """An HTML page's readable text: no script/style/head/nav/footer/svg, a line break at block elements"""
+    SKIP = {"script", "style", "head", "noscript", "svg", "nav", "footer", "template", "iframe"}
+    BLOCK = {"p", "div", "br", "li", "tr", "h1", "h2", "h3", "h4", "h5", "h6", "section", "article", "pre", "table", "ul", "ol", "blockquote"}
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.out, self.skip, self.title, self.in_title = [], 0, "", False
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "title":
+            self.in_title = True
+        if tag in self.SKIP:
+            self.skip += 1
+        elif tag in self.BLOCK:
+            self.out.append("\n")
+        if tag == "li" and not self.skip:
+            self.out.append("- ")
+
+    def handle_endtag(self, tag):
+        if tag == "title":
+            self.in_title = False
+        if tag in self.SKIP and self.skip:
+            self.skip -= 1
+        elif tag in self.BLOCK:
+            self.out.append("\n")
+
+    def handle_data(self, data):
+        if self.in_title:
+            self.title += data
+        elif not self.skip:
+            self.out.append(data)
+
+
+def html_text(page: str) -> tuple[str, str]:
+    """(title, text) of an HTML page, whitespace collapsed, at most one blank line in a row"""
+    t = _Text()
+    t.feed(page)
+    t.close()
+    lines = [re.sub(r"[ \t\r\f\v]+", " ", ln).strip() for ln in "".join(t.out).split("\n")]
+    text = re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
+    return re.sub(r"\s+", " ", t.title).strip(), text
+
+
+def _ddg_url(href: str) -> str:
+    """DuckDuckGo's redirect (//duckduckgo.com/l/?uddg=<url>) to the result's own URL"""
+    href = unescape(href)
+    if "uddg=" in href:
+        q = urllib.parse.parse_qs(urllib.parse.urlparse(href if "://" in href else "https:" + href).query)
+        if q.get("uddg"):
+            return q["uddg"][0]
+    return "https:" + href if href.startswith("//") else href
+
+
+def parse_ddg(page: str) -> list[dict]:
+    """html.duckduckgo.com's result list: [{title, url, snippet}], ads left out"""
+    out = []
+    for block in re.split(r'<div[^>]+class="[^"]*\bresult\b', page)[1:]:
+        if "result--ad" in block[:200]:
+            continue
+        a = re.search(r'<a[^>]+class="[^"]*result__a[^"]*"[^>]+href="([^"]+)"[^>]*>(.*?)</a>', block, re.S) or \
+            re.search(r'<a[^>]+href="([^"]+)"[^>]+class="[^"]*result__a[^"]*"[^>]*>(.*?)</a>', block, re.S)
+        if not a:
+            continue
+        sn = re.search(r'class="[^"]*result__snippet[^"]*"[^>]*>(.*?)</(?:a|div|td)>', block, re.S)
+        strip = lambda h: re.sub(r"\s+", " ", unescape(re.sub(r"<[^>]+>", "", h))).strip()
+        url = _ddg_url(a.group(1))
+        if "duckduckgo.com/y.js" in url:
+            continue
+        out.append({"title": strip(a.group(2)), "url": url, "snippet": strip(sn.group(1)) if sn else ""})
+    return out
 
 class LlamaTools:
     def __init__(self, enabled: list[str], cwd: str | None = None):
@@ -206,6 +301,54 @@ class LlamaTools:
             return {"error": f"missing parameter: {e}"}
         except Exception as e:   # (the UI shows the text)
             return {"error": f"{type(e).__name__}: {e}"}
+
+    # ---- the internet (2026-11-08)
+    @staticmethod
+    def _http(url: str, data: bytes | None = None) -> tuple[bytes, str, str]:
+        """(body up to FETCH_BYTES_MAX, content type, final URL); http(s) only"""
+        if not re.match(r"(?i)^https?://", url or ""):
+            raise ValueError(f"only http(s) URLs: {url!r}")
+        req = urllib.request.Request(url, data=data, headers={"User-Agent": WEB_UA, "Accept-Language": "en,es;q=0.8"})
+        with urllib.request.urlopen(req, timeout=WEB_TIMEOUT_S) as r:
+            body = r.read(FETCH_BYTES_MAX + 1)
+            return body[:FETCH_BYTES_MAX], r.headers.get("Content-Type") or "", r.geturl()
+
+    @staticmethod
+    def _decode(body: bytes, ctype: str) -> str:
+        m = re.search(r"charset=([\w-]+)", ctype or "", re.I) or re.search(rb"<meta[^>]+charset=[\"']?([\w-]+)", body[:4096], re.I)
+        enc = m.group(1) if m else "utf-8"
+        enc = enc.decode("ascii", "replace") if isinstance(enc, bytes) else enc
+        try:
+            return body.decode(enc, errors="replace")
+        except LookupError:
+            return body.decode("utf-8", errors="replace")
+
+    def t_web_search(self, p, cwd, _):
+        q = str(p["query"]).strip()
+        if not q:
+            return {"error": "empty query"}
+        n = max(1, min(WEB_RESULTS_MAX, int(p.get("max_results") or WEB_RESULTS)))
+        body, ctype, _u = self._http("https://html.duckduckgo.com/html/", urllib.parse.urlencode({"q": q}).encode())
+        results = parse_ddg(self._decode(body, ctype))[:n]
+        if not results:
+            return {"plain_text_response": f"no results for: {q}"}
+        text = "\n\n".join(f"{i}. {r['title']}\n{r['url']}\n{r['snippet']}" for i, r in enumerate(results, 1))
+        return {"plain_text_response": text, "results": results}
+
+    def t_fetch_url(self, p, cwd, _):
+        limit = max(500, min(FETCH_CHARS_MAX, int(p.get("max_chars") or FETCH_CHARS)))
+        body, ctype, final = self._http(str(p["url"]).strip())
+        low = ctype.lower()
+        if "html" in low or (not low and body.lstrip()[:1] == b"<"):
+            title, text = html_text(self._decode(body, ctype))
+        elif low.startswith("text/") or "json" in low or "xml" in low or not low:
+            title, text = "", self._decode(body, ctype)
+        else:
+            return {"error": f"not a text resource ({ctype or 'unknown type'}, {len(body)} bytes): {final}"}
+        cut = len(text) > limit
+        text = text[:limit] + ("\n[text truncated]" if cut else "")
+        head = (f"{title}\n" if title else "") + f"{final}\n\n"
+        return {"plain_text_response": head + text}
 
     def t_read_file(self, p, cwd, _):
         path = self._path(p["path"], cwd)
