@@ -1142,6 +1142,8 @@ struct Model::Impl {
     }
     struct TieStats { long long rounds = 0, rows = 0, tie_rounds = 0, ties[4] = {0, 0, 0, 0}, fixed = 0, changed = 0, tail[4] = {0, 0, 0, 0}; } tie_st;
     std::vector<float> tie_lg;
+    std::vector<float> last_draft_conf;   // the last draft block's confidences (draft -> verify)
+    long long draft_fires = 0;
     bool drafts_q = false;
     float dq_temp = 0.0f, dq_top_p = 1.0f, dq_min_p = 0.0f;
     int dq_top_k = 0;
@@ -8468,6 +8470,7 @@ struct Model::Impl {
         CK(cudaStreamSynchronize(hd.st));
         for (int i = 0; i <= T; ++i) tok[i] = h_idx[i];
         for (int i = 0; i < T; ++i) cf[i] = h_w[i];
+        last_draft_conf.assign(cf, cf + T);   // (2026-11-08: verify's DS4_DRAFT_RECHECK reads them)
         if (dump_d != nullptr) {   // 'D', the block's position, y, T, then the drafts, their confidences, the hidden
             std::vector<float> xs((size_t) T * D);   // rows before the final norm; then each block's ring and stream
             CK(cudaMemcpy(xs.data(), hd.x, xs.size() * 4, cudaMemcpyDeviceToHost));
@@ -8659,7 +8662,9 @@ struct Model::Impl {
         // the substitutes moved it (drawing again from the same row would decide nothing). Greedy: the exact argmax.
         const TieCfg& tc = tie_cfg();
         int r_tie = -1, c_tie = -1;
+        bool lg_fresh = false;   // (tie_lg holds this round's rows)
         if (tc.log_gap > 0.0f || tc.fix_gap > 0.0f) {
+            lg_fresh = true;
             const int rows = m + 1;
             tie_lg.resize((size_t) rows * V);
             CK(cudaMemcpyAsync(tie_lg.data(), hd.logits, tie_lg.size() * 4, cudaMemcpyDeviceToHost, hd.st));
@@ -8708,6 +8713,24 @@ struct Model::Impl {
                              100.0 * tie_st.ties[1] / tie_st.rows, 100.0 * tie_st.ties[2] / tie_st.rows, 100.0 * tie_st.ties[3] / tie_st.rows, tie_st.fixed,
                              tie_st.changed, 100.0 * tie_st.tail[0] / tie_st.rows, 100.0 * tie_st.tail[1] / tie_st.rows,
                              100.0 * tie_st.tail[2] / tie_st.rows, 100.0 * tie_st.tail[3] / tie_st.rows);
+        }
+        // 2026-11-08 (DS4_DRAFT_RECHECK=c): the drafter was sure (confidence >= c) of the draft the trunk turned down - two
+        // opinions that disagree, one of them sure: the trunk's substitutes may have tipped it ("RES" + "UESTA" for "RESPUESTA",
+        // confident, no tie).  That row is computed again with the exact routing and decided by the speculative rule, as a tie.
+        // A sure draft turned down is rare (~1-2 % of rounds at 0.9), so it costs little.
+        static const float draft_gate = std::getenv("DS4_DRAFT_RECHECK") ? std::strtof(std::getenv("DS4_DRAFT_RECHECK"), nullptr) : 0.0f;
+        if (r_tie < 0 && draft_gate > 0.0f && m < n && (size_t) m < last_draft_conf.size() && last_draft_conf[(size_t) m] >= draft_gate) {
+            if (!lg_fresh) {   // (the penalised rows, for q: not copied this round when the tie counter is off)
+                tie_lg.resize((size_t) (m + 1) * V);
+                CK(cudaMemcpyAsync(tie_lg.data(), hd.logits, tie_lg.size() * 4, cudaMemcpyDeviceToHost, hd.st));
+                CK(cudaStreamSynchronize(hd.st));
+            }
+            r_tie = m;
+            c_tie = next;
+            ++draft_fires;
+            if (draft_fires <= 3 || draft_fires % 50 == 0)
+                std::fprintf(stderr, "ds4 draft recheck: %lld rows (a sure draft, conf %.2f, turned down)\n", draft_fires,
+                             last_draft_conf[(size_t) m]);
         }
         if (r_tie >= 0) {
             // q: the penalised row's distribution (temperature only), its 64 most likely tokens
