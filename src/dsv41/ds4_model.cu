@@ -7877,7 +7877,10 @@ struct Model::Impl {
         const int j = l0.il + a, end = l0.mtp ? g.nl + g.n_mtp : g.nl;
         if (j >= end || j >= (int) L.size()) return nullptr;
         const Layer& n = L[(size_t) j];
-        if (n.dev != l0.dev || n.mtp != l0.mtp || n.lay.fmt != gg::kFmtMXFP4 || n.gate_w == nullptr || n.n_exp > 1024 ||
+        // (2026-11-08) DS4_AHEAD_ANYFMT=1: any expert format, not only MXFP4 (V4.1's trunk is IQ2: no guesses were ever made for it;
+        // the guess only needs the next layer's F32 gate, and with the SG store a right guess makes the expert GPU-readable)
+        static const bool anyfmt = std::getenv("DS4_AHEAD_ANYFMT") != nullptr && std::atoi(std::getenv("DS4_AHEAD_ANYFMT")) != 0;
+        if (n.dev != l0.dev || n.mtp != l0.mtp || (!anyfmt && n.lay.fmt != gg::kFmtMXFP4) || n.gate_w == nullptr || n.n_exp > 1024 ||
             (int) n.slot.size() < n.n_exp)
             return nullptr;
         for (int e = 0; e < n.n_exp; ++e)
