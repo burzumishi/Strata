@@ -29,7 +29,7 @@ These live in `serve/server.py` and `serve/streams.py`: they apply when the Pyth
   probability/threshold, Typical P, Samplers, Backend sampling, DRY multiplier/base/allowed length/
   penalty last N.
 - **Hides 2 router settings**: Discover Models and the Hugging Face Hub API (one model, nothing to
-  download).
+  download), and the image model from the model picker (it stays in `/v1/models` for its own endpoint).
 - **Keeps**: Temperature, Top K, Top P, Min P, Max tokens, Repeat last N, Repeat penalty,
   Presence/Frequency penalty, API Key, System Message, Tools, MCP, Agentic, Developer (custom JSON/CSS),
   Continue and reasoning.
@@ -62,6 +62,23 @@ Errors found and what they were:
 
 No product error surfaced: tools, MCP panel, reasoning, Continue, the sampling page and the adapted
 Settings all behaved.
+
+## Attachments (2026-11-09)
+
+- **Text: works end to end.** A 46-byte `secreto.txt` ("El código secreto del proyecto es PLATANO-42")
+  was attached from the UI; the request carried 2 text parts / 148 characters and the model answered
+  `PLATANO-42`. The UI shows the file chip with its size.
+- **Images: the backend is live; the UI path could not be automated here.** The engine runs with
+  `--vision on`; its log has **374 requests with 6–7 pictures each**, and `serve/test_vision_*` pass
+  (33 tests; the `test_images` failure came from the audit's P2 and was fixed by keeping the image model
+  in `/v1/models`, `7bd4af62`). The harness declared `modalities.vision: true` and the UI showed the
+  attachment input, but the preview pane cannot drive a real file chooser (a synthetic `change`, paste or
+  drop is ignored), and the Chrome MCP was locked by a profile in use. A real click on "Add files" in a
+  normal browser is the remaining check; nothing in the code path points to a failure.
+- **PDF / audio / video:** the UI accepts them; a PDF is turned into text or images in the browser before
+  it is sent, so the server sees text or picture parts. Not exercised here.
+- The image model stays in `/v1/models` for `/v1/images/generations` but is hidden from the model picker
+  by `deepseek-adapt.js` (it is not a chat model).
 
 ## Pending
 
