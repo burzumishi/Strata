@@ -68,13 +68,14 @@ Settings all behaved.
 - **Text: works end to end.** A 46-byte `secreto.txt` ("El código secreto del proyecto es PLATANO-42")
   was attached from the UI; the request carried 2 text parts / 148 characters and the model answered
   `PLATANO-42`. The UI shows the file chip with its size.
-- **Images: the backend is live; the UI path could not be automated here.** The engine runs with
-  `--vision on`; its log has **374 requests with 6–7 pictures each**, and `serve/test_vision_*` pass
-  (33 tests; the `test_images` failure came from the audit's P2 and was fixed by keeping the image model
-  in `/v1/models`, `7bd4af62`). The harness declared `modalities.vision: true` and the UI showed the
-  attachment input, but the preview pane cannot drive a real file chooser (a synthetic `change`, paste or
-  drop is ignored), and the Chrome MCP was locked by a profile in use. A real click on "Add files" in a
-  normal browser is the remaining check; nothing in the code path points to a failure.
+- **Images: works from the UI, pasted.** Writing the image to the clipboard and pressing Ctrl+V in the
+  composer makes the UI send it as a `data:image` part. An echo harness (no model, no :8080) decoded what
+  arrived in one request: a **PNG 3840×2160 of 10,998,688 bytes** plus **two PNG 360×140 of 5,061 bytes**.
+  The image reaches the server **complete** (format, size and bytes), not just counted. A synthetic
+  `change`/`paste`/`drop` is ignored, but a real paste works. The server→engine half is the same path
+  (`images_of` → `DsPictures` → `GENI`); the engine log has **374 picture requests** and
+  `serve/test_vision_*` pass (33 tests; the `test_images` failure came from the audit's P2 and was fixed
+  by keeping the image model in `/v1/models`, `7bd4af62`). The file chooser itself was not driven.
 - **PDF / audio / video:** the UI accepts them; a PDF is turned into text or images in the browser before
   it is sent, so the server sees text or picture parts. Not exercised here.
 - The image model stays in `/v1/models` for `/v1/images/generations` but is hidden from the model picker
