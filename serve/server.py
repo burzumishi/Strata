@@ -7762,8 +7762,9 @@ def make_handler(svc: Service):
                         model["aliases"] = list(svc.aliases)
                     data = [model, *({**model, "id": x, "alias_of": svc.model} for x in svc.aliases)]
                     data = data if loaded else []
-                    # (2026-11-09) the image model is not a chat model: listing it here put it in the web UI's picker,
-                    # where choosing it failed.  POST /v1/images/generations still works.
+                    if svc.images is not None:            # the image model: POST /v1/images/generations
+                        data.append({"id": svc.images.model, "object": "model", "status": {"value": "loaded"},
+                                     "architecture": {"input_modalities": ["text"], "output_modalities": ["image"]}})
                     self._json(200, {"object": "list", "data": data})
             elif path == "/props":
                 if self._authorized():

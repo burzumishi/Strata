@@ -30,6 +30,9 @@
     "Enable Discover Models", "Use the Hugging Face Hub API",
   ];
 
+  // The image model is in /v1/models for its own endpoint, not for chat: the picker must not offer it.
+  const IMAGE_MODELS = ["qwen-image"];
+
   const debug = (window.__deepseekAdapt = { dropped: [], hidden: 0 });
 
   // 1) Do not send what the engine does not implement (the server ignores it anyway).
@@ -70,6 +73,15 @@
       const field = fieldOf(label);
       if (!field) continue;
       if (field.style.display !== "none") field.style.display = "none";
+      hidden++;
+    }
+    // ... and the image model, wherever the model picker lists it (role=option, a button or a list row)
+    for (const el of document.querySelectorAll('[role="option"], button, li, a')) {
+      const text = (el.textContent || "").trim();
+      if (!text || text.length > 200) continue;
+      if (!IMAGE_MODELS.some((name) => text.toLowerCase().includes(name))) continue;
+      const option = el.closest('[role="option"]') || el;
+      if (option.style.display !== "none") option.style.display = "none";
       hidden++;
     }
     debug.hidden = hidden;
