@@ -6547,10 +6547,10 @@ def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel
             elif ev.kind == "tool_start":
                 streamed[ev.call.id] = calls - base["n"]
                 calls += 1
-                yield chunk({"tool_calls": [{"index": streamed[ev.call.id], "id": ev.call.id, "type": "function",
-                                             "function": {"name": ev.call.name, "arguments": ""}}]})
+                yield live_timings(chunk({"tool_calls": [{"index": streamed[ev.call.id], "id": ev.call.id, "type": "function",
+                                                          "function": {"name": ev.call.name, "arguments": ""}}]}))
             elif ev.kind == "tool_args":
-                yield chunk({"tool_calls": [{"index": streamed[ev.call.id], "function": {"arguments": ev.text}}]})
+                yield live_timings(chunk({"tool_calls": [{"index": streamed[ev.call.id], "function": {"arguments": ev.text}}]}))
             elif ev.kind == "tool_call" and ev.call.id in streamed:
                 finished.add(ev.call.id)
             elif ev.kind == "tool_call":
@@ -6572,6 +6572,9 @@ def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel
                 last["timings"] = x["timings"]          # llama.cpp's field: the speed its clients show
             if x.get("rejected_tool_calls"):
                 last["strata_rejected_tool_calls"] = x["rejected_tool_calls"]     # #3796: only when a call was refused as undeclared
+                # (2026-11-09) the web UI does not read that field: say it in the text too, before the last chunk
+                names = ", ".join(str(r.get("name") or "?") for r in x["rejected_tool_calls"])
+                yield chunk({"content": f"\n[note: {len(x['rejected_tool_calls'])} undeclared tool call(s) were not run: {names}]\n"})
             yield last
 
 
@@ -7108,7 +7111,8 @@ def make_handler(svc: Service):
             body = json.dumps(obj, ensure_ascii=False).encode()
             self.send_response(code)
             self.send_header("Content-Type", "application/json")
-            for k, v in (headers or {}).items():
+            # (2026-11-09) no API answer is cacheable: the web UI's service worker cached /props and /v1/models for 24 h
+            for k, v in {"Cache-Control": "no-store", **(headers or {})}.items():
                 self.send_header(k, str(v))
             if retry_after is not None:
                 self.send_header("Retry-After", str(retry_after))
@@ -7159,6 +7163,11 @@ def make_handler(svc: Service):
             try:
                 body = json.loads(self._body() or b"{}")
                 name = str(body.get("tool") or "")
+                if not name.strip():
+                    # (2026-11-09) the web UI did String(a.error) on an object and ran the model's call with {}; name the
+                    # empty call plainly, as a string, and let the client show it
+                    self._json(400, {"error": "no tool name"})
+                    return
                 params = body.get("params") if isinstance(body.get("params"), dict) else {}
                 # 2026-11-07: a model now and then wraps its arguments once more, {"parameters": "<json object>"} (or "arguments"):
                 # unwrap it (it got "missing parameter: 'path'" and had to call again)
@@ -7200,7 +7209,8 @@ def make_handler(svc: Service):
             hub = svc.mcp
             route = hub.routes().get(name) if hub else None
             if route is None:
-                self._json(404, {"error": {"type": "not_found_error", "message": f"no tool named {name!r}"}})
+                # (2026-11-09) a string: the web UI shows `a.error` as text (an object read as [object Object])
+                self._json(404, {"error": f"no tool named {name!r}"})
                 return
             server, tool = route
             try:
@@ -7276,6 +7286,13 @@ def make_handler(svc: Service):
                 start = max(0, int((q.get("from") or ["0"])[0]))
             except ValueError:
                 start = 0
+            if start > 0:
+                # (2026-11-09) the page reloads with the byte count it saw; that can fall inside an SSE event, and a
+                # replay from there drops the head of a tool_call.  Back up to the start of the event that holds it.
+                with session.cond:
+                    head = bytes(session.buf[:min(len(session.buf), start + 1)])
+                nl = head.rfind(b"\n\n")
+                start = nl + 2 if nl >= 0 else 0
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
@@ -7320,15 +7337,37 @@ def make_handler(svc: Service):
             rel = "index.html" if path == "" else path.lstrip("/")
             if ".." in rel.split("/") or "\\" in rel:
                 return False
+            if rel == "sw.js":
+                # (2026-11-09) the build's service worker caches /v1/*, /props and /models for 24 h (the UI then shows
+                # stale models and props).  This one unregisters itself: the page works, nothing is cached.
+                body = (b"self.addEventListener('install',e=>self.skipWaiting());"
+                        b"self.addEventListener('activate',e=>e.waitUntil(self.registration.unregister()));")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/javascript")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(body)
+                return True
             f = self._LLAMA_UI / rel
             if not f.is_file():
                 return False
             body = f.read_bytes()
+            encoding = None
+            if f.suffix in (".js", ".css", ".html", ".svg", ".json", ".txt") and \
+                    "gzip" in (self.headers.get("Accept-Encoding") or "").lower():
+                # (2026-11-09) the bundle is 9 MB: gzip it on the way out (it is cached by hash, so the cost is paid once)
+                import gzip
+                body = gzip.compress(body, 6)
+                encoding = "gzip"
             self.send_response(200)
             self.send_header("Content-Type", self._LLAMA_TYPES.get(f.suffix, "application/octet-stream"))
             self.send_header("Content-Length", str(len(body)))
             self.send_header("X-Content-Type-Options", "nosniff")
-            if rel == "index.html" or rel == "sw.js":
+            if encoding:
+                self.send_header("Content-Encoding", encoding)
+                self.send_header("Vary", "Accept-Encoding")
+            if rel == "index.html":
                 self.send_header("Cache-Control", "no-cache")
             if f.suffix == ".html":
                 # (2026-11-07) the old page's rule, kept for this one: no frame of it loads an address (its previews are
@@ -7359,6 +7398,11 @@ def make_handler(svc: Service):
                     self.send_header("Cache-Control", "no-cache")
                     self.end_headers()
                     try:
+                        # (2026-11-09) the router's first event: the UI waits for model_status to know the model is up
+                        status = {"event": "model_status", "model": svc.model,
+                                  "data": {"status": {"value": "loaded" if svc.loaded() else "unloaded"}}}
+                        self.wfile.write(b"data: " + json.dumps(status).encode() + b"\n\n")
+                        self.wfile.flush()
                         while True:
                             self.wfile.write(b": keep-alive\n\n")
                             self.wfile.flush()
@@ -7718,9 +7762,8 @@ def make_handler(svc: Service):
                         model["aliases"] = list(svc.aliases)
                     data = [model, *({**model, "id": x, "alias_of": svc.model} for x in svc.aliases)]
                     data = data if loaded else []
-                    if svc.images is not None:            # the image model: POST /v1/images/generations
-                        data.append({"id": svc.images.model, "object": "model", "status": {"value": "loaded"},
-                                     "architecture": {"input_modalities": ["text"], "output_modalities": ["image"]}})
+                    # (2026-11-09) the image model is not a chat model: listing it here put it in the web UI's picker,
+                    # where choosing it failed.  POST /v1/images/generations still works.
                     self._json(200, {"object": "list", "data": data})
             elif path == "/props":
                 if self._authorized():
@@ -7789,6 +7832,9 @@ def make_handler(svc: Service):
                     name = ""
                 ours = {svc.model, svc.model_for({})} if hasattr(svc, "model_for") else {svc.model}
                 if path == "/models/load" and (not name or name in ours):
+                    self._json(200, {"success": True})
+                elif path == "/models/unload":
+                    # (2026-11-09) the UI's Unload: one model, loaded at start, so it is a no-op that reports success
                     self._json(200, {"success": True})
                 else:
                     self._json(400, {"error": {"type": "invalid_request_error", "code": 400,
@@ -8033,6 +8079,7 @@ def make_handler(svc: Service):
                       if k in ("temperature", "top_p", "top_k", "min_p", "seed", "repetition_penalty",
                                "presence_penalty", "frequency_penalty", "penalty_last_n")}
             params["n_predict"] = svc.shared.get("max_tokens", -1)
+            params["max_tokens"] = params["n_predict"]   # (2026-11-09) the web UI syncs max_tokens, not n_predict
             props = {"default_generation_settings": {"n_ctx": svc.reported_ctx(), "params": params},
                      "total_slots": max(1, int(getattr(svc.engine, "batch", 0) or 0)),   # #1004: the batch slots
                      "model_alias": svc.model, "chat_template": svc.template.source,
@@ -8248,20 +8295,28 @@ def make_handler(svc: Service):
                     for _ in svc.engine.generate(ids, 0, {}, cancel, prefill_only=True):
                         pass
                 print(f"[strata] pre-fill: the next turn's start read ({len(ids)} tokens, {time.time() - t0:.1f} s)", flush=True)
+                return len(ids), (time.time() - t0) * 1000.0
             except Exception as e:
                 print(f"[strata] pre-fill skipped: {type(e).__name__}: {e}", flush=True)
+            return 0, 0.0
 
         def _openai(self, req):
             # 2026-11-07: llama.cpp's n_predict 0 (its web UI's "Pre-fill KV cache after response") means "read the prompt, write
             # nothing"; this server read no n_predict and took no limit as "the rest of the context": a full second answer after
             # every reply. Until the engine has a prompt-only read, it is answered empty at once.
             if req.get("n_predict") == 0 and not req.get("stream") and req.get("max_tokens") is None:
-                if svc.model_arch == "deepseek41" and hasattr(svc.engine, "generate"):
-                    self._prefill_warm(req)   # (the engine reads the next turn's start now; see _prefill_warm)
-                self._json(200, {"id": "chatcmpl-prefill", "object": "chat.completion", "created": int(time.time()),
-                                 "model": svc.model, "choices": [{"index": 0, "finish_reason": "length",
-                                                                  "message": {"role": "assistant", "content": ""}}],
-                                 "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}})
+                # (2026-11-09) report what the read did: the UI's context meter kept prompt_n=0 and cache_n=0
+                n_pre, ms_pre = ((self._prefill_warm(req) or (0, 0.0))
+                                 if (svc.model_arch == "deepseek41" and hasattr(svc.engine, "generate")) else (0, 0.0))
+                out = {"id": "chatcmpl-prefill", "object": "chat.completion", "created": int(time.time()),
+                       "model": svc.model, "choices": [{"index": 0, "finish_reason": "length",
+                                                        "message": {"role": "assistant", "content": ""}}],
+                       "usage": {"prompt_tokens": int(n_pre), "completion_tokens": 0, "total_tokens": int(n_pre)}}
+                if n_pre:
+                    out["timings"] = {"prompt_n": int(n_pre), "prompt_ms": round(float(ms_pre), 1),
+                                      "prompt_per_second": round(n_pre / (ms_pre / 1000.0), 1) if ms_pre else 0.0,
+                                      "cache_n": 0}
+                self._json(200, out)
                 return
             req = svc.with_shared(req, "openai")
             bias_api.normalize(req.get("logit_bias"), len(getattr(svc.tok, "tokens", ())) or None)
@@ -8275,7 +8330,9 @@ def make_handler(svc: Service):
             if validator is not None and (tools or req.get("strata_mcp")):
                 raise ValueError("structured response_format with tools/MCP is not supported")
             svc.load()
-            max_req = max_new = int(req.get("max_completion_tokens") or req.get("max_tokens") or 0)   # 0/-1: the rest
+            n_pred = req.get("n_predict")   # (2026-11-09) llama.cpp's n_predict > 0 is its max_tokens
+            max_req = max_new = int(req.get("max_completion_tokens") or req.get("max_tokens")
+                                    or (n_pred if isinstance(n_pred, int) and n_pred > 0 else 0))   # 0/-1: the rest
             # No cap of our own on the reply's length when logprobs are asked for: the reply is already bounded by
             # max_tokens (by the rest of the context when it is not sent), which is the only bound OpenAI and vLLM
             # put on it either.  A reply that is not streamed does hold every entry (its token, bytes and up to 20
@@ -8343,6 +8400,17 @@ def make_handler(svc: Service):
                 return
             self._openai_stream_body(chunks, cancel)
 
+        def _sse_fail(self, err, text):
+            """(2026-11-09) an error mid-stream: the web UI only reads choices, so it goes in a content chunk too."""
+            note = {"id": "chatcmpl-error", "object": "chat.completion.chunk", "created": int(time.time()), "model": svc.model,
+                    "choices": [{"index": 0, "delta": {"content": f"\n[error: {text}]\n"}, "finish_reason": "error"}]}
+            try:
+                self.wfile.write(b"data: " + json.dumps(note, ensure_ascii=False).encode() + b"\n\n")
+                self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
+                self.wfile.flush()
+            except OSError:
+                pass
+
         def _openai_stream_body(self, chunks, cancel):
             try:
                 for c in chunks:
@@ -8359,19 +8427,19 @@ def make_handler(svc: Service):
             except EngineDied as e:                          # mid-stream: say so, then end the stream properly
                 err = {"error": {"type": "server_error", "message": f"{e}; the next request restarts it"}}
                 self._note(error=err["error"])
-                self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
+                self._sse_fail(err, str(e))
             except QueueWaitExpired as e:
                 err = {"error": {"type": "rate_limit_error", "code": "queue_wait_timeout", "message": str(e)}}
                 self._note(error=err["error"])
-                self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
+                self._sse_fail(err, str(e))
             except StructuredOutputError as e:
                 err = {"error": {"type": "structured_output_failed", "code": "structured_output_failed", "message": str(e)}}
                 self._note(error=err["error"])
-                self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
+                self._sse_fail(err, str(e))
             except ValueError as e:                          # the engine's ERR after the stream started: the
                 err = {"error": {"type": "server_error", "message": str(e)}}   # headers are sent, so no 400 now
                 self._note(error=err["error"])
-                self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
+                self._sse_fail(err, str(e))
 
         def _responses_ready(self, req, events):
             """Send a finished Responses result that did not run on the engine."""

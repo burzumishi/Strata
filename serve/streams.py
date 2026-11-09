@@ -6,7 +6,8 @@ from __future__ import annotations
 import threading
 import time
 
-TTL_S = 300                    # a finished stream is kept this long (llama.cpp's STREAM_SESSION_TTL_SECONDS)
+TTL_S = 3600                   # a finished stream is kept this long (llama.cpp's STREAM_SESSION_TTL_SECONDS: 300; a
+                               # reload after a pause in a long agent turn lost the replay, 2026-11-09)
 MAX_BYTES = 16 * 1024 * 1024   # a stream's bytes kept at most (llama.cpp keeps 4 MB in a ring; this keeps them whole)
 
 
