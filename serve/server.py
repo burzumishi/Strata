@@ -5691,7 +5691,8 @@ class Service:
             sampling = {**(sampling or {}), "strata_img_keys": img_keys}   # #2228: sent beside the embeddings file
         # 2026-11-10 (ds-wormhole): the declared tool names, for the engine's name trie (DS4_TOOL_TRIE; an engine without
         # it ignores the key) - the same list the parser accepts, the conversation's own earlier calls included
-        names = tool_names(with_history_tools(tools, sampling))
+        # A request with a deferred tool (Anthropic tool search, #4663) may call names it never declared, so no trie then.
+        names = [] if deferred else tool_names(with_history_tools(tools, sampling))
         if names:
             sampling = {**(sampling or {}), "strata_tool_names": names}
         # Only a DONE line replaces engine.last, so a request that died, errored or was disconnected must not have
