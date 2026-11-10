@@ -15,7 +15,7 @@ gana siempre. El motor no cambia el muestreo por su cuenta.
 | `temperature` | **1,0** | se aplica en cada token y en la verificación especulativa | recomendación oficial (ficha de DeepSeek, comprobada el 07-11) |
 | `top_p` | **1,0** | igual | oficial |
 | `top_k` | no mandar, o 64 | el motor guarda como mucho 64 candidatos: 0 o más de 64 = 64 | |
-| `min_p` | **0,02** (vibecode hoy); **0,05-0,1** si se quieren menos erratas sueltas | corta lo que esté por debajo de `min_p`·p(primero) | ver abajo |
+| `min_p` | **0,066** (vibecode desde el 10-11; antes 0,02); 0,05-0,1 es el rango razonable | corta lo que esté por debajo de `min_p`·p(primero) | ver abajo |
 | `repetition_penalty`, `frequency_penalty`, `presence_penalty` | **no mandar** (1,0 / 0 / 0) | desde el 07-11 se aplican de verdad (antes el motor las ignoraba) | oficial: sin penalizaciones |
 | `seed` | opcional | repite el sorteo con la misma semilla | con la penalización de fallos el texto no es repetible entre ejecuciones |
 | `max_tokens` | amplio | **cuenta el pensamiento**: con poco margen se corta pensando | contexto de 1M; el servidor avisa con 400 si no cabe |
@@ -62,7 +62,7 @@ sobre todo pensar.
 
 | Cliente | Dónde se configura | Hoy |
 |---|---|---|
-| vibecode | sus ajustes (`minP`, `topK`…: `packages/core/src/providers/openai-compat.ts:783`) | `temperature` 1,0, `min_p` 0,02, razonamiento reenviado |
+| vibecode | sus ajustes (`minP`, `topK`…: `packages/core/src/providers/openai-compat.ts:783`) | `temperature` 1,0, `min_p` **0,066** (10-11; antes 0,02), razonamiento reenviado |
 | web ds-wormhole (UI de llama.cpp) | el panel de ajustes del navegador | `deepseek-adapt.js` oculta lo que el motor no tiene (XTC, DRY, `typ_p`, dynatemp) y lo quita del cuerpo |
 | Claude Code | `~/claude-deepseek.sh` | esfuerzo high, `API_TIMEOUT_MS=3600000`; usar «accept edits» (el modo auto manda su clasificador al servidor) |
 
