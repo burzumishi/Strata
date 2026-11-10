@@ -30,6 +30,7 @@
 #include "ds4_os.hpp"
 #include "ds4_packinfo.hpp"
 #include "ds4_slotmeta.hpp"
+#include "ds4_toolname.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -415,6 +416,7 @@ struct Req {
     int pen_n = 64;
     bool prefill_only = false;   // 2026-11-07: prefill=1 - read the prompt, keep its state, make no token (a cache warm-up)
     std::string file;   // GENI: the pictures
+    std::vector<std::string> tool_names;   // 2026-11-10: tool_names=<hex of the names joined by \n> (DS4_TOOL_TRIE)
     std::vector<int> ids;
 };
 
@@ -516,6 +518,7 @@ bool parse_gen(const std::string& line, Req& r, bool geni) {
         else if (k == "penalty_present") r.pen_pres = std::strtof(v.c_str(), nullptr);
         else if (k == "penalty_last_n") r.pen_n = std::max(0, std::atoi(v.c_str()));
         else if (k == "prefill") r.prefill_only = std::atoi(v.c_str()) != 0;
+        else if (k == "tool_names") strata::ds4::toolname::parse_hex(v, r.tool_names);   // (not hex: none)
     }
     return !r.ids.empty() && (!geni || !r.file.empty());
 }
@@ -1110,6 +1113,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         std::vector<int> pen_hist;
         if (pen_on) pen_hist.assign(r.ids.size() > (size_t) r.pen_n ? r.ids.end() - r.pen_n : r.ids.begin(), r.ids.end());
         m.set_penalties(r.pen_rep, r.pen_freq, r.pen_pres, pen_on ? r.pen_n : 0, pen_hist);
+        m.set_tool_names(r.tool_names, r.ids);   // (every request: one without names leaves none from the last)
         int tok = m.sample(r.temperature, r.top_p, r.top_k, r.min_p, r.seed, counter++);
         std::vector<int> got;
         g_suf.reset(r.ids);
@@ -1152,6 +1156,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 break;
             }
             std::printf("T %d\n", tok);
+            m.tool_name_push(tok);
             g_suf.push(tok);
             if (pen_on) pen_hist.push_back(tok);
             ++produced;

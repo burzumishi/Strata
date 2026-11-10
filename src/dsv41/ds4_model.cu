@@ -16,6 +16,7 @@
 #include "ds4_model.hpp"
 #include "ds4_pick_rule.hpp"
 #include "ds4_experts_rule.hpp"
+#include "ds4_toolname.hpp"
 #include "ds4_engram_io.hpp"
 
 #include "ds4_gguf.cuh"
@@ -8601,8 +8602,97 @@ struct Model::Impl {
         const size_t s0 = hist.size() > (size_t) n ? hist.size() - (size_t) n : 0;
         pen_hist.assign(hist.begin() + (long) s0, hist.end());
     }
-    // the penalties on `rows` rows of logits (row r's window: pen_hist + extra[0 .. r), its last pen_n tokens)
+    // 2026-11-10 (DS4_TOOL_TRIE=1, ds4_toolname.hpp): a call's name kept to the request's declared tools.  trie_base:
+    // where the output is after the tokens emitted so far (as pen_hist: up to and including the round's first token);
+    // a row r of a window adds the drafts before it.  Needs the token texts (DS4_TIE_VOCAB); off without them.
+    bool trie_on = false;
+    strata::ds4::toolname::Trie trie;
+    strata::ds4::toolname::Scan trie_base;
+    std::vector<int> h_keep;
+    int* d_keep = nullptr;
+    float* d_keep_tmp = nullptr;
+    size_t d_keep_cap = 0;
+    long long trie_rows = 0, trie_reqs = 0;
+    static bool trie_wanted() {
+        static const bool on = std::getenv("DS4_TOOL_TRIE") != nullptr && std::atoi(std::getenv("DS4_TOOL_TRIE")) != 0;
+        return on;
+    }
+    static const std::string& tok_text(int t) {
+        static const std::string none;
+        const std::vector<std::string>& txt = tie_cfg().txt;
+        return t >= 0 && (size_t) t < txt.size() ? txt[(size_t) t] : none;
+    }
+    void set_tool_names(const std::vector<std::string>& names, const std::vector<int>& prompt) {
+        if (trie_rows > 0)
+            std::fprintf(stderr, "ds4 tool names: the last request kept %lld row(s) to its %zu declared name(s)\n", trie_rows,
+                         trie.names().size());
+        trie_rows = 0;
+        trie_base = {};
+        trie_on = false;
+        if (!trie_wanted() || names.empty()) return;
+        if (tie_cfg().txt.empty()) {
+            static bool told = false;
+            if (!told) std::fprintf(stderr, "ds4 tool names: DS4_TOOL_TRIE needs DS4_TIE_VOCAB (the token texts): off\n");
+            told = true;
+            return;
+        }
+        trie.set(names);
+        trie_on = !trie.names().empty();
+        if (trie_on && trie_reqs++ == 0)
+            std::fprintf(stderr, "ds4 tool names: DS4_TOOL_TRIE on (%zu names in the first request)\n", trie.names().size());
+        // the prompt's tail: a forced call's opening (`... invoke name="`) puts the output inside a name from token 0
+        for (size_t i = prompt.size() > 64 ? prompt.size() - 64 : 0; i < prompt.size(); ++i)
+            strata::ds4::toolname::feed(trie_base, tok_text(prompt[i]));
+    }
+    void tool_name_push(int tok) {
+        if (trie_on) strata::ds4::toolname::feed(trie_base, tok_text(tok));
+    }
+    // rows of logits inside a name: only the declared names' continuations stay (row r: trie_base + extra[0 .. row0 + r))
+    void trie_rows_keep(Dev& d, float* logits, int rows, const int* extra, int row0) {
+        if (!trie_on || rows <= 0) return;
+        trie.trim();   // (before any reference into its cache is taken)
+        strata::ds4::toolname::Scan st = trie_base;
+        for (int i = 0; i < row0; ++i) strata::ds4::toolname::feed(st, tok_text(extra[i]));
+        std::vector<std::pair<int, const std::vector<int>*>> todo;
+        for (int r = 0; r < rows; ++r) {
+            if (r > 0) strata::ds4::toolname::feed(st, tok_text(extra[row0 + r - 1]));
+            if (!st.in) continue;
+            const std::vector<int>& keep = trie.allowed(tie_cfg().txt, st.pre, st.close);
+            if (!keep.empty()) todo.emplace_back(r, &keep);
+        }
+        if (todo.empty()) return;
+        h_keep.clear();
+        for (const auto& t : todo) h_keep.insert(h_keep.end(), t.second->begin(), t.second->end());
+        cudaSetDevice(d.id);
+        if (h_keep.size() > d_keep_cap) {
+            cudaStreamSynchronize(d.st);
+            if (d_keep != nullptr) cudaFree(d_keep);
+            if (d_keep_tmp != nullptr) cudaFree(d_keep_tmp);
+            d_keep_cap = std::max<size_t>(h_keep.size(), 4096);
+            if (cudaMalloc((void**) &d_keep, d_keep_cap * 4) != cudaSuccess ||
+                cudaMalloc((void**) &d_keep_tmp, d_keep_cap * 4) != cudaSuccess) {
+                cudaGetLastError();
+                if (d_keep != nullptr) cudaFree(d_keep);
+                d_keep = nullptr;
+                d_keep_tmp = nullptr;
+                d_keep_cap = 0;
+                return;
+            }
+        }
+        if (cudaMemcpyAsync(d_keep, h_keep.data(), h_keep.size() * 4, cudaMemcpyHostToDevice, d.st) != cudaSuccess) return;
+        size_t off = 0;
+        for (const auto& t : todo) {
+            const int n = (int) t.second->size();
+            keep_only(logits + (size_t) t.first * g.vocab, g.vocab, d_keep + off, n, d_keep_tmp + off, d.st);
+            off += (size_t) n;
+        }
+        cudaStreamSynchronize(d.st);   // (h_keep is written again by the next call)
+        trie_rows += (long long) todo.size();
+    }
+    // the penalties on `rows` rows of logits (row r's window: pen_hist + extra[0 .. r), its last pen_n tokens); first the
+    // tool-name trie's rows (2026-11-10)
     void penalize_rows(Dev& d, float* logits, int rows, const int* extra, int row0 = 0) {
+        trie_rows_keep(d, logits, rows, extra, row0);
         if (!pen_active || rows <= 0) return;
         std::vector<int> off((size_t) rows + 1, 0), tok, cnt;
         std::unordered_map<int, int> c;
@@ -11738,6 +11828,10 @@ std::vector<int64_t> Model::check_positions() const { return p_->check_positions
 int64_t Model::restorable(int64_t limit) const { return p_->restorable(limit); }
 uint64_t Model::slot_save(std::vector<uint8_t>& out, std::string& err) { return p_->slot_save(out, err); }
 void Model::set_penalties(float rp, float fp, float pp, int n, const std::vector<int>& hist) { p_->set_penalties(rp, fp, pp, n, hist); }
+void Model::set_tool_names(const std::vector<std::string>& names, const std::vector<int>& prompt) {
+    p_->set_tool_names(names, prompt);
+}
+void Model::tool_name_push(int tok) { p_->tool_name_push(tok); }
 bool Model::slot_load(const uint8_t* data, size_t bytes, int64_t n_pos, std::string& err) {
     return p_->slot_load(data, bytes, n_pos, err);
 }

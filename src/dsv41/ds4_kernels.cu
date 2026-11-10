@@ -2344,6 +2344,30 @@ void penalize(float* logits, int V, int rows, const int* tok, const int* cnt, co
     strata_ds4_launch(penalize_kernel, rows, 128, 0, s, logits, V, tok, cnt, off, rp, fp, pp);
 }
 
+namespace {
+// 2026-11-10 (DS4_TOOL_TRIE): one row of logits down to the ids in keep[0 .. n): those keep their logits (saved to tmp
+// first), every other id goes to -1e30 (not -inf: a row's max minus itself stays 0 in every sampler)
+__global__ void keep_save_kernel(const float* row, const int* keep, int n, int V, float* tmp) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) tmp[i] = keep[i] >= 0 && keep[i] < V ? row[keep[i]] : -1e30f;
+}
+__global__ void keep_fill_kernel(float* row, int V) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < V) row[i] = -1e30f;
+}
+__global__ void keep_back_kernel(float* row, const int* keep, int n, int V, const float* tmp) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n && keep[i] >= 0 && keep[i] < V) row[keep[i]] = tmp[i];
+}
+}  // namespace
+
+void keep_only(float* row, int V, const int* keep, int n, float* tmp, cudaStream_t s) {
+    if (n <= 0 || V <= 0) return;
+    strata_ds4_launch(keep_save_kernel, (n + 255) / 256, 256, 0, s, row, keep, n, V, tmp);
+    strata_ds4_launch(keep_fill_kernel, (V + 255) / 256, 256, 0, s, row, V);
+    strata_ds4_launch(keep_back_kernel, (n + 255) / 256, 256, 0, s, row, keep, n, V, tmp);
+}
+
 void route_publish(const float* logits, const float* bias, int n, int k, int T, float route_scale,
                    const unsigned long long* vram, const float* x, int dim, int* idx, float* w,
                    unsigned long long* plan_ptr, Req* req, unsigned seq, cudaStream_t s, const float* bias_vl,

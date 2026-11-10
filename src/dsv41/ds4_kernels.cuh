@@ -249,6 +249,8 @@ void set_penalty_scale(float s);
 // 2026-11-07: repetition / frequency / presence penalties on `rows` rows of logits (llama.cpp's semantics), pairs by row
 void penalize(float* logits, int V, int rows, const int* tok, const int* cnt, const int* off, float rp, float fp, float pp,
               cudaStream_t s);
+// 2026-11-10 (DS4_TOOL_TRIE): one row of logits down to the ids keep[0 .. n) (the rest -1e30); tmp holds n floats
+void keep_only(float* row, int V, const int* keep, int n, float* tmp, cudaStream_t s);
 void route_publish(const float* logits, const float* bias, int n, int k, int T, float route_scale,
                    const unsigned long long* vram, const float* x, int dim, int* idx, float* w,
                    unsigned long long* plan_ptr, Req* req, unsigned seq, cudaStream_t s, const float* bias_vl = nullptr,

@@ -183,6 +183,13 @@ public:
     /// 2026-11-07: the request's repetition / frequency / presence penalties (llama.cpp's) over the last n tokens of `hist`
     /// (which ends with the round's first token); n = 0 or neutral values turn them off
     void set_penalties(float rp, float fp, float pp, int n, const std::vector<int>& hist);
+    /// 2026-11-10 (DS4_TOOL_TRIE=1, needs DS4_TIE_VOCAB's token texts): the request's declared tool names. While the
+    /// output is inside a call's name (after `invoke name="`, `invoke name='` or `<function=`), every row of logits keeps
+    /// only the tokens that go on with one of them or close it; nothing else changes.  `prompt`'s tail seeds where the
+    /// output starts (a forced call's opening).  Empty names: off for this request.
+    void set_tool_names(const std::vector<std::string>& names, const std::vector<int>& prompt);
+    /// a token the request emitted (the trie's state follows the output)
+    void tool_name_push(int tok);
     bool slot_load(const uint8_t* data, size_t bytes, int64_t n_pos, std::string& err);
     /// What a saved conversation must match: this engine's version, this model's geometry and files and the drafter's
     /// blocks - a slot naming anything else is not this model's state (a file's .meta says so; slot_load refuses).

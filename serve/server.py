@@ -1510,6 +1510,10 @@ class StrataEngine:
         if isinstance(ik, list) and ik and all(isinstance(k, str) and k and all(c in "0123456789abcdef" for c in k)
                                                for k in ik):
             keys += " img_keys=" + ",".join(ik)
+        # 2026-11-10: the declared tool names (DS4_TOOL_TRIE), joined by \n and sent as hex: no spaces on the GEN line
+        tn = sampling.get("strata_tool_names")
+        if isinstance(tn, list) and tn and all(isinstance(n, str) and n and "\n" not in n for n in tn):
+            keys += " tool_names=" + "\n".join(tn).encode("utf-8").hex()
         # "strata_prefix" (resolved by Service.resolve_prefix to {"tokens": N}): the first N prompt tokens are a shared
         # prefix - the engine pins the checkpoint there.  Absent or unresolved = as before.
         prefix = sampling.get("strata_prefix")
@@ -2371,7 +2375,11 @@ class StrataEngine:
         # an image request takes the same sampling keys as text (#75: it used to decode greedily whatever was asked)
         head = f"GENI {int(max_new)}{self.sampling_keys(sampling or {})} {embeddings}" if embeddings else \
             f"GEN {int(max_new)}{self.sampling_keys(sampling or {})}"
-        print(f"[strata] sampling:{self.sampling_keys(sampling or {}) or ' (engine defaults)'}", flush=True)   # (2026-11-07)
+        nl = b"\n"
+        shown = re.sub(r" tool_names=([0-9a-f]+)",
+                       lambda mt: " tool_names=<%d names>" % (bytes.fromhex(mt.group(1)).count(nl) + 1),
+                       self.sampling_keys(sampling or {}))   # (2026-11-10: the names' hex is long; the log counts them)
+        print(f"[strata] sampling:{shown or ' (engine defaults)'}", flush=True)   # (2026-11-07)
         if prefill_only:                                 # split serving (serve/split.py): read the prompt, make no token
             if embeddings or int(max_new) != 0:
                 raise ValueError("prefill_only is a text prompt and max_new 0")
@@ -5601,6 +5609,11 @@ class Service:
         img_keys, self.embeddings.keys = getattr(self.embeddings, "keys", None), None
         if emb and img_keys:
             sampling = {**(sampling or {}), "strata_img_keys": img_keys}   # #2228: sent beside the embeddings file
+        # 2026-11-10 (ds-wormhole): the declared tool names, for the engine's name trie (DS4_TOOL_TRIE; an engine without
+        # it ignores the key) - the same list the parser accepts, the conversation's own earlier calls included
+        names = tool_names(with_history_tools(tools, sampling))
+        if names:
+            sampling = {**(sampling or {}), "strata_tool_names": names}
         # Only a DONE line replaces engine.last, so a request that died, errored or was disconnected must not have
         # the PREVIOUS request's decode figures recorded as its own: each pass keeps its own DONE (a segment) if
         # one arrived.  A reasoning-budget continuation is another native generation, not another API request,
@@ -9430,6 +9443,22 @@ def with_component_engine(cfg: dict) -> dict:
     if cfg.get("backend") == "hip":     # AMD: the package's own hipBLASLt tuning table for this card, when its hipBLASLt version matches
         cfg = hipblaslt_tuning.apply(cfg, Path(cfg["exe"]).parent, say=lambda line: print(line, flush=True))
     return cfg
+
+
+def tool_names(tools) -> list:
+    """2026-11-10 (ds-wormhole): the names of a request's tools (normalised dicts with "name", or OpenAI's {"function": {"name"}}),
+    in order, once each - what the engine's trie keeps a call's name to (DS4_TOOL_TRIE)."""
+    out, seen = [], set()
+    for t in tools or []:
+        if not isinstance(t, dict):
+            continue
+        name = t.get("name")
+        if not isinstance(name, str):
+            name = (t.get("function") or {}).get("name") if isinstance(t.get("function"), dict) else None
+        if isinstance(name, str) and name and "\n" not in name and name not in seen:
+            seen.add(name)
+            out.append(name)
+    return out
 
 
 def with_history_tools(tools, req) -> list:
