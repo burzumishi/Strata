@@ -12,9 +12,9 @@ gana siempre. El motor no cambia el muestreo por su cuenta.
 
 | Parámetro | Recomendado | Qué hace aquí | Notas |
 |---|---|---|---|
-| `temperature` | **1,0** | se aplica en cada token y en la verificación especulativa | recomendación oficial (ficha de DeepSeek, comprobada el 07-11) |
-| `top_p` | **1,0** | igual | oficial |
-| `top_k` | no mandar, o 64 | el motor guarda como mucho 64 candidatos: 0 o más de 64 = 64 | |
+| `temperature` | **1,0** | se aplica en cada token y en la verificación especulativa | oficial; el `deepseek-recipe` la **fija a 1,0** en modo pensamiento (`validation.rs:108-119`) |
+| `top_p` | **1,0** (razonamiento); **0,95** para agentes | igual | informe técnico de V4.1: razonamiento con top_p 1,0; agentes de código (DeepSeek Harness, 1M) y visuales (harness de Claude Code) con temperatura 1,0 y **top_p 0,95** (`report.txt:1685-1702`) |
+| `top_k` | no mandar | sin `top_k` el motor usa **64** (`ds4_main.cpp:406`), y es también su máximo: 0 o más de 64 = 64 | **DeepSeek no define `top_k`** (ni el `deepseek-recipe`, ni `inference/generate.py`, ni el informe): oficialmente se muestrea sobre todo el vocabulario. Con `min_p` ≥ 0,05 el tope de 64 no se nota |
 | `min_p` | **0,066** (vibecode desde el 10-11; antes 0,02); 0,05-0,1 es el rango razonable | corta lo que esté por debajo de `min_p`·p(primero) | ver abajo |
 | `repetition_penalty`, `frequency_penalty`, `presence_penalty` | **no mandar** (1,0 / 0 / 0) | desde el 07-11 se aplican de verdad (antes el motor las ignoraba) | oficial: sin penalizaciones |
 | `seed` | opcional | repite el sorteo con la misma semilla | con la penalización de fallos el texto no es repetible entre ejecuciones |
