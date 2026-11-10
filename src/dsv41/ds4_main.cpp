@@ -552,12 +552,14 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
     // shorter one is read again in about the time its slot would take).  Pictures (2026-11-10; before, text only): a slot
     // keeps the pictures its state holds (start, the pixels' hash, the span), its .meta lists them, and a prompt takes it
     // back only as far as its pictures agree - the same picture at the same place (the image tokens alone cannot tell);
-    // the pictures it brings back are held again, so their spans are not encoded again either.
+    // the pictures it brings back are held again, so their spans are not encoded again either.  STRATA_DS4_SLOT_PICS=1
+    // turns that on (off: text only, as before).
     const auto env_num = [](const char* k, double d) { const char* v = std::getenv(k); return v ? std::atof(v) : d; };
     const bool slot_keep =
         std::getenv("STRATA_DS4_SLOT_KEEP") != nullptr && std::atoi(std::getenv("STRATA_DS4_SLOT_KEEP")) != 0;
     const bool reuse = std::getenv("STRATA_DS4_REUSE") == nullptr || std::atoi(std::getenv("STRATA_DS4_REUSE")) != 0;
     int slot_max = slot_keep ? std::max(0, (int) env_num("STRATA_DS4_SLOT_CAP", 4)) : 0;
+    const bool slot_pics = env_num("STRATA_DS4_SLOT_PICS", 0) != 0;   // (2026-11-10: conversations with pictures too)
     const size_t slot_min = (size_t) std::max(1.0, env_num("STRATA_DS4_SLOT_MIN", 1024));
     const double slot_days = env_num("STRATA_DS4_SLOT_DAYS", 7);
     const uint64_t slot_budget = (uint64_t) (env_num("STRATA_DS4_SLOT_GB", 16) * 1073741824.0);
@@ -696,6 +698,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         if (slot_max <= 0) return;
         const std::vector<int32_t>& t = m.tokens();
         if (t.size() < slot_min) return;   // (a fresh engine's 0-token state is no conversation: nothing to set aside)
+        if (!slot_pics && !held.empty()) return;   // (STRATA_DS4_SLOT_PICS off: text only, as before)
         const std::vector<strata::ds4::slotmeta::Pic> hp = meta_pics(held);
         for (const strata::ds4::slotmeta::Pic& q : hp)
             if (q.len == 0) {   // (a held picture always has its span; without it the slot could not be matched)
@@ -747,7 +750,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
     const auto slot_take = [&](const std::vector<int>& prompt, const std::vector<Pic>& ppics, size_t floor,
                                bool& whole) -> size_t {
         whole = false;
-        if (slot_max <= 0 || prompt.size() < 2) return 0;
+        if (slot_max <= 0 || prompt.size() < 2 || (!slot_pics && !ppics.empty())) return 0;
         std::vector<strata::ds4::slotmeta::Cand> cands;
         for (const Slot& sl : slots) cands.push_back({&sl.tokens, &sl.cks, &sl.pics});
         size_t len = 0;
