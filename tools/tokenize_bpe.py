@@ -5,10 +5,11 @@ Uso: python3 tokenize_bpe.py "texto a tokenizar" [salida_ids.txt]
 El vocab.json y merges.txt se leen de la ruta del tokenizer pasada por --tokenizer o por defecto.
 """
 import json
+import os
 import regex as re
 import sys
 
-TOKENIZER_DIR = "~/Strata-data/packs/ista-iq2xs/tokenizer"
+TOKENIZER_DIR = os.environ.get("STRATA_TOKENIZER_DIR", os.path.expanduser("~/Strata-data/packs/ista-iq2xs/tokenizer"))
 
 # byte-level BPE de GPT-2: byte -> caracter
 def bytes_to_unicode():

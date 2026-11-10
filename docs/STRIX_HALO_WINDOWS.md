@@ -5,6 +5,11 @@ of the box, what speed to expect with Qwen3.8-Flash-Next IQ3_S and with DeepSeek
 build, the toolchain and the opt-in switches are on [STRIX_HALO.md](STRIX_HALO.md); the DeepSeek details are in
 [DEEPSEEK41.md](DEEPSEEK41.md).
 
+> **64 GB and Linux (ds-wormhole fork).** The DeepSeek numbers on this page come from upstream's 128 GB Strix Halo on Windows.
+> A 64 GB Strix Halo runs DeepSeek V4.1-Flash 2.25 bpw on **Linux** at 22-25 tokens/s with a 1M-token context in this fork:
+> the settings and measurements are in
+> [STRIX_HALO.md](STRIX_HALO.md#deepseek-v41-flash-on-linux-with-64-gb-ds-wormhole-fork).
+
 The structure of this page comes from the first Windows guide for this PC, written by HaiYunChuang (pull request #3029). It measured
 engines 0.1.41 to 0.1.47 with a hand-made configuration (`--mmap-experts`, a list of switches, a batch file). Since then the app and
 `strata launch` have taken over most of that, so this version describes the 0.2.7 install and every number in it was measured again.
