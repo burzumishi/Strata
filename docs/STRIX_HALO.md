@@ -94,7 +94,47 @@ CPU lane's experts into RAM on an integrated GPU: on this box that copy overcomm
 on Strix on 2026-10-25, fixed for 0.2.7; `DS4_COPY_ALL=1` forces the old behaviour for a test). `--ssd-cache N` sets the store size.
 
 Known limits: the 128 GB machine was tested. A 64 GB or 32 GB Strix Halo gets a smaller store and is slower, and setup says so (it never
-refuses). Linux on Strix Halo has no DeepSeek engine package yet. WSL is not supported: the AMD engines hang there.
+refuses). Linux on Strix Halo has no DeepSeek engine package yet (this fork builds and runs it on Linux with 64 GB: see
+[the next section](#deepseek-v41-flash-on-linux-with-64-gb-ds-wormhole-fork)). WSL is not supported: the AMD engines hang there.
+
+### DeepSeek V4.1-Flash on Linux with 64 GB (ds-wormhole fork)
+
+The `ds-wormhole` branch of this fork runs the 2.25 bpw set (IQ2_XS) on a **64 GB** Strix Halo (Ryzen AI MAX+ 395, Radeon 8060S,
+LPDDR5X-8000) under **Linux**, with a **1M-token context**, DSpark and vision. Built from source; there is no package. Measured on
+that box (Ubuntu 26.04, kernel 7.0, ROCm 7.2.4):
+
+| | |
+|---|---|
+| Decode, real agent sessions | 25.1 tok/s mean over 96 requests (median 24.8, range 16.7-37.5); 22.1 tok/s token-weighted over two days of use |
+| Decode, task batteries (base x2 + hard, 42 answers) | 23.5-25.0 tok/s, 41-42 of 42 valid |
+| Long context | above 20 tok/s past 500K tokens (a 703K session: 24.9 tok/s, 872 tool calls, 0 errors) |
+| Prompt reading | 257 tok/s on average in long sessions; 340-470 tok/s in short conversations |
+| Experts in memory | about 3,100 of 15,744 (20 %); they serve 99.6 % of the picks, the CPU lane 0.1-0.4 % |
+| Quality | perplexity against the same set's exact route (no substitution): +8 % with the speed profile below; +2 % with a softer miss penalty (0.5 / 20-39=1), being validated for speed |
+
+How it fits in 64 GB:
+
+- **BIOS:** iGPU memory `UMA_SPECIFIED`, frame buffer **2 GB** (the minimum). Linux gives the GPU system memory through GTT at the
+  same speed; a large carve-out only takes RAM away from the OS.
+- **Kernel command line:** `amdgpu.gttsize=57344 ttm.pages_limit=14680064 amdgpu.vm_fragment_size=9 iommu=pt` (GTT 56 GiB;
+  `vm_fragment_size=9` took managed-memory bandwidth from ~169 to ~240 GB/s). **Do not** set `amdgpu.cwsr_enable=0`: without CWSR
+  the kernel driver cannot evict queues and resets the GPU. Transparent huge pages with `defrag=never` (synchronous compaction
+  under the GPU's mapped pages stalls it).
+- **Engine switches** (all opt-in; the full profile is
+  [`configs/ds-wormhole/strata-v41-iq2xs-1m-h4d.example.json`](../configs/ds-wormhole/strata-v41-iq2xs-1m-h4d.example.json)):
+  the expert store in pinned host memory that the GPU reads in place (`DS4_STORE_GPU`, `DS4_STORE_PINNED`), the store lending
+  its slots to the prompt read (`DS4_STORE_LEND`, `DS4_CHUNK_LEND`), expert slots in host memory (`DS4_SLOTS_HOST`), the
+  embedding table read from the model's mapping (`DS4_EMBED_MAP`), and a **miss penalty** in the router
+  (`DS4_ROUTE_MISS_PENALTY`, `DS4_ROUTE_PEN_LAYERS`): an expert that is not in memory is replaced by a resident one unless it
+  matters enough, instead of being read from the SSD for every word. Near ties are computed again with the exact route
+  (`DS4_TIE_RECHECK`, `DS4_TIE_MID`).
+- `--experts 5 --prefill-chunk 8192 --reserve-mib 21800 --ssd-cache 10` and an expert profile from real use
+  (`--expert-profile`, `--profile-readonly`). With the server up about 3-4 GB stay free: do not build or load another model
+  beside it.
+
+Known issues: the substitution can still produce a rare misspelt word inside a word (7 in 7,400 words of Spanish prose in two days of
+sessions; none in 57,000 words of code edits), mostly right after an engine start while the store is cold. Work on
+it is in progress (`DS4_FLOW_PEN_WARM`, `DS4_MISS_RECHECK`). Stop the server with SIGTERM so it keeps the conversation.
 
 ## What the engine does differently
 
