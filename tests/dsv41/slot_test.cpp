@@ -140,6 +140,65 @@ static void pick_tests() {
     CHECK(pick({}, {}, as_int(a_turn), 0, &len) == SIZE_MAX && len == 0);
 }
 
+// 2026-11-10: kept conversations with pictures - the .meta round trip (DS4META3), the refusals, and the pick that
+// cuts at the first picture that is not the same picture at the same place
+static void pic_tests(const fs::path& dir) {
+    const std::string id = "strata-ds4-session-2 engine=test", path = (dir / "slot-pics.meta").string();
+    const std::vector<int32_t> toks = seq(100, 50);
+    const std::vector<int64_t> cks = {40};
+    const std::vector<sm::Pic> pics = {{5, 0x1111, 10}, {30, 0x2222, 8}};
+    std::vector<int32_t> t;
+    std::vector<int64_t> c;
+    std::vector<sm::Pic> p;
+    uint64_t bytes = 0;
+    CHECK(sm::write(path, id, toks, 77, cks, pics));
+    CHECK(sm::read(path, id, 1000, t, bytes, c, &p) && t == toks && c == cks && bytes == 77 && p.size() == 2 &&
+          p[0].start == 5 && p[0].hash == 0x1111 && p[0].len == 10 && p[1].start == 30 && p[1].len == 8);
+    CHECK(!sm::read(path, id, 1000, t, bytes, c));          // a caller that does not know pictures refuses it
+    CHECK(sm::write(path, id, toks, 77, cks, {}));          // text only: still DS4META2, read by either form
+    CHECK(sm::read(path, id, 1000, t, bytes, c) && sm::read(path, id, 1000, t, bytes, c, &p) && p.empty());
+    CHECK(sm::write(path, id, toks, 77, cks, {{45, 0x3333, 10}}));   // a span past the tokens
+    CHECK(!sm::read(path, id, 1000, t, bytes, c, &p));
+    CHECK(sm::write(path, id, toks, 77, cks, {{5, 0x3333, 0}}));     // an empty span
+    CHECK(!sm::read(path, id, 1000, t, bytes, c, &p));
+
+    // pick: a slot of 3000 tokens with a picture at 100 (span 50) and one at 2000 (span 50), checkpoints at 2050 and 1000
+    const std::vector<int32_t> a = seq(1, 3000);
+    const std::vector<int64_t> acks = {2050, 1000};
+    const std::vector<sm::Pic> apics = {{100, 0xAA, 50}, {2000, 0xBB, 50}};
+    std::vector<int32_t> turn = a;
+    for (int32_t x : seq(9000, 40)) turn.push_back(x);
+    const std::vector<sm::Cand> cand = {{&a, &acks, &apics}};
+    size_t len = 0;
+    std::vector<sm::Pic> same = {{100, 0xAA, 0}, {2000, 0xBB, 0}};
+    CHECK(sm::pick(cand, as_int(turn), 0, &len, &same) == 0 && len == 3000);             // the same pictures: whole
+    std::vector<sm::Pic> other2 = {{100, 0xAA, 0}, {2000, 0xCC, 0}};
+    CHECK(sm::pick(cand, as_int(turn), 0, &len, &other2) == 0 && len == 1000);           // 2nd differs: cut at 2000 -> ck 1000
+    std::vector<sm::Pic> other1 = {{100, 0xDD, 0}, {2000, 0xBB, 0}};
+    CHECK(sm::pick(cand, as_int(turn), 0, &len, &other1) == SIZE_MAX && len == 0);       // 1st differs: nothing before 100
+    CHECK(sm::pick(cand, as_int(turn), 0, &len) == SIZE_MAX && len == 0);                // a prompt with no pictures
+    std::vector<sm::Pic> extra = {{100, 0xAA, 0}, {2000, 0xBB, 0}, {1500, 0xEE, 0}};     // a picture the slot lacks
+    CHECK(sm::pick(cand, as_int(turn), 0, &len, &extra) == 0 && len == 1000);
+    // a checkpoint inside a held picture's span does not count: same pictures, the prompt leaves the slot at 2030
+    const std::vector<int64_t> inside = {2020};
+    const std::vector<sm::Cand> cand2 = {{&a, &inside, &apics}};
+    std::vector<int32_t> split(a.begin(), a.begin() + 2030);
+    for (int32_t x : seq(9000, 40)) split.push_back(x);
+    CHECK(sm::pick(cand2, as_int(split), 0, &len, &same) == SIZE_MAX && len == 0);
+    const std::vector<int64_t> before = {2000};   // at the span's start it does
+    const std::vector<sm::Cand> cand3 = {{&a, &before, &apics}};
+    CHECK(sm::pick(cand3, as_int(split), 0, &len, &same) == 0 && len == 2000);
+    // text-only slots and prompts behave as before (no pictures on either side)
+    const std::vector<int64_t> none;
+    const std::vector<sm::Cand> text = {{&a, &none}};
+    CHECK(sm::pick(text, as_int(turn), 0, &len) == 0 && len == 3000);
+    // a text-only slot against a prompt that has a picture inside the shared start: cut at the picture
+    std::vector<sm::Pic> late = {{2500, 0xFF, 0}};
+    const std::vector<int64_t> ck2 = {2400};
+    const std::vector<sm::Cand> text2 = {{&a, &ck2}};
+    CHECK(sm::pick(text2, as_int(turn), 0, &len, &late) == 0 && len == 2400);
+}
+
 int main() {
     const fs::path dir = fs::temp_directory_path() / "ds4-slot-test";
     std::error_code ec;
@@ -147,6 +206,7 @@ int main() {
     fs::create_directories(dir);
     meta_tests(dir);
     pick_tests();
+    pic_tests(dir);
     fs::remove_all(dir, ec);
     std::printf(fails ? "FAILED: %d\n" : "slot_test: all passed\n", fails);
     return fails ? 1 : 0;
