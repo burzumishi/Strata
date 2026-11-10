@@ -1,194 +1,96 @@
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="apps/host/public/brand/strata-lockup-dark.svg">
-    <img src="apps/host/public/brand/strata-lockup-light.svg" alt="Strata" width="340">
-  </picture>
-</p>
+# Strata · ds-wormhole
 
-<h3 align="center">Run powerful AI on your own computer.</h3>
-<p align="center">Chat, code and work with images, locally.</p>
+**DeepSeek-V4.1-Flash (763B) con 1M de contexto en un mini PC de 64 GB.** Fork de
+[Niko1221/Strata](https://github.com/Niko1221/Strata) adaptado a AMD Strix Halo (Ryzen AI MAX+ 395, Radeon 8060S `gfx1151`,
+RDNA 3.5, 64 GB LPDDR5X unificada). La rama de trabajo es `ds-wormhole`.
 
-<p align="center">
-  <a href="#models">Models</a> · <a href="#install"><b>Install</b></a> ·
-  <a href="#hardware">Hardware</a> · <a href="#tools">Tools</a> ·
-  <a href="#help">Help</a> · <a href="#support-strata">Support</a>
-</p>
+> Fork personal, no oficial. Todo lo de upstream sigue siendo de Niko1221 y los contribuidores de Strata (MIT, ver
+> `LICENSE`); el motor DeepSeek viene de Project Maya (`third_party/project-maya`). El README original está en
+> [`README.strata.md`](README.strata.md).
 
-<p align="center">
-  <a href="https://github.com/Niko1221/Strata/releases/latest"><img src="https://img.shields.io/github/v/release/Niko1221/Strata?label=download&color=0ab887" alt="Download Strata"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/github/license/Niko1221/Strata" alt="MIT license"></a>
-  <a href="https://buymeacoffee.com/strataengine"><img src="https://img.shields.io/badge/Buy_me_a_coffee-FFDD00?logo=buymeacoffee&logoColor=000" alt="Support Strata on Buy Me a Coffee"></a>
-</p>
+## Qué hace
 
-<p align="center"><sub><b>English</b> · <a href="README.zh-CN.md">简体中文</a> · <a href="README.ja.md">日本語</a> · <a href="README.de.md">Deutsch</a> · <a href="README.fr.md">Français</a> · <a href="README.es.md">Español</a> · <a href="README.pt-BR.md">Português</a> · <a href="README.pl.md">Polski</a></sub></p>
+| | |
+|---|---|
+| Modelo | DeepSeek-V4.1-Flash-1017 **IQ2_XS** (ISTA-DASLab GSQ-RCO), 40 capas, 384 expertos/capa, Engram IQ4_NL y DSpark Q8_0 |
+| Contexto | **1.048.576 tokens** (KV FP4, 890 B/token), visión y herramientas |
+| Velocidad (uso real) | **~22-25 t/s** de media en sesiones de agente (2026-11-09: 25,1 t/s de media, mediana 24,8, rango 16,7-37,5; 09-10: 22,1 t/s ponderados) |
+| Con contexto largo | por encima de 500K sigue por encima de 20 t/s (sesión de 703K: 24,9 t/s, 872 llamadas a herramientas, 0 errores) |
+| Lectura del prompt | 257 t/s de media en sesiones largas; 340-470 t/s con conversaciones cortas |
+| Especulación | DSpark: ~2,7 tokens por ronda de verificación, ~124 ms por ronda |
+| Memoria | ~3.100 de 15.744 expertos residentes (20 %) cubren el 99,6 % de las peticiones; el carril de CPU sirve el 0,1-0,4 % |
 
-**Free, open source, and yours to run.** Use Strata on your desktop or with your favorite coding tools. No account needed.
+El modelo pesa unos 143 GB de expertos más 111 GB de Engram: no cabe en 64 GB. Funciona porque solo una parte de los
+expertos se queda en memoria y los demás se **sustituyen con una penalización medida** (o se leen del SSD sin pasar
+por la caché de páginas). Con la ruta exacta, sin sustituciones, va a ~6 t/s; la producción (perfil H4d) va a ~25.
 
-## Models
+## Qué añade ds-wormhole al motor `strata-dsv41`
 
-We recommend **ISTA-DASLab first**, then **Unsloth** and other providers, where a compatible model fits.
+Todo es opcional y se activa por variable de entorno; los valores de producción están en
+[`configs/ds-wormhole/strata-v41-iq2xs-1m-h4d.example.json`](configs/ds-wormhole/strata-v41-iq2xs-1m-h4d.example.json).
 
-<details>
-<summary><img src="docs/media/models/qwen.svg" width="22" alt="" align="middle"> &nbsp;<b>Qwen3.8-Flash-Next</b></summary>
+**Memoria unificada (Strix Halo)**
+- Almacén de expertos en memoria pinned leída por la GPU en su sitio (`DS4_STORE_GPU`, `DS4_STORE_PINNED`,
+  `DS4_STORE_ZC_FRAC`, `DS4_STORE_MAPREAD`), huecos de expertos en host (`DS4_SLOTS_HOST`).
+- El «switch» de memoria: el almacén presta sus huecos al prompt (`DS4_STORE_LEND`) y el scratch grande del trozo vive
+  en una región pinned prestada (`DS4_CHUNK_LEND`, ~1,5 GB).
+- Tabla de embeddings leída del mapeo del modelo, sin copia BF16 (`DS4_EMBED_MAP`, −1,3 GB).
 
-| Provider | Choices |
-| --- | --- |
-| **ISTA-DASLab · recommended** | Q2\_0, IQ2\_XS, IQ3\_XXS, IQ3\_S. [Coder: IQ1\_M](docs/MODELS.md#coder) for coding. |
-| **Unsloth** | UD-IQ4\_XS, UD-Q4\_K\_XL, UD-Q5\_K\_XL, UD-Q6\_K\_XL, Q8\_0 |
-| **Gyro · agentionai** | [Gyro-S, Gyro-M](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-GGUF). Lower memory use but slower. |
-| **Other options** | [Swift 1.5](docs/MODELS.md#swift-15), [NVFP4](docs/NVFP4.md), [OrcaRouter](docs/ORCA.md) |
+**Calidad con expertos ausentes**
+- Penalización de fallos en el router, por capas (`DS4_ROUTE_MISS_PENALTY`, `DS4_ROUTE_PEN_LAYERS`), también en la
+  lectura del prompt (`DS4_FLOW_PEN_MAX`, `DS4_PICK_MIN`).
+- Rechequeo de casi-empates con la ruta exacta y la regla especulativa (`DS4_TIE_LOG`, `DS4_TIE_RECHECK`, `DS4_TIE_MID`
+  para empates dentro de una palabra), con contadores de muestras de la cola.
+- Trie de nombres de herramienta: el nombre de una llamada solo puede ser uno de los declarados (`DS4_TOOL_TRIE`).
 
-[Compare sizes, memory needs and compatibility](docs/MODELS.md).
+**Velocidad**
+- Elección de cuántos borradores verificar por coste medido de la ronda (`DS4_SPEC_COST`, `DS4_ROUND_LOG`).
+- GEMV densas Q5_K con las sumas de activación una vez por bloque en LDS (`DS4_MV_SUMS`, ~10 % menos por ronda,
+  resultados idénticos byte a byte).
+- Lookahead del router para cualquier formato de experto (`DS4_AHEAD_ANYFMT`), YOCO acotado (`DS4_YOCO`).
 
-</details>
+**Servidor y clientes**
+- Conversaciones aparcadas en disco, también con imágenes (`STRATA_DS4_SLOT_PICS`): vuelven en ~1 s sin recodificar.
+- Penalizaciones de repetición/frecuencia/presencia con la semántica de llama.cpp.
+- La web de llama.cpp (b12032) como interfaz, con herramientas (`web_search`, `fetch_url`, ficheros), MCP, adjuntos e
+  imágenes: [`docs/DS_WORMHOLE_WEB.md`](docs/DS_WORMHOLE_WEB.md).
+- Llamadas DSML leídas como las lee `deepseek-recipe`; API OpenAI y Anthropic (Claude Code).
+- Parámetros para los clientes (el muestreo es del cliente, no del servidor):
+  [`docs/DS_WORMHOLE_CLIENTES.md`](docs/DS_WORMHOLE_CLIENTES.md).
 
-<details>
-<summary><img src="docs/media/models/qwen.svg" width="22" alt="" align="middle"> &nbsp;<b>Qwen3.6-35B-A3B</b></summary>
+## Requisitos y compilación
 
-**Unsloth:** UD-Q4_K_XL, UD-Q6_K_XL, Q8_0. These are the currently documented packs for this model.
+- Linux (probado en Ubuntu 26.04, kernel 7.0), ROCm 7.2.4, CMake + Ninja.
+- BIOS con el carve-out de la iGPU al mínimo (UMA 2 GB) y GTT grande por el arranque del kernel:
+  `amdgpu.gttsize=57344 ttm.pages_limit=14680064 amdgpu.vm_fragment_size=9 iommu=pt`. **No** desactivar CWSR
+  (`amdgpu.cwsr_enable=0` provoca reinicios de la GPU). THP sin defrag síncrono.
+- Unos 300 GB de disco para el modelo, el Engram, el borrador y la visión.
 
-[Model guide and compatibility](docs/QWEN36.md).
-
-</details>
-
-<details>
-<summary><img src="docs/media/models/deepseek.svg" width="22" alt="" align="middle"> &nbsp;<b>DeepSeekV4.1-Flash-1017</b></summary>
-
-In the **desktop app** and the **Terminal**. What does not fit in memory is read from your SSD, so it needs a lot of free
-disk space.
-
-| Set (IST-DAS) | Download | Free disk needed |
-| --- | ---: | ---: |
-| 1.75 bpw | 239 GB | about 245 GB |
-| 2.00 bpw | 257 GB | about 265 GB |
-| 2.25 bpw | 274 GB | about 280 GB |
-
-Runs on NVIDIA RTX 30, 40 and 50 series (Windows and Linux), AMD Radeon AI PRO R9700 (Linux), AMD Ryzen AI Max — Strix Halo
-(Windows), and Apple Silicon Macs with 64 GB or more, text only ([Mac](docs/DEEPSEEK_MAC.md)). Setup downloads the files and the DeepSeek engine, then starts the model.
-
-```sh
-strata launch --family deepseek41 --model ist-das-2.00bpw --plan
+```bash
+cmake -S . -B build-dsv41-hip -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_HIP=ON -DSTRATA_ENABLE_CUDA=OFF \
+  -DSTRATA_BUILD_TESTS=ON -DCMAKE_HIP_ARCHITECTURES=gfx1151 \
+  -DCMAKE_HIP_COMPILER=/opt/rocm-7.2.4/llvm/bin/clang++ -DCMAKE_PREFIX_PATH=/opt/rocm-7.2.4
+cmake --build build-dsv41-hip --target strata-dsv41 -j12
 ```
 
-Measured with the 2.00 bpw set on Strata 0.2.5 (Strix Halo: 0.2.7). Output is the speed of the answer, prompt is how fast Strata reads your input.
+Arranque (servidor Python de Strata con el perfil de ejemplo, rellenando `<STRATA>`, `<MODELS>` y `<DATA>`):
 
-| Hardware | Output | Prompt |
-| --- | ---: | ---: |
-| RTX 5070 12 GB, 64 GB RAM | 4 to 6 tokens/s | about 110 tokens/s (4K) |
-| RTX 3060 12 GB, 46 GB RAM | 9 to 11 tokens/s | about 155 tokens/s (4K) |
-| 1x Radeon AI PRO R9700, 251 GB RAM | 21 to 25 tokens/s | 320 to 360 tokens/s (8K) |
-| 4x Radeon AI PRO R9700 | 74 to 77 tokens/s | 400 to 450 tokens/s (8K) |
-| Ryzen AI Max+ 395 (Strix Halo), 128 GB unified | 19 to 21 tokens/s (code), 11 (chat) | 87 tokens/s (4K), 125 tokens/s (8K) |
-
-[Memory, disk and details](docs/DEEPSEEK41.md) · [Release notes](https://github.com/Niko1221/Strata/releases)
-
-</details>
-
-<a id="the-other-sizes"></a>
-
-Not sure what fits? [Choose a model for your computer](docs/MODELS.md#pick-by-memory).
-
-## Install
-
-<a id="option-a-the-strata-app"></a>
-
-### Desktop app
-
-**[Download Strata for Windows, Linux or Mac →](https://github.com/Niko1221/Strata/releases/latest)**
-
-Install the app, choose a model, and start chatting. There is one installer for each system. On first start the app
-downloads the engine for your graphics card. [Help with the installer](docs/INSTALL.md#the-app).
-
-<sub>Files: `Strata-0.2.9-windows-x64-setup.exe` · `Strata-0.2.9-linux-x86_64.AppImage` · `Strata-0.2.9-macos-arm64.dmg`</sub>
-
-<p align="center">
-  <img src="docs/media/app-chat.png" width="900" alt="Strata desktop app with a chat and live code preview side by side">
-  <br><sub>Chat, files and a live preview in one window.</sub>
-</p>
-
-<a id="option-b-the-terminal-one-line"></a>
-
-### Terminal app
-
-Prefer the terminal? Install Strata, then run **`strata launch`**.
-
-<details open>
-<summary><b>Install commands</b></summary>
-
-**Linux / Mac**
-
-```sh
-curl -fsSL https://github.com/Niko1221/Strata/releases/latest/download/install.sh -o install.sh && sh install.sh
+```bash
+.venv/bin/python serve/server.py --engine strata --config strata-v41-iq2xs-1m-h4d.json --host 0.0.0.0 --port 8080
 ```
 
-**Windows PowerShell**
+Pararlo con SIGTERM para que guarde la conversación en curso.
 
-```powershell
-irm https://github.com/Niko1221/Strata/releases/latest/download/install.ps1 | iex
-```
+## Qwen en Strix Halo
 
-On Windows, open a new terminal afterwards. Then:
+La rama también lleva el port de los motores de Qwen a `gfx1151` hecho antes (octubre de 2026): expertos MXFP4,
+arena de memoria unificada, MTP nativo Q4_0/Q8_0, visión en HIP, aparcado de conversaciones en disco
+(`--conversation-disk-dir`) y el motor `strata-q36` con atención WMMA de prompt, KV int8, YaRN y los 27B densos.
+Son los commits `local:` del historial; [`docs/STRIX_HALO.md`](docs/STRIX_HALO.md) es la guía de upstream para esta
+máquina.
 
-```sh
-strata launch
-```
+## Estado
 
-Follow the prompts to download and start a model. [Terminal guide](docs/TERMINAL_LAUNCH.md).
-
-</details>
-
-<p align="center">
-  <img src="docs/media/terminal-monitor.png" width="900" alt="Strata terminal app showing model activity, speed, memory and recent requests">
-  <br><sub>Watch your model and hardware while it runs.</sub>
-</p>
-
-<a id="build-from-source"></a>
-
-[Build from source](docs/SOURCE_INSTALL.md) · [Docker](docs/DOCKER.md) · [Full install guide](docs/INSTALL.md)
-
-<a id="what-you-need"></a>
-
-## Hardware
-
-| Supported hardware | Guide |
-| --- | --- |
-| **NVIDIA GeForce RTX 20 / 30 / 40 / 50 series** | [NVIDIA setup](docs/INSTALL.md#what-you-need) |
-| **AMD Radeon RX 7700 / 7800 / 7900, RX 9060 / 9070, AI PRO R9700** | [AMD setup](docs/AMD_HIP.md) |
-| **AMD Radeon RX 6800 / 6900 · experimental** | [RX 6000 setup](docs/AMD_HIP.md#rdna2-gfx1030) |
-| **Intel Arc · Linux** | [Intel setup](docs/INTEL_ARC.md) |
-| **Apple Silicon · M1 or newer** | [Mac setup](docs/MAC.md) |
-| **AMD Ryzen AI Max · Strix Halo** | [Strix Halo setup](docs/STRIX_HALO.md) |
-| **NVIDIA DGX Spark · Linux** | [DGX Spark setup](docs/DGX_SPARK_LINUX.md) |
-
-<a id="using-it"></a>
-
-## Tools
-
-**Claude Code · Codex CLI · OpenCode · oh-my-pi · pi.dev · Hermes Agent · OpenClaw**, and more through the OpenAI- and Anthropic-compatible APIs.
-
-Run **`strata connect`** to see setup instructions for your tool. [Connection guide](docs/TERMINAL_LAUNCH.md#connect-your-apps-strata-connect).
-
-<a id="guides"></a>
-<a id="how-fast-is-it"></a>
-<a id="how-does-it-work"></a>
-<a id="something-went-wrong"></a>
-
-## Help
-
-[All guides](docs) · [Troubleshooting](docs/TROUBLESHOOTING.md) · [Report a bug](https://github.com/Niko1221/Strata/issues/new/choose) ·
-[Benchmarks](docs/COMMUNITY_BENCHMARKS.md) · [How it works](docs/HOW_IT_WORKS.md) · [Contribute](CONTRIBUTING.md)
-
-## Support Strata
-
-**Help keep local AI open to everyone.** A coffee helps fund development and testing on more hardware.
-
-<a href="https://buymeacoffee.com/strataengine"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me a Coffee: support Strata" height="48"></a>
-
-[MIT license](LICENSE) · [Credits and model licenses](docs/HOW_IT_WORKS.md#credits) · [Privacy](docs/SAFETY.md)
-
-<a id="option-c-let-your-ai-set-it-up"></a>
-
-<sub>For AI tools and automated readers: <a href="AGENTS.md">technical reference</a> · <a href="docs/AI_SETUP.md">setup instructions</a>.</sub>
-
-**Sponsorships, hardware partnerships or collaborations:** [niko.veit@outlook.com](mailto:niko.veit@outlook.com).
-
+Trabajo en curso. Los cambios se miden con baterías de tareas reales (velocidad, validez y erratas), no con
+benchmarks cortos, y no se recuantiza para ganar velocidad. Las mejoras de upstream posteriores a v0.2.9 se traen por
+cherry-pick en ramas aparte (`ds-wormhole-up`).
