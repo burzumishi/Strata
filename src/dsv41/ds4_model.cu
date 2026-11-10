@@ -1145,6 +1145,10 @@ struct Model::Impl {
     std::vector<float> tie_lg;
     std::vector<float> last_draft_conf;   // the last draft block's confidences (draft -> verify)
     std::vector<std::vector<int16_t>> win_wanted;   // [trunk layer][row * k + i]: the last verify window's wanted experts
+    std::vector<std::vector<int16_t>> win_picked;   // [trunk layer][row * k + i]: the experts those rows ran (DS4_MISS_RECHECK)
+    int miss_first_said = 0;
+    bool flow_warm_said = false;   // (DS4_FLOW_PEN_WARM's line, once)
+    struct MissStats { long long rounds = 0, rows = 0, mid = 0, fired = 0, hist[8] = {0, 0, 0, 0, 0, 0, 0, 0}; } miss_st;
     long long draft_fires = 0;
     bool drafts_q = false;
     float dq_temp = 0.0f, dq_top_p = 1.0f, dq_min_p = 0.0f;
@@ -8139,6 +8143,12 @@ struct Model::Impl {
                     ww.assign((size_t) T * l.k_exp, -1);
                     for (int t = 0; t < T; ++t)
                         for (int i = 0; i < l.k_exp; ++i) ww[(size_t) t * l.k_exp + i] = (int16_t) r.wanted[t][i];
+                    // (2026-11-10, DS4_MISS_RECHECK) and the experts it got: a wanted one not among them was substituted
+                    if (win_picked.size() < (size_t) g.nl) win_picked.resize((size_t) g.nl);
+                    std::vector<int16_t>& wp = win_picked[(size_t) li];
+                    wp.assign((size_t) T * l.k_exp, -1);
+                    for (int t = 0; t < T; ++t)
+                        for (int i = 0; i < l.k_exp; ++i) wp[(size_t) t * l.k_exp + i] = (int16_t) r.ids[t][i];
                 }
                 for (int t = 0; t < T; ++t) {
                     if (heat_wanted)   // (the heat from what the router wanted; an expert the penalty turned away may still come in)
@@ -8924,6 +8934,63 @@ struct Model::Impl {
                 std::fprintf(stderr, "ds4 draft recheck: %lld rows (a sure draft, conf %.2f, turned down)\n", draft_fires,
                              last_draft_conf[(size_t) m]);
         }
+        // 2026-11-10 (DS4_MISS_RECHECK=s): a token written inside a word ("extra" + "o", "merge_inter" + "ivals") whose row ran
+        // without several of the experts the router wanted most: s = the (layer, rank 0-1) pairs whose wanted expert was
+        // substituted.  Not a near tie (the typo had ~15 % against ~85 %), so the tie recheck never sees it; the row is
+        // computed again with the exact routing and decided by the speculative rule, as a tie.  Only rows inside a word
+        // (DS4_TIE_VOCAB's texts), so a whole-word choice is never second-guessed.  DS4_MISS_LOG=1: the score's histogram.
+        {
+            static const int miss_gate = std::getenv("DS4_MISS_RECHECK") ? std::atoi(std::getenv("DS4_MISS_RECHECK")) : 0;
+            static const bool miss_log = std::getenv("DS4_MISS_LOG") != nullptr && std::atoi(std::getenv("DS4_MISS_LOG")) != 0;
+            if ((miss_gate > 0 || miss_log) && !tc.txt.empty() && !win_wanted.empty() && win_picked.size() == win_wanted.size()) {
+                auto alnum = [](unsigned char ch) { return std::isalnum(ch) || ch == '_' || ch >= 0x80; };
+                const int last = std::min(m, n);   // (rows 0..m: the kept drafts and the row that samples next)
+                for (int r = 0; r <= last; ++r) {
+                    const int ch = r < m ? drafts[(size_t) r] : next;
+                    const int pv = tk[r];
+                    if (ch < 0 || pv < 0 || (size_t) ch >= tc.txt.size() || (size_t) pv >= tc.txt.size()) continue;
+                    const std::string& ct = tc.txt[(size_t) ch];
+                    const std::string& pt = tc.txt[(size_t) pv];
+                    ++miss_st.rows;
+                    const bool mid = !pt.empty() && alnum((unsigned char) pt.back()) && !ct.empty() && alnum((unsigned char) ct[0]);
+                    if (!mid) continue;
+                    ++miss_st.mid;
+                    int s = 0;
+                    for (size_t il = 0; il < win_wanted.size(); ++il) {
+                        const std::vector<int16_t>& ww = win_wanted[il];
+                        const std::vector<int16_t>& wp = win_picked[il];
+                        const int k = L[il].k_exp;
+                        const size_t b = (size_t) r * k;
+                        if (b + k > ww.size() || b + k > wp.size()) continue;
+                        for (int i = 0; i < 2 && i < k; ++i) {
+                            const int16_t e = ww[b + i];
+                            if (e < 0) continue;
+                            bool got = false;
+                            for (int j = 0; j < k; ++j) got |= wp[b + j] == e;
+                            if (!got) ++s;
+                        }
+                    }
+                    ++miss_st.hist[s == 0 ? 0 : s == 1 ? 1 : s == 2 ? 2 : s <= 4 ? 3 : s <= 8 ? 4 : s <= 16 ? 5 : s <= 32 ? 6 : 7];
+                    if (r_tie < 0 && miss_gate > 0 && s >= miss_gate) {
+                        if (!lg_fresh) {
+                            tie_lg.resize((size_t) (m + 1) * V);
+                            CK(cudaMemcpyAsync(tie_lg.data(), hd.logits, tie_lg.size() * 4, cudaMemcpyDeviceToHost, hd.st));
+                            CK(cudaStreamSynchronize(hd.st));
+                            lg_fresh = true;
+                        }
+                        r_tie = r;
+                        c_tie = ch;
+                        ++miss_st.fired;
+                    }
+                }
+                // (the line: at the first recheck and every 500 rounds)
+                if (++miss_st.rounds % 500 == 0 || (miss_st.fired == 1 && miss_first_said++ == 0))
+                    std::fprintf(stderr, "ds4 miss recheck (s >= %d): %lld rows, %lld inside a word, %lld rechecked; inside a word by s: "
+                                 "0 %lld | 1 %lld | 2 %lld | 3-4 %lld | 5-8 %lld | 9-16 %lld | 17-32 %lld | 33+ %lld\n", miss_gate,
+                                 miss_st.rows, miss_st.mid, miss_st.fired, miss_st.hist[0], miss_st.hist[1], miss_st.hist[2],
+                                 miss_st.hist[3], miss_st.hist[4], miss_st.hist[5], miss_st.hist[6], miss_st.hist[7]);
+            }
+        }
         if (r_tie >= 0) {
             // q: the penalised row's distribution (temperature only), its 64 most likely tokens
             strata::dsv41k::SpecList& q = h_specq[0];
@@ -9334,7 +9401,16 @@ struct Model::Impl {
         // DS4_FLOW_PEN_MAX=N: a chunk of up to N tokens routes with the token path's miss penalty (what it streams is the turn's cost)
         static const int flow_pen_max = std::getenv("DS4_FLOW_PEN_MAX") != nullptr ? std::atoi(std::getenv("DS4_FLOW_PEN_MAX")) : 0;
         static const bool flow_heat_wanted = std::getenv("DS4_FLOW_HEAT_WANTED") != nullptr;
-        const bool chunk_pen = T <= flow_pen_max && !l.mtp;
+        // 2026-11-10 (DS4_FLOW_PEN_WARM=N): no read penalty until the engine has gone through N tokens since it started - a cold
+        // engine (the store still empty) substituted so much that the first read after a start wrote "actual" + "o" for
+        // "actualizo" (V8b, t90, t93: only on the first request; warm, or read without the penalty, "izo")
+        static const long long flow_pen_warm = std::getenv("DS4_FLOW_PEN_WARM") != nullptr ? std::atoll(std::getenv("DS4_FLOW_PEN_WARM")) : 0;
+        const bool chunk_pen = T <= flow_pen_max && !l.mtp && st.tokens >= flow_pen_warm;
+        if (flow_pen_warm > 0 && l.il == 0 && !flow_warm_said && st.tokens >= flow_pen_warm) {
+            flow_warm_said = true;
+            std::fprintf(stderr, "ds4: DS4_FLOW_PEN_WARM: %lld tokens since the start, prompt reads take the miss penalty from here\n",
+                         (long long) st.tokens);
+        }
         for (int r0 = 0; r0 < T; r0 += kVlRows) {   // (route()'s image bits cover kVlRows rows a call)
             const int nr = std::min(kVlRows, T - r0);
             VlBits vb;
