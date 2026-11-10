@@ -937,6 +937,66 @@ __global__ void __launch_bounds__(kThreads) mv_kernel(const Jobs J) {
             if (lane == 0) b.y[c * b.ycs + row] = b.alpha * v + (b.bias != nullptr ? b.bias[row] : 0.0f);
         }
 }
+// The dense Q5_K GEMVs, every column count 1-16 (DS4_MV_SUMS=1: one kernel, so a window's column has the token path's bits; 2026-11-10 ds-wormhole KG1): mv_kernel<kQ5_K, NC> with
+// (1) the activations' own sums of each 32-value half (sub_dot's sl / sh: they depend on the activations only) computed
+// once a block into LDS, where mv_kernel computes them again in every weight row (8 of a sub-block's 16 dp4a a column), and
+// (2) the window's exact column count as the template (mv_kernel takes 16 for 5-6 columns). A GEMV of 4-6 columns was
+// instruction bound (--pmc: wq_b 249 -> 678 VALU a wave from 1 to 6 columns). Every sum is mv_kernel's: integer sums
+// (exact in any order), then the same F32 operations in the same order a lane and the same warp_sum - the same bits.
+template <int NC>
+__global__ void __launch_bounds__(kThreads) mv_q5k_sums_kernel(const Jobs J) {
+    extern __shared__ int2 ssum[];   // [column][sub-block]: (sl, sh)
+    const MvJob& b = J.j[blockIdx.y];
+    const int nsb = b.k / 32;
+    for (int i = threadIdx.x; i < b.ncol * nsb; i += kThreads) {
+        const int c = i / nsb, kb = i - c * nsb;
+        const int4* xp = (const int4*) (b.xq + (size_t) c * b.k + (size_t) kb * 32);
+        const int4 xa = xp[0], xb = xp[1];
+        int sl = __dp4a(0x01010101, xa.x, 0);
+        sl = __dp4a(0x01010101, xa.y, sl);
+        sl = __dp4a(0x01010101, xa.z, sl);
+        sl = __dp4a(0x01010101, xa.w, sl);
+        int sh = __dp4a(0x01010101, xb.x, 0);
+        sh = __dp4a(0x01010101, xb.y, sh);
+        sh = __dp4a(0x01010101, xb.z, sh);
+        sh = __dp4a(0x01010101, xb.w, sh);
+        ssum[i] = make_int2(sl, sh);
+    }
+    __syncthreads();
+    const int row = blockIdx.x * kWarps + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+    if (row >= b.n) return;
+    const uint8_t* w = b.w + (size_t) row * b.ld;
+    float acc[NC];
+#pragma unroll
+    for (int c = 0; c < NC; ++c) acc[c] = 0.0f;
+    for (int kb = lane; kb < nsb; kb += 32) {
+        Sub s;
+        decode<kQ5_K>(w, kb, nullptr, s);
+#pragma unroll
+        for (int c = 0; c < NC; ++c) {
+            if (c >= b.ncol) break;
+            const int4* xp = (const int4*) (b.xq + (size_t) c * b.k + (size_t) kb * 32);
+            const int2 sm = ssum[c * nsb + kb];
+            int lo = __dp4a(s.q[0], xp[0].x, 0);
+            lo = __dp4a(s.q[1], xp[0].y, lo);
+            lo = __dp4a(s.q[2], xp[0].z, lo);
+            lo = __dp4a(s.q[3], xp[0].w, lo);
+            int hi = __dp4a(s.q[4], xp[1].x, 0);
+            hi = __dp4a(s.q[5], xp[1].y, hi);
+            hi = __dp4a(s.q[6], xp[1].z, hi);
+            hi = __dp4a(s.q[7], xp[1].w, hi);
+            float v = __fmul_rn(s.d, (float) (s.s0 * lo + s.s1 * hi));
+            v = __fsub_rn(v, __fadd_rn(__fmul_rn(s.m0, (float) sm.x), __fmul_rn(s.m1, (float) sm.y)));
+            acc[c] = fmaf(b.xd[(size_t) c * nsb + kb], v, acc[c]);
+        }
+    }
+#pragma unroll
+    for (int c = 0; c < NC; ++c) {
+        if (c >= b.ncol) break;
+        const float v = warp_sum(acc[c]);
+        if (lane == 0) b.y[c * b.ycs + row] = b.alpha * v + (b.bias != nullptr ? b.bias[row] : 0.0f);
+    }
+}
 
 // ---------------------------------------------------------------- the prompt sets' light experts
 // A set's experts of a few rows (<= kLightRows: a prompt of a few hundred tokens spreads ~10 over most of 384 experts)
@@ -1274,9 +1334,31 @@ bool light_set(const SetArgs& a, bool gu, cudaStream_t s) {
     return true;
 }
 
+bool mv_sums_on() {   // DS4_MV_SUMS=1: the dense Q5_K GEMVs (1-16 columns) through mv_q5k_sums_kernel
+    static const bool on = [] {
+        const char* v = std::getenv("DS4_MV_SUMS");
+        return v != nullptr && v[0] == '1';
+    }();
+    return on;
+}
+// every job of the launch, its own column count <= the launch's (as mv_kernel); LDS: the widest job's sums
+bool mv_sums_launch(const Jobs& J, int nj, int max_n, int max_c, cudaStream_t s) {
+    size_t lds = 0;
+    for (int i = 0; i < nj; ++i) lds = std::max(lds, (size_t) J.j[i].ncol * (J.j[i].k / 32) * sizeof(int2));
+    if (lds > 49152 || max_c < 1 || max_c > 16) return false;
+    const dim3 grid((unsigned) ((max_n + kWarps - 1) / kWarps), (unsigned) nj);
+    switch (max_c) {
+#define MS_(N) case N: strata_ds4_launch(mv_q5k_sums_kernel<N>, grid, kThreads, lds, s, J); return true;
+        MS_(1) MS_(2) MS_(3) MS_(4) MS_(5) MS_(6) MS_(7) MS_(8) MS_(9) MS_(10) MS_(11) MS_(12) MS_(13) MS_(14) MS_(15) MS_(16)
+#undef MS_
+        default: return false;
+    }
+}
 template <int T>
 void mv_nc(const Jobs& J, int nj, int max_n, int max_c, cudaStream_t s) {
     const dim3 grid((unsigned) ((max_n + kWarps - 1) / kWarps), (unsigned) nj);
+    if constexpr (T == kQ5_K)
+        if (mv_sums_on() && mv_sums_launch(J, nj, max_n, max_c, s)) return;
     if (max_c <= 1) strata_ds4_launch(mv_kernel<T, 1>, grid, kThreads, 0, s, J);
     else if (max_c <= 4) strata_ds4_launch(mv_kernel<T, 4>, grid, kThreads, 0, s, J);
     else strata_ds4_launch(mv_kernel<T, 16>, grid, kThreads, 0, s, J);
