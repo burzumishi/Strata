@@ -2480,7 +2480,7 @@ class StrataEngine:
                     return
                 elif line.startswith("ERR"):
                     done = True
-                    self._swallow_trailing_done(lines_q)  # an engine that ended the request on ERR may still print its DONE
+                    self._swallow_trailing_done(self.lines)  # an engine that ended the request on ERR may still print its DONE
                     raise ValueError(line[4:].strip())
         finally:
             if not done:                                  # the consumer stopped early: stop the engine, drain to DONE
