@@ -1,70 +1,74 @@
 # Strata · ds-wormhole
 
-**DeepSeek-V4.1-Flash (763B) con 1M de contexto en un mini PC de 64 GB.** Fork de
-[Niko1221/Strata](https://github.com/Niko1221/Strata) adaptado a AMD Strix Halo (Ryzen AI MAX+ 395, Radeon 8060S `gfx1151`,
-RDNA 3.5, 64 GB LPDDR5X unificada). La rama de trabajo es `ds-wormhole`.
+<sub><b>English</b> · [Español](README.es.md)</sub>
 
-> Fork personal, no oficial. Todo lo de upstream sigue siendo de Niko1221 y los contribuidores de Strata (MIT, ver
-> `LICENSE`); el motor DeepSeek viene de Project Maya (`third_party/project-maya`). El README original está en
+**DeepSeek-V4.1-Flash (763B) with a 1M-token context on a 64 GB mini PC.** A fork of
+[Niko1221/Strata](https://github.com/Niko1221/Strata) tuned for AMD Strix Halo (Ryzen AI MAX+ 395, Radeon 8060S `gfx1151`,
+RDNA 3.5, 64 GB of unified LPDDR5X). The working branch is `ds-wormhole`.
+
+> A personal, unofficial fork. Everything from upstream belongs to Niko1221 and the Strata contributors (MIT, see
+> `LICENSE`); the DeepSeek engine comes from Project Maya (`third_party/project-maya`). Strata's original README is in
 > [`README.strata.md`](README.strata.md).
 
-## Qué hace
+## What it does
 
 | | |
 |---|---|
-| Modelo | DeepSeek-V4.1-Flash-1017 **IQ2_XS** (ISTA-DASLab GSQ-RCO), 40 capas, 384 expertos/capa, Engram IQ4_NL y DSpark Q8_0 |
-| Contexto | **1.048.576 tokens** (KV FP4, 890 B/token), visión y herramientas |
-| Velocidad (uso real) | **~22-25 t/s** de media en sesiones de agente (2026-11-09: 25,1 t/s de media, mediana 24,8, rango 16,7-37,5; 09-10: 22,1 t/s ponderados) |
-| Con contexto largo | por encima de 500K sigue por encima de 20 t/s (sesión de 703K: 24,9 t/s, 872 llamadas a herramientas, 0 errores) |
-| Lectura del prompt | 257 t/s de media en sesiones largas; 340-470 t/s con conversaciones cortas |
-| Especulación | DSpark: ~2,7 tokens por ronda de verificación, ~124 ms por ronda |
-| Memoria | ~3.100 de 15.744 expertos residentes (20 %) cubren el 99,6 % de las peticiones; el carril de CPU sirve el 0,1-0,4 % |
+| Model | DeepSeek-V4.1-Flash-1017 **IQ2_XS** (ISTA-DASLab GSQ-RCO), 40 layers, 384 experts a layer, Engram IQ4_NL and the DSpark Q8_0 drafter |
+| Context | **1,048,576 tokens** (FP4 KV, 890 bytes a token), vision and tools |
+| Speed (real use) | **~22-25 tok/s** on average in agent sessions (2026-11-09: 25.1 tok/s mean, 24.8 median, 16.7-37.5 range; 2026-11-09/10: 22.1 tok/s token-weighted) |
+| Long context | still above 20 tok/s past 500K (a 703K session: 24.9 tok/s, 872 tool calls, 0 errors) |
+| Prompt reading | 257 tok/s on average in long sessions; 340-470 tok/s with short conversations |
+| Speculation | DSpark: ~2.7 tokens per verify round, ~124 ms a round |
+| Memory | ~3,100 of 15,744 routed experts resident (20 %) serve 99.6 % of the picks; the CPU lane serves 0.1-0.4 % |
 
-El modelo pesa unos 143 GB de expertos más 111 GB de Engram: no cabe en 64 GB. Funciona porque solo una parte de los
-expertos se queda en memoria y los demás se **sustituyen con una penalización medida** (o se leen del SSD sin pasar
-por la caché de páginas). Con la ruta exacta, sin sustituciones, va a ~6 t/s; la producción (perfil H4d) va a ~25.
+The model is about 143 GB of experts plus a 111 GB Engram table, so it does not fit in 64 GB. It runs because only part
+of the experts stays in memory: a missing one is **substituted under a measured penalty**, or read from the SSD
+without going through the page cache. The exact route (no substitutions) runs at ~6 tok/s; production (the H4d
+profile) at ~25.
 
-## Qué añade ds-wormhole al motor `strata-dsv41`
+## What ds-wormhole adds to the `strata-dsv41` engine
 
-Todo es opcional y se activa por variable de entorno; los valores de producción están en
+Everything is opt-in through environment variables; the production values are in
 [`configs/ds-wormhole/strata-v41-iq2xs-1m-h4d.example.json`](configs/ds-wormhole/strata-v41-iq2xs-1m-h4d.example.json).
 
-**Memoria unificada (Strix Halo)**
-- Almacén de expertos en memoria pinned leída por la GPU en su sitio (`DS4_STORE_GPU`, `DS4_STORE_PINNED`,
-  `DS4_STORE_ZC_FRAC`, `DS4_STORE_MAPREAD`), huecos de expertos en host (`DS4_SLOTS_HOST`).
-- El «switch» de memoria: el almacén presta sus huecos al prompt (`DS4_STORE_LEND`) y el scratch grande del trozo vive
-  en una región pinned prestada (`DS4_CHUNK_LEND`, ~1,5 GB).
-- Tabla de embeddings leída del mapeo del modelo, sin copia BF16 (`DS4_EMBED_MAP`, −1,3 GB).
+**Unified memory (Strix Halo)**
+- An expert store in pinned memory that the GPU reads in place (`DS4_STORE_GPU`, `DS4_STORE_PINNED`,
+  `DS4_STORE_ZC_FRAC`, `DS4_STORE_MAPREAD`), expert slots in host memory (`DS4_SLOTS_HOST`).
+- The memory "switch": the store lends its slots to the prompt read (`DS4_STORE_LEND`), and a chunk's big scratch lives
+  in a lent pinned region (`DS4_CHUNK_LEND`, ~1.5 GB).
+- The embedding table read from the model's mapping, with no BF16 copy (`DS4_EMBED_MAP`, −1.3 GB).
 
-**Calidad con expertos ausentes**
-- Penalización de fallos en el router, por capas (`DS4_ROUTE_MISS_PENALTY`, `DS4_ROUTE_PEN_LAYERS`), también en la
-  lectura del prompt (`DS4_FLOW_PEN_MAX`, `DS4_PICK_MIN`).
-- Rechequeo de casi-empates con la ruta exacta y la regla especulativa (`DS4_TIE_LOG`, `DS4_TIE_RECHECK`, `DS4_TIE_MID`
-  para empates dentro de una palabra), con contadores de muestras de la cola.
-- Trie de nombres de herramienta: el nombre de una llamada solo puede ser uno de los declarados (`DS4_TOOL_TRIE`).
+**Quality with missing experts**
+- A miss penalty in the router, per layer (`DS4_ROUTE_MISS_PENALTY`, `DS4_ROUTE_PEN_LAYERS`), also while reading the
+  prompt (`DS4_FLOW_PEN_MAX`, `DS4_PICK_MIN`).
+- Near ties rechecked with the exact route under the speculative rule (`DS4_TIE_LOG`, `DS4_TIE_RECHECK`, and
+  `DS4_TIE_MID` for ties inside a word), with counters for draws from the tail.
+- A tool-name trie: a call's name can only be one of the declared tools (`DS4_TOOL_TRIE`).
 
-**Velocidad**
-- Elección de cuántos borradores verificar por coste medido de la ronda (`DS4_SPEC_COST`, `DS4_ROUND_LOG`).
-- GEMV densas Q5_K con las sumas de activación una vez por bloque en LDS (`DS4_MV_SUMS`, ~10 % menos por ronda,
-  resultados idénticos byte a byte).
-- Lookahead del router para cualquier formato de experto (`DS4_AHEAD_ANYFMT`), YOCO acotado (`DS4_YOCO`).
+**Speed**
+- How many drafts to verify, chosen from the measured cost of a round (`DS4_SPEC_COST`, `DS4_ROUND_LOG`).
+- Dense Q5_K GEMVs with the activation sums computed once a block in LDS (`DS4_MV_SUMS`: ~10 % less a round,
+  byte-identical results).
+- Router lookahead for any expert format (`DS4_AHEAD_ANYFMT`), bounded YOCO (`DS4_YOCO`).
 
-**Servidor y clientes**
-- Conversaciones aparcadas en disco, también con imágenes (`STRATA_DS4_SLOT_PICS`): vuelven en ~1 s sin recodificar.
-- Penalizaciones de repetición/frecuencia/presencia con la semántica de llama.cpp.
-- La web de llama.cpp (b12032) como interfaz, con herramientas (`web_search`, `fetch_url`, ficheros), MCP, adjuntos e
-  imágenes: [`docs/DS_WORMHOLE_WEB.md`](docs/DS_WORMHOLE_WEB.md).
-- Llamadas DSML leídas como las lee `deepseek-recipe`; API OpenAI y Anthropic (Claude Code).
-- Parámetros para los clientes (el muestreo es del cliente, no del servidor):
-  [`docs/DS_WORMHOLE_CLIENTES.md`](docs/DS_WORMHOLE_CLIENTES.md).
+**Server and clients**
+- Conversations parked on disk, pictures included (`STRATA_DS4_SLOT_PICS`): they come back in ~1 s without encoding the
+  images again.
+- Repetition / frequency / presence penalties with llama.cpp's semantics.
+- llama.cpp's web UI (b12032) as the chat page, with tools (`web_search`, `fetch_url`, files), MCP, attachments and
+  images: [`docs/DS_WORMHOLE_WEB.md`](docs/DS_WORMHOLE_WEB.md).
+- DSML tool calls read the way `deepseek-recipe` reads them; OpenAI and Anthropic APIs (Claude Code works).
+- Client parameters (sampling belongs to the client, not the server):
+  [`docs/DS_WORMHOLE_CLIENTES.md`](docs/DS_WORMHOLE_CLIENTES.md) (in Spanish).
 
-## Requisitos y compilación
+## Requirements and build
 
-- Linux (probado en Ubuntu 26.04, kernel 7.0), ROCm 7.2.4, CMake + Ninja.
-- BIOS con el carve-out de la iGPU al mínimo (UMA 2 GB) y GTT grande por el arranque del kernel:
-  `amdgpu.gttsize=57344 ttm.pages_limit=14680064 amdgpu.vm_fragment_size=9 iommu=pt`. **No** desactivar CWSR
-  (`amdgpu.cwsr_enable=0` provoca reinicios de la GPU). THP sin defrag síncrono.
-- Unos 300 GB de disco para el modelo, el Engram, el borrador y la visión.
+- Linux (tested on Ubuntu 26.04, kernel 7.0), ROCm 7.2.4, CMake and Ninja.
+- BIOS with the iGPU carve-out at its minimum (UMA 2 GB) and a large GTT on the kernel command line:
+  `amdgpu.gttsize=57344 ttm.pages_limit=14680064 amdgpu.vm_fragment_size=9 iommu=pt`. Do **not** turn CWSR off
+  (`amdgpu.cwsr_enable=0` causes GPU resets). Transparent huge pages without synchronous defrag.
+- About 300 GB of disk for the model, the Engram table, the drafter and the vision tower.
 
 ```bash
 cmake -S . -B build-dsv41-hip -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_HIP=ON -DSTRATA_ENABLE_CUDA=OFF \
@@ -73,24 +77,23 @@ cmake -S . -B build-dsv41-hip -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABL
 cmake --build build-dsv41-hip --target strata-dsv41 -j12
 ```
 
-Arranque (servidor Python de Strata con el perfil de ejemplo, rellenando `<STRATA>`, `<MODELS>` y `<DATA>`):
+Start it (Strata's Python server with the example profile, after filling in `<STRATA>`, `<MODELS>` and `<DATA>`):
 
 ```bash
 .venv/bin/python serve/server.py --engine strata --config strata-v41-iq2xs-1m-h4d.json --host 0.0.0.0 --port 8080
 ```
 
-Pararlo con SIGTERM para que guarde la conversación en curso.
+Stop it with SIGTERM so it saves the conversation in progress.
 
-## Qwen en Strix Halo
+## Qwen on Strix Halo
 
-La rama también lleva el port de los motores de Qwen a `gfx1151` hecho antes (octubre de 2026): expertos MXFP4,
-arena de memoria unificada, MTP nativo Q4_0/Q8_0, visión en HIP, aparcado de conversaciones en disco
-(`--conversation-disk-dir`) y el motor `strata-q36` con atención WMMA de prompt, KV int8, YaRN y los 27B densos.
-Son los commits `local:` del historial; [`docs/STRIX_HALO.md`](docs/STRIX_HALO.md) es la guía de upstream para esta
-máquina.
+The branch also carries the earlier port of the Qwen engines to `gfx1151` (October 2026): MXFP4 experts, a unified-memory
+arena, native Q4_0/Q8_0 MTP, HIP vision, conversations parked on disk (`--conversation-disk-dir`) and the `strata-q36`
+engine with WMMA prompt attention, int8 KV, YaRN and the dense 27B models. Those are the `local:` commits in the
+history; [`docs/STRIX_HALO.md`](docs/STRIX_HALO.md) is upstream's guide for this machine.
 
-## Estado
+## Status
 
-Trabajo en curso. Los cambios se miden con baterías de tareas reales (velocidad, validez y erratas), no con
-benchmarks cortos, y no se recuantiza para ganar velocidad. Las mejoras de upstream posteriores a v0.2.9 se traen por
-cherry-pick en ramas aparte (`ds-wormhole-up`).
+Work in progress. Changes are measured with batteries of real tasks (speed, validity and typos), not short
+benchmarks, and nothing is requantized to gain speed. Upstream improvements after v0.2.9 come in by cherry-pick on
+separate branches (`ds-wormhole-up`).
