@@ -43,16 +43,15 @@ sobre todo pensar.
 - El servidor reutiliza el prefijo de la conversación (99,9 % en sesiones reales). Para no perderlo: mandar el historial
   igual cada turno (sin reescribir mensajes anteriores) y con el razonamiento reenviado.
 - **Una conversación en RAM a la vez.** Otra petición (otro cliente, un título, un subagente) la aparca en disco y vuelve
-  en ~1 s, **salvo si tiene imágenes**: hoy una conversación con imágenes no se aparca y se relee entera (900K ≈ 50 min).
-  Hasta que entre `STRATA_DS4_SLOT_PICS` (escrito el 10-11, sin compilar), no intercalar peticiones con una conversación
-  con imágenes.
+  en ~1 s. **Desde el 10-11 también con imágenes** (`STRATA_DS4_SLOT_PICS=1`): vuelve con sus imágenes sin codificarlas otra
+  vez, siempre que sean las mismas imágenes en el mismo sitio.
 - Compactar: el resumen se pide con el mismo prefijo, así que sale barato (no se relee). La web solo compacta a mano.
 
 ## Herramientas
 
 - Se aceptan las del cliente (`tools`) y las que la conversación ya usó (aunque el turno no las declare).
 - Formas de llamada que lee el servidor: DSML de DeepSeek y, a veces, la de Qwen (`<function=…>`).
-- **`DS4_TOOL_TRIE`** (motor, escrito el 10-11, sin compilar, apagado): con él, el nombre de una llamada solo puede ser
+- **`DS4_TOOL_TRIE`** (motor, en producción desde el 10-11): con él, el nombre de una llamada solo puede ser
   uno de los declarados (evita «search_session_transracts», «Vibeccode»). No cambia ninguna salida válida ni necesita
   nada del cliente: el servidor manda la lista de nombres que ya conoce.
 - Tiempo de espera del cliente: largo. Claude Code usa `API_TIMEOUT_MS` (no `API_TIMEOUT`); un turno con mucho
