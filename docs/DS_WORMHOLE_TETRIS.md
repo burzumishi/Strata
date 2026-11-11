@@ -68,6 +68,47 @@ both: that comes from the headless capture, not from the games.)
 | Cost and privacy | 10 | 6 | local is free and nothing leaves the machine |
 | **Overall result quality** | **7** | **9** | |
 
+## Second round: the local model improves its own Tetris (v2)
+
+After the comparison, the same local model got one request, this time from the web page `strata-dsv41` serves (the
+llama.cpp UI), not from vibecode: *"look at ~/tetris_local.html, the visual quality is not very good, let's see if we can
+make it more attractive and sharper"* (in Spanish). Same P075a profile; temperature 1, top_k 64, min_p 0.066.
+
+| | Local v2 (improvement) |
+|---|---|
+| Duration | ~45 min wall (with a break: the PC went off halfway and the session went on with "continue please") |
+| Tokens written | 55,320 in 44 requests, **21.8 t/s**; context up to 75K |
+| Tool calls | 49, 0 failed (one read too large, repeated in ranges) |
+| How | read the whole game, listed seven problems (colours washed out by the light and no tone mapping, flat cubes, fixed camera, tiny preview, jumpy movement and a CSS bug of v1: `n-child` for `nth-child`), made a plan and applied it in 25 edits |
+| Checked its work | **yes, with its own eyes**: took screenshots with headless Chromium, looked at them through vision and recalibrated lights, exposure and saturation three times until they no longer looked washed out; also tried the mobile layout and removed its test files |
+| Typos | two in prose, one-offs: "Re reviso" and "Node/PPython"; one in code, `toneMappingExposure = 09`, which it fixed itself in the next edit. The final code has no typos and its JavaScript passes `node --check` |
+
+**Local v2** ([`tetris_local_v2.html`](ds-wormhole-tetris/tetris_local_v2.html)):
+
+![Local Tetris v2](ds-wormhole-tetris/local_v2.png)
+
+Dark board, saturated colours, rounded bevelled blocks with shadows, thin frame and grid, interpolated movement, framing
+that follows the window, a glass panel and a large preview. Still no line counter.
+
+| | Local v1 | **Local v2** | Cloud | Notes on v2 |
+|---|---|---|---|---|
+| Meets the prompt | 9 | 9 | 9 | |
+| Gameplay | 8 | 8 | 9 | the logic is unchanged: still no line count |
+| Graphics | 5 | **8** | 9 | fixed exactly what the cloud saw on its own (washed-out colours) and added bevels, shadows and framing; the cloud still has the background, particles and a solid frame |
+| Side panel | 7 | **8** | 9 | large, embossed preview; no lines |
+| Code | 7 | **8** | 8.5 | tone mapping, sRGB, bevelled geometry, interpolation, FOV framing; still one material per block |
+| Self-checking | 7 | **9** | 9 | screenshot → look → fix loop, like the cloud |
+| Text and typos | 8 | 7 | 10 | two one-offs in prose and one in code it fixed itself |
+| Speed | 2 | 2 | 10 | 21.8 t/s |
+| Cost and privacy | 10 | 10 | 6 | |
+| **Overall quality of the result** | **7** | **8** | **9** | |
+
+**What it adds:** the graphics gap of the first try was attention, not ability. Given a second request, the local model
+found on its own the same fault the cloud had fixed by itself (three.js r128's linear colours), fixed it by looking at its
+own screenshots and brought the game close to the cloud's. What the cloud does in one pass, the local model does in two.
+Typos still show up in the prose: "Re reviso" is the same class as "In Incluye" (a piece of a word followed by the whole
+word), and it is being fixed in the engine (`DS4_TIE_SPACE`).
+
 ## What it says
 
 - In logic and code the local model is close: a complete game, no visible bugs, every requirement met.

@@ -1,0 +1,1031 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tetris 3D</title>
+<style>
+  :root {
+    --bg: #05080d;
+    --bg-deep: #02050a;
+    --panel-bg: #08111d;
+    --card-bg: #0e1a2b;
+    --line: rgba(103, 232, 249, 0.16);
+    --line-strong: rgba(103, 232, 249, 0.32);
+    --text: #e8f3ff;
+    --muted: #8ba7c4;
+    --accent: #67e8f9;
+    --accent-2: #c084fc;
+    --accent-3: #fbbf24;
+    --shadow: rgba(0, 0, 0, 0.55);
+    --glow: rgba(103, 232, 249, 0.35);
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    height: 100%;
+    margin: 0;
+    overflow: hidden;
+    background:
+      radial-gradient(ellipse at 50% 18%, #10233d 0%, #070d16 55%, #03060b 100%);
+    color: var(--text);
+    font-family: "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+  #app {
+    display: flex;
+    height: 100%;
+    min-height: 100vh;
+  }
+  #stage {
+    flex: 1 1 auto;
+    min-width: 0;
+    position: relative;
+    overflow: hidden;
+    background:
+      radial-gradient(ellipse at 50% 42%, #102b47 0%, #071220 48%, #03070d 100%);
+    isolation: isolate;
+  }
+  #stage::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    z-index: 0;
+    pointer-events: none;
+    background-image:
+      radial-gradient(circle at 50% 50%, rgba(103, 232, 249, 0.055) 0, transparent 55%),
+      linear-gradient(rgba(255, 255, 255, 0.025) 1px, transparent 1px);
+    background-size: 100% 100%, 100% 44px;
+    opacity: 0.55;
+  }
+  #stage::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    z-index: 2;
+    pointer-events: none;
+    background: radial-gradient(ellipse at center, transparent 52%, rgba(0, 0, 0, 0.62) 100%);
+  }
+  #stage canvas {
+    display: block;
+    width: 100%;
+    height: 100%;
+    position: relative;
+    z-index: 1;
+  }
+  #panel {
+    width: 350px;
+    flex: 0 0 350px;
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+    padding: 22px;
+    background:
+      radial-gradient(ellipse at 100% 0%, rgba(103, 232, 249, 0.10) 0, transparent 45%),
+      linear-gradient(180deg, #0c1a2b 0%, #060d17 100%);
+    border-left: 1px solid var(--line);
+    box-shadow: -18px 0 40px var(--shadow);
+    overflow-y: auto;
+  }
+  #panel header h1 {
+    margin: 0;
+    font-size: 21px;
+    font-weight: 800;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    background: linear-gradient(90deg, var(--accent) 0%, #a5f3fc 45%, var(--accent-2) 100%);
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+    filter: drop-shadow(0 0 14px rgba(103, 232, 249, 0.35));
+  }
+  #panel header p {
+    margin: 7px 0 0;
+    color: var(--muted);
+    font-size: 11.5px;
+    letter-spacing: 0.04em;
+  }
+  .card {
+    background:
+      linear-gradient(180deg, rgba(20, 34, 52, 0.82), rgba(7, 13, 22, 0.92));
+    border: 1px solid var(--line);
+    border-radius: 16px;
+    padding: 16px 18px;
+    box-shadow:
+      inset 0 1px 0 rgba(255, 255, 255, 0.07),
+      inset 0 0 24px rgba(103, 232, 249, 0.035),
+      0 12px 28px rgba(0, 0, 0, 0.22);
+  }
+  .label {
+    display: block;
+    font-size: 10.5px;
+    font-weight: 700;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    color: #9bb7d4;
+  }
+  .score-card {
+    display: flex;
+    gap: 10px;
+  }
+  .metric {
+    flex: 1;
+  }
+  .metric strong {
+    display: block;
+    margin-top: 7px;
+    font-size: 32px;
+    font-weight: 750;
+    line-height: 1;
+    font-variant-numeric: tabular-nums;
+    letter-spacing: 0.02em;
+    color: var(--accent);
+    text-shadow: 0 0 20px rgba(103, 232, 249, 0.35);
+  }
+  .metric:nth-child(2) strong {
+    color: var(--accent-2);
+    text-shadow: 0 0 20px rgba(192, 132, 252, 0.38);
+  }
+  #nextWrap {
+    height: 150px;
+    margin-top: 9px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    overflow: hidden;
+    border-radius: 12px;
+    border: 1px solid rgba(103, 232, 249, 0.14);
+    background:
+      radial-gradient(ellipse at 50% 45%, #16324f 0%, #0a1829 55%, #050d18 100%);
+    box-shadow: inset 0 0 28px rgba(103, 232, 249, 0.06);
+  }
+  #nextWrap canvas {
+    display: block;
+    width: 100%;
+    height: 100%;
+  }
+  .help-card ul {
+    list-style: none;
+    padding: 0;
+    margin: 10px 0 0;
+    display: grid;
+    gap: 8px;
+  }
+  .help-card li {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    font-size: 12.5px;
+    color: var(--text);
+  }
+  .help-card li span {
+    color: var(--muted);
+  }
+  kbd {
+    display: inline-block;
+    min-width: 30px;
+    padding: 3px 8px;
+    text-align: center;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 11.5px;
+    font-weight: 600;
+    color: #e8f7ff;
+    background: linear-gradient(180deg, #27405f 0%, #152539 100%);
+    border: 1px solid rgba(103, 232, 249, 0.28);
+    border-bottom-width: 2px;
+    border-radius: 7px;
+    box-shadow: 0 2px 0 rgba(0, 0, 0, 0.28), inset 0 1px rgba(255, 255, 255, 0.08);
+  }
+  .status {
+    margin-top: auto;
+    padding: 11px 14px;
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    background: rgba(10, 20, 32, 0.72);
+    color: var(--muted);
+    font-size: 12px;
+    font-weight: 600;
+    text-align: center;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    box-shadow: inset 0 1px rgba(255, 255, 255, 0.05);
+  }
+  .overlay {
+    position: absolute;
+    inset: 0;
+    z-index: 3;
+    display: grid;
+    place-items: center;
+    pointer-events: none;
+    background: rgba(3, 7, 14, 0.5);
+    backdrop-filter: blur(6px);
+    transition: opacity 0.22s ease, visibility 0.22s ease;
+  }
+  .overlay.hidden {
+    opacity: 0;
+    visibility: hidden;
+  }
+  .overlay-card {
+    padding: 26px 40px;
+    text-align: center;
+    background:
+      linear-gradient(180deg, rgba(20, 35, 54, 0.92), rgba(7, 13, 22, 0.94));
+    border: 1px solid rgba(103, 232, 249, 0.45);
+    border-radius: 18px;
+    box-shadow:
+      0 28px 70px rgba(0, 0, 0, 0.62),
+      0 0 48px rgba(103, 232, 249, 0.16),
+      inset 0 1px 0 rgba(255, 255, 255, 0.08);
+    backdrop-filter: blur(10px);
+  }
+  .overlay-card h2 {
+    margin: 0;
+    font-size: 26px;
+    font-weight: 800;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    background: linear-gradient(90deg, var(--accent) 0%, #dbeafe 50%, var(--accent-2) 100%);
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+    filter: drop-shadow(0 0 16px rgba(103, 232, 249, 0.35));
+  }
+  .overlay-card p {
+    margin: 12px 0 0;
+    color: #cfe6ff;
+    font-size: 14px;
+    letter-spacing: 0.02em;
+  }
+  @media (max-width: 860px) {
+    #app {
+      flex-direction: column;
+    }
+    #stage {
+      flex: 1 1 auto;
+      min-height: 0;
+    }
+    #panel {
+      width: 100%;
+      flex: 0 0 auto;
+      max-height: 42vh;
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+      border-left: 0;
+      border-top: 1px solid var(--line);
+      padding: 14px;
+    }
+    #panel header {
+      grid-column: 1 / -1;
+    }
+    #panel header h1 {
+      font-size: 18px;
+    }
+    #nextWrap {
+      height: 120px;
+    }
+    .status {
+      grid-column: 1 / -1;
+      margin-top: 0;
+    }
+  }
+</style>
+</head>
+<body>
+<div id="app">
+  <section id="stage" aria-label="Tablero de piezas del Tetris">
+    <div id="overlay" class="overlay">
+      <div class="overlay-card">
+        <h2 id="overlayTitle">Tetris 3D</h2>
+        <p id="overlayText">Pulsa Espacio para comenzar</p>
+      </div>
+    </div>
+  </section>
+
+  <aside id="panel" aria-label="Panel lateral de puntuación y controles">
+    <header>
+      <h1>Tetris 3D</h1>
+      <p>Hecho con DeepSeek V4.1-Flash local</p>
+    </header>
+
+    <section class="card score-card">
+      <div class="metric">
+        <span class="label">Puntuación</span>
+        <strong id="score">0</strong>
+      </div>
+      <div class="metric">
+        <span class="label">Nivel</span>
+        <strong id="level">1</strong>
+      </div>
+    </section>
+
+    <section class="card">
+      <span class="label">Próxima pieza</span>
+      <div id="nextWrap"></div>
+    </section>
+
+    <section class="card help-card">
+      <span class="label">Teclas</span>
+      <ul>
+        <li><kbd>←</kbd><kbd>→</kbd><span>mover</span></li>
+        <li><kbd>↑</kbd><span>rotar</span></li>
+        <li><kbd>↓</kbd><span>acelerar caída</span></li>
+        <li><kbd>Espacio</kbd><span>pausa / comenzar</span></li>
+      </ul>
+    </section>
+
+    <div id="status" class="status" role="status" aria-live="polite">Listo para comenzar</div>
+  </aside>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+(() => {
+  if (!window.THREE) {
+    document.getElementById("overlayTitle").textContent = "No se pudo cargar Three.js";
+    document.getElementById("overlayText").textContent = "Revisa la conexión al CDN de la librería";
+    return;
+  }
+
+  const THREE = window.THREE;
+  const stage = document.getElementById("stage");
+  const overlay = document.getElementById("overlay");
+  const overlayTitle = document.getElementById("overlayTitle");
+  const overlayText = document.getElementById("overlayText");
+  const scoreEl = document.getElementById("score");
+  const levelEl = document.getElementById("level");
+  const statusEl = document.getElementById("status");
+  const nextWrap = document.getElementById("nextWrap");
+
+  const W = 10;
+  const H = 20;
+  const COLORS = {
+    I: 0x00d5ff,
+    O: 0xffb703,
+    T: 0xa855f7,
+    S: 0x10b981,
+    Z: 0xef4444,
+    J: 0x2563eb,
+    L: 0xf97316
+  };
+  const SHAPES = {
+    I: [[0, 0], [1, 0], [2, 0], [3, 0]],
+    O: [[0, 0], [1, 0], [0, 1], [1, 1]],
+    T: [[0, 0], [1, 0], [2, 0], [1, 1]],
+    S: [[1, 0], [2, 0], [0, 1], [1, 1]],
+    Z: [[0, 0], [1, 0], [1, 1], [2, 1]],
+    J: [[0, 0], [0, 1], [0, 2], [1, 2]],
+    L: [[0, 0], [0, 1], [0, 2], [1, 0]]
+  };
+  const PIECE_TYPES = Object.keys(SHAPES);
+  const POINTS = [0, 100, 300, 600, 1200];
+
+  let board = Array.from({ length: H }, () => Array(W).fill(null));
+  let current = null;
+  let next = null;
+  let bag = [];
+  let score = 0;
+  let level = 1;
+  let lines = 0;
+  let mode = "idle";
+  let clearing = null;
+  let dropAcc = 0;
+  let fastDrop = false;
+  let lockedMeshes = [];
+  let previewHalfW = 1.25;
+  let previewHalfH = 0.65;
+
+  const scene = new THREE.Scene();
+  scene.background = null;
+  scene.fog = new THREE.Fog(0x071220, 45, 110);
+
+  const camera = new THREE.PerspectiveCamera(45, 1, 0.1, 200);
+  camera.position.set(0, 0, 40);
+  camera.lookAt(0, 0, 0);
+
+  function fitCamera() {
+    const w = stage.clientWidth;
+    const h = stage.clientHeight;
+    if (!w || !h) return;
+
+    const aspect = w / h;
+    camera.aspect = aspect;
+
+    const tanV = Math.tan((camera.fov * Math.PI / 180) / 2);
+    const tanH = tanV * aspect;
+    const halfW = (W + 1.6) / 2;
+    const halfH = (H + 1.6) / 2;
+    const radius = Math.hypot(halfW, halfH);
+
+    const distanceV = radius / Math.sin(Math.atan(tanV));
+    const distanceH = radius / Math.sin(Math.atan(tanH));
+    const distance = Math.max(distanceV, distanceH) * 1.04;
+
+    camera.position.set(distance * 0.16, distance * 0.09, distance);
+    camera.lookAt(0, 0, 0);
+    camera.near = Math.max(0.1, distance * 0.05);
+    camera.far = distance * 3;
+    camera.updateProjectionMatrix();
+  }
+
+  const renderer = new THREE.WebGLRenderer({
+    antialias: true,
+    alpha: true,
+    powerPreference: "high-performance"
+  });
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 3));
+  renderer.outputEncoding = THREE.LinearEncoding;
+  renderer.toneMapping = THREE.NoToneMapping;
+  renderer.toneMappingExposure = 1.0;
+  renderer.setClearColor(0x000000, 0);
+  renderer.shadowMap.enabled = true;
+  renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+  stage.appendChild(renderer.domElement);
+
+  scene.add(new THREE.HemisphereLight(0xa8e6ff, 0x0a1220, 0.3));
+
+  const keyLight = new THREE.DirectionalLight(0xfff4e6, 0.9);
+  keyLight.position.set(9, 16, 13);
+  keyLight.castShadow = true;
+  keyLight.shadow.mapSize.set(2048, 2048);
+  keyLight.shadow.camera.left = -14;
+  keyLight.shadow.camera.right = 14;
+  keyLight.shadow.camera.top = 16;
+  keyLight.shadow.camera.bottom = -16;
+  keyLight.shadow.camera.near = 1;
+  keyLight.shadow.camera.far = 60;
+  keyLight.shadow.bias = -0.0006;
+  keyLight.shadow.radius = 4;
+  scene.add(keyLight);
+
+  const fillLight = new THREE.DirectionalLight(0x6fb6ff, 0.32);
+  fillLight.position.set(-10, 6, 12);
+  scene.add(fillLight);
+
+  const rimLight = new THREE.PointLight(0xc084fc, 0.55, 34, 2);
+  rimLight.position.set(9, 5, 12);
+  scene.add(rimLight);
+
+  const boardBase = new THREE.Mesh(
+    new THREE.BoxGeometry(W + 0.6, H + 0.6, 0.6),
+    new THREE.MeshStandardMaterial({
+      color: 0x040b13,
+      roughness: 0.86,
+      metalness: 0.06,
+      emissive: 0x000000,
+      emissiveIntensity: 0
+    })
+  );
+  boardBase.position.set(0, 0, -0.35);
+  boardBase.receiveShadow = true;
+  scene.add(boardBase);
+
+  const gridPoints = [];
+  for (let x = -W / 2; x <= W / 2; x += 1) {
+    gridPoints.push(new THREE.Vector3(x, -H / 2, 0.02), new THREE.Vector3(x, H / 2, 0.02));
+  }
+  for (let y = -H / 2; y <= H / 2; y += 1) {
+    gridPoints.push(new THREE.Vector3(-W / 2, y, 0.02), new THREE.Vector3(W / 2, y, 0.02));
+  }
+  const grid = new THREE.LineSegments(
+    new THREE.BufferGeometry().setFromPoints(gridPoints),
+    new THREE.LineBasicMaterial({ color: 0x3a6f9f, transparent: true, opacity: 0.32 })
+  );
+  scene.add(grid);
+
+  const framePoints = [
+    new THREE.Vector3(-W / 2 - 0.2, -H / 2 - 0.2, 0.04),
+    new THREE.Vector3(W / 2 + 0.2, -H / 2 - 0.2, 0.04),
+    new THREE.Vector3(W / 2 + 0.2, -H / 2 - 0.2, 0.04),
+    new THREE.Vector3(W / 2 + 0.2, H / 2 + 0.2, 0.04),
+    new THREE.Vector3(W / 2 + 0.2, H / 2 + 0.2, 0.04),
+    new THREE.Vector3(-W / 2 - 0.2, H / 2 + 0.2, 0.04),
+    new THREE.Vector3(-W / 2 - 0.2, H / 2 + 0.2, 0.04),
+    new THREE.Vector3(-W / 2 - 0.2, -H / 2 - 0.2, 0.04)
+  ];
+  const frame = new THREE.LineSegments(
+    new THREE.BufferGeometry().setFromPoints(framePoints),
+    new THREE.LineBasicMaterial({ color: 0x67e8f9, transparent: true, opacity: 0.9 })
+  );
+  scene.add(frame);
+
+  function roundedBlockGeometry(size, depth, bevel, radius) {
+    const shape = new THREE.Shape();
+    const half = size / 2;
+    shape.moveTo(-half + radius, -half);
+    shape.lineTo(half - radius, -half);
+    shape.quadraticCurveTo(half, -half, half, -half + radius);
+    shape.lineTo(half, half - radius);
+    shape.quadraticCurveTo(half, half, half - radius, half);
+    shape.lineTo(-half + radius, half);
+    shape.quadraticCurveTo(-half, half, -half, half - radius);
+    shape.lineTo(-half, -half + radius);
+    shape.quadraticCurveTo(-half, -half, -half + radius, -half);
+
+    const geo = new THREE.ExtrudeGeometry(shape, {
+      depth,
+      bevelEnabled: true,
+      bevelThickness: bevel,
+      bevelSize: bevel,
+      bevelSegments: 3,
+      curveSegments: 6
+    });
+    geo.center();
+    geo.computeVertexNormals();
+    return geo;
+  }
+
+  const blockGeo = roundedBlockGeometry(0.64, 0.64, 0.07, 0.11);
+  const lockedGroup = new THREE.Group();
+  const pieceGroup = new THREE.Group();
+  const pieceTarget = new THREE.Vector3();
+  scene.add(lockedGroup, pieceGroup);
+
+  function clearGroup(group) {
+    while (group.children.length > 0) {
+      const child = group.children[0];
+      group.remove(child);
+      if (child.material) child.material.dispose();
+    }
+  }
+
+  function rebuildLocked() {
+    clearGroup(lockedGroup);
+    lockedMeshes = Array.from({ length: H }, () => Array(W).fill(null));
+
+    for (let r = 0; r < H; r += 1) {
+      for (let c = 0; c < W; c += 1) {
+        const color = board[r][c];
+        if (color === null) continue;
+
+        const material = new THREE.MeshStandardMaterial({
+          color,
+          roughness: 0.32,
+          metalness: 0.24,
+          emissive: color,
+          emissiveIntensity: 0.1
+        });
+        const mesh = new THREE.Mesh(blockGeo, material);
+        mesh.castShadow = true;
+        mesh.receiveShadow = true;
+        mesh.position.set(c - (W - 1) / 2, r - (H - 1) / 2, 0.45);
+        lockedGroup.add(mesh);
+        lockedMeshes[r][c] = mesh;
+      }
+    }
+  }
+
+  function makePiece(type) {
+    return {
+      type,
+      color: COLORS[type],
+      cells: SHAPES[type].map(([x, y]) => [x, y])
+    };
+  }
+
+  function drawType() {
+    if (bag.length === 0) {
+      bag = PIECE_TYPES.slice();
+      for (let i = bag.length - 1; i > 0; i -= 1) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [bag[i], bag[j]] = [bag[j], bag[i]];
+      }
+    }
+    return bag.pop();
+  }
+
+  function bounds(cells) {
+    const xs = cells.map(([x]) => x);
+    const ys = cells.map(([, y]) => y);
+    const minX = Math.min(...xs);
+    const maxX = Math.max(...xs);
+    const minY = Math.min(...ys);
+    const maxY = Math.max(...ys);
+    return {
+      minX,
+      maxX,
+      minY,
+      maxY,
+      width: maxX - minX + 1,
+      height: maxY - minY + 1
+    };
+  }
+
+  function collides(cells, x, y) {
+    for (const [cx, cy] of cells) {
+      const bx = x + cx;
+      const by = y + cy;
+      if (bx < 0 || bx >= W || by < 0 || by >= H) return true;
+      if (board[by][bx] !== null) return true;
+    }
+    return false;
+  }
+
+  function rotateCells(cells) {
+    const b = bounds(cells);
+    const pivotX = Math.floor((b.minX + b.maxX) / 2);
+    const pivotY = Math.floor((b.minY + b.maxY) / 2);
+
+    const rotated = cells.map(([x, y]) => {
+      const dx = x - pivotX;
+      const dy = y - pivotY;
+      return [pivotX - dy, pivotY + dx];
+    });
+
+    const rMinX = Math.min(...rotated.map(([x]) => x));
+    const rMinY = Math.min(...rotated.map(([, y]) => y));
+    return rotated.map(([x, y]) => [x - rMinX, y - rMinY]);
+  }
+
+  function renderPiece() {
+    clearGroup(pieceGroup);
+    if (!current) return;
+
+    for (const [cx, cy] of current.cells) {
+      const material = new THREE.MeshStandardMaterial({
+        color: current.color,
+        roughness: 0.28,
+        metalness: 0.3,
+        emissive: current.color,
+        emissiveIntensity: 0.12
+      });
+      const mesh = new THREE.Mesh(blockGeo, material);
+      mesh.castShadow = true;
+      mesh.receiveShadow = true;
+      mesh.position.set(cx, cy, 0.45);
+      pieceGroup.add(mesh);
+    }
+
+    syncPiecePosition();
+    pieceGroup.position.copy(pieceTarget);
+    pieceGroup.scale.setScalar(0.94);
+  }
+
+  function syncPiecePosition() {
+    if (!current) return;
+    pieceTarget.set(
+      current.x - (W - 1) / 2,
+      current.y - (H - 1) / 2,
+      0
+    );
+  }
+
+  function updatePreview(piece) {
+    clearGroup(previewGroup);
+    if (!piece) return;
+
+    const b = bounds(piece.cells);
+    const centerX = (b.minX + b.maxX) / 2;
+    const centerY = (b.minY + b.maxY) / 2;
+
+    for (const [x, y] of piece.cells) {
+      const material = new THREE.MeshStandardMaterial({
+        color: piece.color,
+        roughness: 0.28,
+        metalness: 0.3,
+        emissive: piece.color,
+        emissiveIntensity: 0.12
+      });
+      const mesh = new THREE.Mesh(previewGeo, material);
+      mesh.position.set((x - centerX) * 0.65, (y - centerY) * 0.65, 0);
+      previewGroup.add(mesh);
+    }
+
+    previewHalfW = ((b.width - 1) * 0.65 + 0.56) / 2;
+    previewHalfH = ((b.height - 1) * 0.65 + 0.56) / 2;
+    fitPreviewCamera(previewHalfW, previewHalfH);
+  }
+
+  function tryMove(dx, dy) {
+    if (!current || mode !== "playing" || clearing) return false;
+    if (!collides(current.cells, current.x + dx, current.y + dy)) {
+      current.x += dx;
+      current.y += dy;
+      syncPiecePosition();
+      return true;
+    }
+    return false;
+  }
+
+  function rotateCurrent() {
+    if (!current || mode !== "playing" || clearing) return;
+
+    const cells = rotateCells(current.cells);
+    const kicks = [
+      [0, 0], [-1, 0], [1, 0], [0, -1], [0, -2], [0, -3], [-1, -1], [1, -1]
+    ];
+
+    for (const [ox, oy] of kicks) {
+      if (!collides(cells, current.x + ox, current.y + oy)) {
+        current.cells = cells;
+        current.x += ox;
+        current.y += oy;
+        renderPiece();
+        return;
+      }
+    }
+  }
+
+  function spawnPiece() {
+    if (!next) next = makePiece(drawType());
+
+    current = next;
+    next = makePiece(drawType());
+
+    const b = bounds(current.cells);
+    current.x = Math.floor((W - b.width) / 2);
+    current.y = H - b.height;
+
+    if (collides(current.cells, current.x, current.y)) {
+      current = null;
+      clearGroup(pieceGroup);
+      updatePreview(next);
+      gameOver();
+      return;
+    }
+
+    renderPiece();
+    updatePreview(next);
+  }
+
+  function lockPiece() {
+    if (!current) return;
+
+    for (const [cx, cy] of current.cells) {
+      board[current.y + cy][current.x + cx] = current.color;
+    }
+
+    clearGroup(pieceGroup);
+    current = null;
+    rebuildLocked();
+
+    const fullRows = [];
+    for (let r = 0; r < H; r += 1) {
+      if (board[r].every((cell) => cell !== null)) fullRows.push(r);
+    }
+
+    if (fullRows.length > 0) {
+      clearing = { rows: fullRows, elapsed: 0 };
+      for (const r of fullRows) {
+        for (let c = 0; c < W; c += 1) {
+          const mesh = lockedMeshes[r][c];
+          if (mesh) {
+            mesh.material.emissive.setHex(0xffffff);
+            mesh.material.emissiveIntensity = 0.4;
+          }
+        }
+      }
+      return;
+    }
+
+    spawnPiece();
+  }
+
+  function finishClear() {
+    const clearedRows = clearing.rows;
+    const rowSet = new Set(clearedRows);
+    const nextBoard = [];
+
+    for (let r = 0; r < H; r += 1) {
+      if (!rowSet.has(r)) nextBoard.push(board[r]);
+    }
+    while (nextBoard.length < H) {
+      nextBoard.push(Array(W).fill(null));
+    }
+
+    board = nextBoard;
+
+    const count = clearedRows.length;
+    score += POINTS[count] * level;
+    lines += count;
+    level = 1 + Math.floor(lines / 10);
+    clearing = null;
+
+    updateUI();
+    setStatus("En juego");
+    rebuildLocked();
+    spawnPiece();
+  }
+
+  function updateUI() {
+    scoreEl.textContent = score;
+    levelEl.textContent = level;
+  }
+
+  function setStatus(text) {
+    statusEl.textContent = text;
+  }
+
+  function showOverlay(title, text) {
+    overlayTitle.textContent = title;
+    overlayText.textContent = text;
+    overlay.classList.remove("hidden");
+  }
+
+  function hideOverlay() {
+    overlay.classList.add("hidden");
+  }
+
+  function gameOver() {
+    mode = "over";
+    setStatus("Partida terminada");
+    showOverlay("Partida terminada", "Pulsa Espacio para reiniciar");
+  }
+
+  function startGame() {
+    bag = [];
+    board = Array.from({ length: H }, () => Array(W).fill(null));
+    current = null;
+    next = makePiece(drawType());
+    score = 0;
+    level = 1;
+    lines = 0;
+    clearing = null;
+    dropAcc = 0;
+    fastDrop = false;
+
+    clearGroup(pieceGroup);
+    rebuildLocked();
+    updatePreview(next);
+    updateUI();
+
+    mode = "playing";
+    hideOverlay();
+    setStatus("En juego");
+    spawnPiece();
+  }
+
+  function togglePause() {
+    if (mode === "idle" || mode === "over") {
+      startGame();
+    } else if (mode === "playing") {
+      mode = "paused";
+      setStatus("Pausa");
+      showOverlay("PAUSA", "Espacio para continuar");
+    } else if (mode === "paused") {
+      mode = "playing";
+      setStatus("En juego");
+      hideOverlay();
+    }
+  }
+
+  function updateGame(dt) {
+    if (mode !== "playing") return;
+
+    if (clearing) {
+      clearing.elapsed += dt * 1000;
+      const pulse = 0.5 + 0.5 * Math.sin(clearing.elapsed * 0.018);
+
+      for (const r of clearing.rows) {
+        for (let c = 0; c < W; c += 1) {
+          const mesh = lockedMeshes[r][c];
+          if (mesh) {
+            mesh.material.emissive.setHex(0xffffff);
+            mesh.material.emissiveIntensity = 0.25 + pulse * 1.3;
+          }
+        }
+      }
+
+      if (clearing.elapsed >= 650) finishClear();
+      return;
+    }
+
+    if (!current) return;
+
+    dropAcc += dt * 1000;
+    const interval = fastDrop ? 65 : Math.max(120, 650 - (level - 1) * 55);
+
+    if (dropAcc >= interval) {
+      dropAcc = 0;
+      if (!tryMove(0, -1)) lockPiece();
+    }
+  }
+
+  const previewScene = new THREE.Scene();
+  previewScene.add(new THREE.HemisphereLight(0xa8e6ff, 0x07101b, 0.3));
+
+  const previewKey = new THREE.DirectionalLight(0xfff4e6, 0.9);
+  previewKey.position.set(4, 5, 6);
+  previewScene.add(previewKey);
+
+  const previewRim = new THREE.PointLight(0xc084fc, 0.45, 16, 2);
+  previewRim.position.set(-4, 3, 6);
+  previewScene.add(previewRim);
+
+  const previewCamera = new THREE.PerspectiveCamera(45, 1, 0.1, 100);
+  previewCamera.position.set(0, 0, 2.4);
+  previewCamera.lookAt(0, 0, 0);
+
+  function fitPreviewCamera(halfW, halfH) {
+    const w = nextWrap.clientWidth;
+    const h = nextWrap.clientHeight;
+    if (!w || !h) return;
+
+    const aspect = w / h;
+    previewCamera.aspect = aspect;
+
+    const tanV = Math.tan((previewCamera.fov * Math.PI / 180) / 2);
+    const tanH = tanV * aspect;
+    const distanceV = halfH / Math.sin(Math.atan(tanV));
+    const distanceH = halfW / Math.sin(Math.atan(tanH));
+    const distance = Math.max(distanceV, distanceH) * 1.12;
+
+    previewCamera.position.set(0, 0, distance);
+    previewCamera.lookAt(0, 0, 0);
+    previewCamera.near = Math.max(0.05, distance * 0.05);
+    previewCamera.far = distance * 3;
+    previewCamera.updateProjectionMatrix();
+  }
+
+  const previewGroup = new THREE.Group();
+  previewScene.add(previewGroup);
+
+  const previewGeo = roundedBlockGeometry(0.46, 0.46, 0.05, 0.09);
+  const previewRenderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+  previewRenderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 3));
+  previewRenderer.outputEncoding = THREE.LinearEncoding;
+  previewRenderer.toneMapping = THREE.NoToneMapping;
+  previewRenderer.toneMappingExposure = 1.0;
+  previewRenderer.setClearColor(0x000000, 0);
+  nextWrap.appendChild(previewRenderer.domElement);
+
+  function resize() {
+    const w = stage.clientWidth;
+    const h = stage.clientHeight;
+    if (!w || !h) return;
+    renderer.setSize(w, h, false);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 3));
+    fitCamera();
+  }
+
+  function resizePreview() {
+    const w = nextWrap.clientWidth;
+    const h = nextWrap.clientHeight;
+    if (!w || !h) return;
+    previewRenderer.setSize(w, h, false);
+    previewRenderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 3));
+    fitPreviewCamera(previewHalfW, previewHalfH);
+  }
+
+  window.addEventListener("resize", () => {
+    resize();
+    resizePreview();
+  });
+
+  window.addEventListener("keydown", (event) => {
+    const code = event.code;
+
+    if (code === "Space") {
+      event.preventDefault();
+      if (!event.repeat) togglePause();
+      return;
+    }
+
+    if (code === "ArrowLeft" || code === "ArrowRight" || code === "ArrowUp" || code === "ArrowDown") {
+      event.preventDefault();
+      if (mode !== "playing" || clearing || !current) return;
+
+      if (code === "ArrowLeft") {
+        tryMove(-1, 0);
+      } else if (code === "ArrowRight") {
+        tryMove(1, 0);
+      } else if (code === "ArrowUp") {
+        rotateCurrent();
+      } else if (code === "ArrowDown") {
+        fastDrop = true;
+        if (!tryMove(0, -1)) lockPiece();
+      }
+    }
+  });
+
+  window.addEventListener("keyup", (event) => {
+    if (event.code === "ArrowDown") fastDrop = false;
+  });
+
+  const clock = new THREE.Clock();
+  renderer.setAnimationLoop(() => {
+    const dt = Math.min(clock.getDelta(), 0.05);
+    updateGame(dt);
+
+    if (current && mode === "playing" && !clearing) {
+      pieceGroup.position.lerp(pieceTarget, Math.min(1, dt * 24));
+      const grow = Math.min(1, dt * 10);
+      const scale = pieceGroup.scale.x;
+      pieceGroup.scale.setScalar(scale + (1 - scale) * grow);
+    }
+
+    renderer.render(scene, camera);
+    previewRenderer.render(previewScene, previewCamera);
+  });
+
+  resize();
+  resizePreview();
+  rebuildLocked();
+  updateUI();
+
+  next = makePiece(drawType());
+  updatePreview(next);
+})();
+</script>
+</body>
+</html>

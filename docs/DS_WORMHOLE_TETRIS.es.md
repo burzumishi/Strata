@@ -65,6 +65,47 @@ inicio se ve medio transparente durante la partida en los dos: viene de la captu
 | Coste y privacidad | 10 | 6 | el local es gratis y nada sale de la máquina |
 | **Calidad global del resultado** | **7** | **9** | |
 
+## Segunda vuelta: el modelo local mejora su propio Tetris (v2)
+
+Después de la comparación, el mismo modelo local recibió una sola petición, esta vez desde la web que sirve `strata-dsv41`
+(la UI de llama.cpp), no desde vibecode: *«revisa el fichero ~/tetris_local.html la calidad visual no es muy buena a ver
+si podemos hacerlo más atractivo y con mejor definición»*. Mismo perfil P075a; temperatura 1, top_k 64, min_p 0,066.
+
+| | Local v2 (mejora) |
+|---|---|
+| Duración | ~45 min de pared (con un corte: el PC se apagó a mitad y la sesión siguió con «continua por favor») |
+| Tokens escritos | 55.320 en 44 peticiones, **21,8 t/s**; contexto hasta 75K |
+| Llamadas a herramientas | 49, 0 fallidas (una lectura demasiado grande que repitió por tramos) |
+| Cómo lo hizo | leyó el juego entero, listó siete problemas (colores lavados por la luz y sin *tone mapping*, cubos planos, cámara fija, vista previa diminuta, movimiento a saltos y un error de CSS del v1: `n-child` por `nth-child`), hizo un plan y lo aplicó en 25 ediciones |
+| Comprobó su trabajo | **sí, con sus propios ojos**: sacó capturas con Chromium sin interfaz, las miró con visión y recalibró luces, exposición y saturación tres veces hasta que dejaron de verse lavadas; probó también la vista móvil y borró sus ficheros de prueba |
+| Erratas | dos en prosa, sueltas: «Re reviso» y «Node/PPython»; una en el código, `toneMappingExposure = 09`, que corrigió él mismo en la edición siguiente. El código final no tiene erratas y su JavaScript pasa `node --check` |
+
+**Local v2** ([`tetris_local_v2.html`](ds-wormhole-tetris/tetris_local_v2.html)):
+
+![Tetris local v2](ds-wormhole-tetris/local_v2.png)
+
+Tablero oscuro, colores saturados, bloques redondeados con bisel y sombras, marco y rejilla finos, movimiento interpolado,
+encuadre que se adapta a la ventana, panel de cristal y una vista previa grande. Sigue sin contador de líneas.
+
+| | Local v1 | **Local v2** | Nube | Notas sobre el v2 |
+|---|---|---|---|---|
+| Cumple el prompt | 9 | 9 | 9 | |
+| Jugabilidad | 8 | 8 | 9 | la lógica no cambia: sigue sin contar líneas |
+| Gráficos | 5 | **8** | 9 | arregló justo lo que la nube vio sola (colores lavados) y añadió bisel, sombras y encuadre; a la nube le quedan el fondo, las partículas y el marco con volumen |
+| Panel lateral | 7 | **8** | 9 | vista previa grande y con relieve; sin líneas |
+| Código | 7 | **8** | 8,5 | *tone mapping*, sRGB, geometría con bisel, interpolación, encuadre por FOV; sigue creando un material por bloque |
+| Autocomprobación | 7 | **9** | 9 | ciclo captura → mirar → corregir, como la nube |
+| Texto y erratas | 8 | 7 | 10 | dos sueltas en prosa y una en el código que corrigió él mismo |
+| Velocidad | 2 | 2 | 10 | 21,8 t/s |
+| Coste y privacidad | 10 | 10 | 6 | |
+| **Calidad global del resultado** | **7** | **8** | **9** | |
+
+**Lo que añade:** la distancia gráfica del primer intento era de atención, no de capacidad. Con una segunda petición, el
+modelo local encontró por sí mismo el mismo fallo que la nube había corregido sola (los colores lineales de three.js
+r128), lo arregló mirando sus propias capturas y llevó el juego cerca del de la nube. Lo que la nube hace en una pasada,
+el local lo hace en dos. Las erratas siguen apareciendo en el texto: «Re reviso» es la misma clase que «In Incluye»
+(un trozo de palabra seguido de la palabra entera), y se está corrigiendo en el motor (`DS4_TIE_SPACE`).
+
 ## Lo que dice
 
 - En lógica y código el modelo local está cerca: un juego completo, sin errores visibles y con todo lo pedido.
