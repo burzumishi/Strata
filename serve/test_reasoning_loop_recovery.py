@@ -169,14 +169,17 @@ class ReasoningLoopRecovery(unittest.TestCase):
         self.assertEqual(len(engine.calls), 1)
         self.assertEqual(events[-1][1]['reasoning_recoveries'], 0)
 
-    def test_missing_native_high_hint_skips_recovery(self):
-        engine = RecordingEngine(self.tok, [self.loop])
+    def test_missing_native_high_hint_wraps_up_the_thinking(self):
+        # ds-wormhole 2026-11-11: with no effort sentence to swap (DeepSeek's template, or pictures) the loop is no
+        # longer left running: the thinking is closed with the budget's wrap-up and the model answers
+        engine = RecordingEngine(self.tok, [self.loop, 'The answer.'])
         service = Service(engine, self.tok, None)
         service.answer_room = False      # these cases test the loop guards at the cap itself
         service.reasoning_loop_recovery = True
         ids = self.tok.encode('<|im_start|>user\nTask<|im_end|>\n', parse_special=True)
         events = list(service.run(ids, True, [], 40000, {}, threading.Event()))
-        self.assertEqual(len(engine.calls), 1)
+        self.assertEqual(len(engine.calls), 2)
+        self.assertIn('time to give my answer', self.tok.decode(engine.calls[1][0]))
         self.assertEqual(events[-1][1]['reasoning_recoveries'], 0)
 
     def test_cancel_during_reasoning_does_not_start_recovery(self):

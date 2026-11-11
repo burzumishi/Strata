@@ -5702,6 +5702,7 @@ class Service:
         timings, before = None, None                    # this request's timings; the engine's `last` before it
         recovery_count, reasoning_text, repeat_coverage = 0, "", 0.0
         looped, next_loop_check = False, LOOP_CHECK_EVERY       # #728: reasoning that repeats whole passages
+        loop_wrap = False                                       # (the loop closed by the wrap-up, below)
         raw_ids = []                                    # every generated id (STRATA_DEBUG: dump raw model text)
         emb, self.embeddings.path = getattr(self.embeddings, "path", None), None   # this run's to delete now
         img_keys, self.embeddings.keys = getattr(self.embeddings, "keys", None), None
@@ -5911,6 +5912,14 @@ class Service:
                                             recover_prompt = focused_recovery_prompt(self.tok, ids, raw_ids)
                                             if recover_prompt is not None:
                                                 break
+                                        # (ds-wormhole 2026-11-11: the low-effort swap needs Qwen's "<|im_start|>system"
+                                        # sentence, so with DeepSeek - or with pictures - "recover" never fired and a
+                                        # thinking loop ran 64K tokens until the client hung up.  Where it cannot swap,
+                                        # close the thinking as the budget does and let the model answer.)
+                                        if parser.clean:
+                                            loop_wrap = True
+                                            wrap = True
+                                            break
                                 if (getattr(self, "end_reasoning_now", False) and parser.state == "reasoning" and parser.clean
                                         and not detok.pending()):
                                     self.end_reasoning_now = False   # the web UI's "skip thinking": wrap up and answer now
@@ -6039,7 +6048,11 @@ class Service:
                         extra = self.tok.encode(text, parse_special=True)
                         if max_new - n - len(extra) < 1:
                             break                       # no room left to answer: "length", as without a budget
-                        if wrap:
+                        if wrap and loop_wrap:
+                            print(f"[strata] the thinking repeated the same passages (coverage={repeat_coverage:.3f}) at "
+                                  f"{n} tokens: wrapping up the thinking (reasoning_loop_recovery)", flush=True)
+                            loop_wrap = False
+                        elif wrap:
                             print(f"[strata] thinking budget reached ({thought} tokens): wrapping up the thinking",
                                   flush=True)
                         for t in extra:
