@@ -1,0 +1,844 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tetris 3D</title>
+<style>
+  :root {
+    --bg: #05080f;
+    --panel-bg: #0b1220;
+    --card-bg: #111a2b;
+    --line: #24344d;
+    --text: #e8f2ff;
+    --muted: #8fa6c4;
+    --accent: #66d9ff;
+    --accent-2: #b44cff;
+    --shadow: rgba(0, 0, 0, 0.45);
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    height: 100%;
+    margin: 0;
+    overflow: hidden;
+    background: radial-gradient(circle at 20% 20%, #0b1730 0, #05080f 65%);
+    color: var(--text);
+    font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+  }
+  #app {
+    display: flex;
+    height: 100%;
+    min-height: 100vh;
+  }
+  #stage {
+    flex: 1 1 auto;
+    min-width: 0;
+    position: relative;
+    background: radial-gradient(circle at 50% 45%, #0d1a31 0, #05080f 70%);
+  }
+  #stage canvas {
+    display: block;
+    width: 100%;
+    height: 100%;
+  }
+  #panel {
+    width: 360px;
+    flex: 0 0 360px;
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+    padding: 24px;
+    background: linear-gradient(180deg, #0d1626 0, #07101d 100%);
+    border-left: 1px solid var(--line);
+    box-shadow: -18px 0 36px var(--shadow);
+    overflow-y: auto;
+  }
+  #panel header h1 {
+    margin: 0;
+    font-size: 20px;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--accent);
+  }
+  #panel header p {
+    margin: 6px 0 0;
+    color: var(--muted);
+    font-size: 12px;
+  }
+  .card {
+    background: linear-gradient(180deg, rgba(18, 27, 45, 0.9), rgba(9, 14, 24, 0.92));
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    padding: 14px 16px;
+    box-shadow: inset 0 1px rgba(255, 255, 255, 0.04);
+  }
+  .label {
+    display: block;
+    font-size: 11px;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+    color: var(--muted);
+  }
+  .score-card {
+    display: flex;
+    gap: 10px;
+  }
+  .metric {
+    flex: 1;
+  }
+  .metric strong {
+    display: block;
+    margin-top: 6px;
+    font-size: 30px;
+    line-height: 1;
+    font-variant-numeric: tabular-nums;
+    color: var(--accent);
+  }
+  .metric:n-child(2) strong {
+    color: var(--accent-2);
+  }
+  #nextWrap {
+    height: 140px;
+    margin-top: 8px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    overflow: hidden;
+    border-radius: 10px;
+    background: radial-gradient(circle at 50% 50%, #12253d 0, #07101b 80%);
+  }
+  #nextWrap canvas {
+    display: block;
+    width: 100%;
+    height: 100%;
+  }
+  .help-card ul {
+    list-style: none;
+    padding: 0;
+    margin: 10px 0 0;
+    display: grid;
+    gap: 8px;
+  }
+  .help-card li {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 13px;
+    color: var(--text);
+  }
+  .help-card li span {
+    color: var(--muted);
+  }
+  kbd {
+    display: inline-block;
+    min-width: 28px;
+    padding: 3px 7px;
+    text-align: center;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 12px;
+    color: #d8ecff;
+    background: #1a2a44;
+    border: 1px solid #324a6b;
+    border-bottom-width: 2px;
+    border-radius: 6px;
+  }
+  .status {
+    margin-top: auto;
+    padding: 10px 12px;
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    color: var(--muted);
+    font-size: 12px;
+    text-align: center;
+    letter-spacing: 0.06em;
+  }
+  .overlay {
+    position: absolute;
+    inset: 0;
+    z-index: 2;
+    display: grid;
+    place-items: center;
+    pointer-events: none;
+    background: rgba(5, 8, 15, 0.36);
+    backdrop-filter: blur(3px);
+    transition: opacity 0.2s ease, visibility 0.2s ease;
+  }
+  .overlay.hidden {
+    opacity: 0;
+    visibility: hidden;
+  }
+  .overlay-card {
+    padding: 24px 36px;
+    text-align: center;
+    background: rgba(10, 18, 32, 0.88);
+    border: 1px solid rgba(102, 217, 255, 0.45);
+    border-radius: 16px;
+    box-shadow: 0 24px 60px rgba(0, 0, 0, 0.55);
+  }
+  .overlay-card h2 {
+    margin: 0;
+    font-size: 24px;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--accent);
+  }
+  .overlay-card p {
+    margin: 10px 0 0;
+    color: var(--text);
+    font-size: 14px;
+  }
+  @media (max-width: 860px) {
+    #app {
+      flex-direction: column;
+    }
+    #stage {
+      flex: 1 1 auto;
+      min-height: 0;
+    }
+    #panel {
+      width: 100%;
+      flex: 0 0 auto;
+      max-height: 42vh;
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+      border-left: 0;
+      border-top: 1px solid var(--line);
+      padding: 14px;
+    }
+    #panel header {
+      grid-column: 1 / -1;
+    }
+    #panel header h1 {
+      font-size: 16px;
+    }
+    #nextWrap {
+      height: 110px;
+    }
+    .status {
+      grid-column: 1 / -1;
+      margin-top: 0;
+    }
+  }
+</style>
+</head>
+<body>
+<div id="app">
+  <section id="stage" aria-label="Tablero de piezas del Tetris">
+    <div id="overlay" class="overlay">
+      <div class="overlay-card">
+        <h2 id="overlayTitle">Tetris 3D</h2>
+        <p id="overlayText">Pulsa Espacio para comenzar</p>
+      </div>
+    </div>
+  </section>
+
+  <aside id="panel" aria-label="Panel lateral de puntuación y controles">
+    <header>
+      <h1>Tetris 3D</h1>
+      <p>Hecho con DeepSeek V4.1-Flash local</p>
+    </header>
+
+    <section class="card score-card">
+      <div class="metric">
+        <span class="label">Puntuación</span>
+        <strong id="score">0</strong>
+      </div>
+      <div class="metric">
+        <span class="label">Nivel</span>
+        <strong id="level">1</strong>
+      </div>
+    </section>
+
+    <section class="card">
+      <span class="label">Próxima pieza</span>
+      <div id="nextWrap"></div>
+    </section>
+
+    <section class="card help-card">
+      <span class="label">Teclas</span>
+      <ul>
+        <li><kbd>←</kbd><kbd>→</kbd><span>mover</span></li>
+        <li><kbd>↑</kbd><span>rotar</span></li>
+        <li><kbd>↓</kbd><span>acelerar caída</span></li>
+        <li><kbd>Espacio</kbd><span>pausa / comenzar</span></li>
+      </ul>
+    </section>
+
+    <div id="status" class="status" role="status" aria-live="polite">Listo para comenzar</div>
+  </aside>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+(() => {
+  if (!window.THREE) {
+    document.getElementById("overlayTitle").textContent = "No se pudo cargar Three.js";
+    document.getElementById("overlayText").textContent = "Revisa la conexión al CDN de la librería";
+    return;
+  }
+
+  const THREE = window.THREE;
+  const stage = document.getElementById("stage");
+  const overlay = document.getElementById("overlay");
+  const overlayTitle = document.getElementById("overlayTitle");
+  const overlayText = document.getElementById("overlayText");
+  const scoreEl = document.getElementById("score");
+  const levelEl = document.getElementById("level");
+  const statusEl = document.getElementById("status");
+  const nextWrap = document.getElementById("nextWrap");
+
+  const W = 10;
+  const H = 20;
+  const COLORS = {
+    I: 0x00e5ff,
+    O: 0xffd23f,
+    T: 0xb44cff,
+    S: 0x34d399,
+    Z: 0xff4d6d,
+    J: 0x3b82f6,
+    L: 0xff9f1c
+  };
+  const SHAPES = {
+    I: [[0, 0], [1, 0], [2, 0], [3, 0]],
+    O: [[0, 0], [1, 0], [0, 1], [1, 1]],
+    T: [[0, 0], [1, 0], [2, 0], [1, 1]],
+    S: [[1, 0], [2, 0], [0, 1], [1, 1]],
+    Z: [[0, 0], [1, 0], [1, 1], [2, 1]],
+    J: [[0, 0], [0, 1], [0, 2], [1, 2]],
+    L: [[0, 0], [0, 1], [0, 2], [1, 0]]
+  };
+  const PIECE_TYPES = Object.keys(SHAPES);
+  const POINTS = [0, 100, 300, 600, 1200];
+
+  let board = Array.from({ length: H }, () => Array(W).fill(null));
+  let current = null;
+  let next = null;
+  let bag = [];
+  let score = 0;
+  let level = 1;
+  let lines = 0;
+  let mode = "idle";
+  let clearing = null;
+  let dropAcc = 0;
+  let fastDrop = false;
+  let lockedMeshes = [];
+
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x05080f);
+  scene.fog = new THREE.Fog(0x05080f, 18, 52);
+
+  const camera = new THREE.PerspectiveCamera(45, 1, 0.1, 100);
+  camera.position.set(4, 6, 32);
+  camera.lookAt(0, 0, 0);
+
+  const renderer = new THREE.WebGLRenderer({ antialias: true });
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+  renderer.outputEncoding = THREE.sRGBEncoding;
+  stage.appendChild(renderer.domElement);
+
+  scene.add(new THREE.HemisphereLight(0xbfe6ff, 0x08101e, 0.85));
+
+  const keyLight = new THREE.DirectionalLight(0xffffff, 15);
+  keyLight.position.set(8, 14, 12);
+  scene.add(keyLight);
+
+  const fillLight = new THREE.DirectionalLight(0x5db8ff, 0.75);
+  fillLight.position.set(-10, 4, 10);
+  scene.add(fillLight);
+
+  const rimLight = new THREE.PointLight(0xb44cff, 1.4, 28);
+  rimLight.position.set(8, 4, 10);
+  scene.add(rimLight);
+
+  const boardBase = new THREE.Mesh(
+    new THREE.BoxGeometry(W + 0.6, H + 0.6, 0.6),
+    new THREE.MeshStandardMaterial({ color: 0x0a1322, roughness: 0.8, metalness: 0.1 })
+  );
+  boardBase.position.set(0, 0, -0.35);
+  scene.add(boardBase);
+
+  const gridPoints = [];
+  for (let x = -W / 2; x <= W / 2; x += 1) {
+    gridPoints.push(new THREE.Vector3(x, -H / 2, 0.02), new THREE.Vector3(x, H / 2, 0.02));
+  }
+  for (let y = -H / 2; y <= H / 2; y += 1) {
+    gridPoints.push(new THREE.Vector3(-W / 2, y, 0.02), new THREE.Vector3(W / 2, y, 0.02));
+  }
+  const grid = new THREE.LineSegments(
+    new THREE.BufferGeometry().setFromPoints(gridPoints),
+    new THREE.LineBasicMaterial({ color: 0x244d72, transparent: true, opacity: 0.55 })
+  );
+  scene.add(grid);
+
+  const framePoints = [
+    new THREE.Vector3(-W / 2 - 0.2, -H / 2 - 0.2, 0.04),
+    new THREE.Vector3(W / 2 + 0.2, -H / 2 - 0.2, 0.04),
+    new THREE.Vector3(W / 2 + 0.2, -H / 2 - 0.2, 0.04),
+    new THREE.Vector3(W / 2 + 0.2, H / 2 + 0.2, 0.04),
+    new THREE.Vector3(W / 2 + 0.2, H / 2 + 0.2, 0.04),
+    new THREE.Vector3(-W / 2 - 0.2, H / 2 + 0.2, 0.04),
+    new THREE.Vector3(-W / 2 - 0.2, H / 2 + 0.2, 0.04),
+    new THREE.Vector3(-W / 2 - 0.2, -H / 2 - 0.2, 0.04)
+  ];
+  const frame = new THREE.LineSegments(
+    new THREE.BufferGeometry().setFromPoints(framePoints),
+    new THREE.LineBasicMaterial({ color: 0x66d9ff, transparent: true, opacity: 0.8 })
+  );
+  scene.add(frame);
+
+  const blockGeo = new THREE.BoxGeometry(0.88, 0.88, 0.9);
+  const lockedGroup = new THREE.Group();
+  const pieceGroup = new THREE.Group();
+  scene.add(lockedGroup, pieceGroup);
+
+  function clearGroup(group) {
+    while (group.children.length > 0) {
+      const child = group.children[0];
+      group.remove(child);
+      if (child.material) child.material.dispose();
+    }
+  }
+
+  function rebuildLocked() {
+    clearGroup(lockedGroup);
+    lockedMeshes = Array.from({ length: H }, () => Array(W).fill(null));
+
+    for (let r = 0; r < H; r += 1) {
+      for (let c = 0; c < W; c += 1) {
+        const color = board[r][c];
+        if (color === null) continue;
+
+        const material = new THREE.MeshStandardMaterial({
+          color,
+          roughness: 0.32,
+          metalness: 0.3,
+          emissive: color,
+          emissiveIntensity: 0.06
+        });
+        const mesh = new THREE.Mesh(blockGeo, material);
+        mesh.position.set(c - (W - 1) / 2, r - (H - 1) / 2, 0.45);
+        lockedGroup.add(mesh);
+        lockedMeshes[r][c] = mesh;
+      }
+    }
+  }
+
+  function makePiece(type) {
+    return {
+      type,
+      color: COLORS[type],
+      cells: SHAPES[type].map(([x, y]) => [x, y])
+    };
+  }
+
+  function drawType() {
+    if (bag.length === 0) {
+      bag = PIECE_TYPES.slice();
+      for (let i = bag.length - 1; i > 0; i -= 1) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [bag[i], bag[j]] = [bag[j], bag[i]];
+      }
+    }
+    return bag.pop();
+  }
+
+  function bounds(cells) {
+    const xs = cells.map(([x]) => x);
+    const ys = cells.map(([, y]) => y);
+    const minX = Math.min(...xs);
+    const maxX = Math.max(...xs);
+    const minY = Math.min(...ys);
+    const maxY = Math.max(...ys);
+    return {
+      minX,
+      maxX,
+      minY,
+      maxY,
+      width: maxX - minX + 1,
+      height: maxY - minY + 1
+    };
+  }
+
+  function collides(cells, x, y) {
+    for (const [cx, cy] of cells) {
+      const bx = x + cx;
+      const by = y + cy;
+      if (bx < 0 || bx >= W || by < 0 || by >= H) return true;
+      if (board[by][bx] !== null) return true;
+    }
+    return false;
+  }
+
+  function rotateCells(cells) {
+    const b = bounds(cells);
+    const pivotX = Math.floor((b.minX + b.maxX) / 2);
+    const pivotY = Math.floor((b.minY + b.maxY) / 2);
+
+    const rotated = cells.map(([x, y]) => {
+      const dx = x - pivotX;
+      const dy = y - pivotY;
+      return [pivotX - dy, pivotY + dx];
+    });
+
+    const rMinX = Math.min(...rotated.map(([x]) => x));
+    const rMinY = Math.min(...rotated.map(([, y]) => y));
+    return rotated.map(([x, y]) => [x - rMinX, y - rMinY]);
+  }
+
+  function renderPiece() {
+    clearGroup(pieceGroup);
+    if (!current) return;
+
+    for (const [cx, cy] of current.cells) {
+      const material = new THREE.MeshStandardMaterial({
+        color: current.color,
+        roughness: 0.25,
+        metalness: 0.45,
+        emissive: current.color,
+        emissiveIntensity: 0.12
+      });
+      const mesh = new THREE.Mesh(blockGeo, material);
+      mesh.position.set(cx, cy, 0.45);
+      pieceGroup.add(mesh);
+    }
+
+    pieceGroup.position.set(
+      current.x - (W - 1) / 2,
+      current.y - (H - 1) / 2,
+      0
+    );
+  }
+
+  function syncPiecePosition() {
+    if (!current) return;
+    pieceGroup.position.set(
+      current.x - (W - 1) / 2,
+      current.y - (H - 1) / 2,
+      0
+    );
+  }
+
+  function updatePreview(piece) {
+    clearGroup(previewGroup);
+    if (!piece) return;
+
+    const b = bounds(piece.cells);
+    const centerX = (b.minX + b.maxX) / 2;
+    const centerY = (b.minY + b.maxY) / 2;
+
+    for (const [x, y] of piece.cells) {
+      const material = new THREE.MeshStandardMaterial({
+        color: piece.color,
+        roughness: 0.28,
+        metalness: 0.42,
+        emissive: piece.color,
+        emissiveIntensity: 0.12
+      });
+      const mesh = new THREE.Mesh(previewGeo, material);
+      mesh.position.set((x - centerX) * 0.65, (y - centerY) * 0.65, 0);
+      previewGroup.add(mesh);
+    }
+  }
+
+  function tryMove(dx, dy) {
+    if (!current || mode !== "playing" || clearing) return false;
+    if (!collides(current.cells, current.x + dx, current.y + dy)) {
+      current.x += dx;
+      current.y += dy;
+      syncPiecePosition();
+      return true;
+    }
+    return false;
+  }
+
+  function rotateCurrent() {
+    if (!current || mode !== "playing" || clearing) return;
+
+    const cells = rotateCells(current.cells);
+    const kicks = [
+      [0, 0], [-1, 0], [1, 0], [0, -1], [0, -2], [0, -3], [-1, -1], [1, -1]
+    ];
+
+    for (const [ox, oy] of kicks) {
+      if (!collides(cells, current.x + ox, current.y + oy)) {
+        current.cells = cells;
+        current.x += ox;
+        current.y += oy;
+        renderPiece();
+        return;
+      }
+    }
+  }
+
+  function spawnPiece() {
+    if (!next) next = makePiece(drawType());
+
+    current = next;
+    next = makePiece(drawType());
+
+    const b = bounds(current.cells);
+    current.x = Math.floor((W - b.width) / 2);
+    current.y = H - b.height;
+
+    if (collides(current.cells, current.x, current.y)) {
+      current = null;
+      clearGroup(pieceGroup);
+      updatePreview(next);
+      gameOver();
+      return;
+    }
+
+    renderPiece();
+    updatePreview(next);
+  }
+
+  function lockPiece() {
+    if (!current) return;
+
+    for (const [cx, cy] of current.cells) {
+      board[current.y + cy][current.x + cx] = current.color;
+    }
+
+    clearGroup(pieceGroup);
+    current = null;
+    rebuildLocked();
+
+    const fullRows = [];
+    for (let r = 0; r < H; r += 1) {
+      if (board[r].every((cell) => cell !== null)) fullRows.push(r);
+    }
+
+    if (fullRows.length > 0) {
+      clearing = { rows: fullRows, elapsed: 0 };
+      for (const r of fullRows) {
+        for (let c = 0; c < W; c += 1) {
+          const mesh = lockedMeshes[r][c];
+          if (mesh) {
+            mesh.material.emissive.setHex(0xffffff);
+            mesh.material.emissiveIntensity = 0.4;
+          }
+        }
+      }
+      return;
+    }
+
+    spawnPiece();
+  }
+
+  function finishClear() {
+    const clearedRows = clearing.rows;
+    const rowSet = new Set(clearedRows);
+    const nextBoard = [];
+
+    for (let r = 0; r < H; r += 1) {
+      if (!rowSet.has(r)) nextBoard.push(board[r]);
+    }
+    while (nextBoard.length < H) {
+      nextBoard.push(Array(W).fill(null));
+    }
+
+    board = nextBoard;
+
+    const count = clearedRows.length;
+    score += POINTS[count] * level;
+    lines += count;
+    level = 1 + Math.floor(lines / 10);
+    clearing = null;
+
+    updateUI();
+    setStatus("En juego");
+    rebuildLocked();
+    spawnPiece();
+  }
+
+  function updateUI() {
+    scoreEl.textContent = score;
+    levelEl.textContent = level;
+  }
+
+  function setStatus(text) {
+    statusEl.textContent = text;
+  }
+
+  function showOverlay(title, text) {
+    overlayTitle.textContent = title;
+    overlayText.textContent = text;
+    overlay.classList.remove("hidden");
+  }
+
+  function hideOverlay() {
+    overlay.classList.add("hidden");
+  }
+
+  function gameOver() {
+    mode = "over";
+    setStatus("Partida terminada");
+    showOverlay("Partida terminada", "Pulsa Espacio para reiniciar");
+  }
+
+  function startGame() {
+    bag = [];
+    board = Array.from({ length: H }, () => Array(W).fill(null));
+    current = null;
+    next = makePiece(drawType());
+    score = 0;
+    level = 1;
+    lines = 0;
+    clearing = null;
+    dropAcc = 0;
+    fastDrop = false;
+
+    clearGroup(pieceGroup);
+    rebuildLocked();
+    updatePreview(next);
+    updateUI();
+
+    mode = "playing";
+    hideOverlay();
+    setStatus("En juego");
+    spawnPiece();
+  }
+
+  function togglePause() {
+    if (mode === "idle" || mode === "over") {
+      startGame();
+    } else if (mode === "playing") {
+      mode = "paused";
+      setStatus("Pausa");
+      showOverlay("PAUSA", "Espacio para continuar");
+    } else if (mode === "paused") {
+      mode = "playing";
+      setStatus("En juego");
+      hideOverlay();
+    }
+  }
+
+  function updateGame(dt) {
+    if (mode !== "playing") return;
+
+    if (clearing) {
+      clearing.elapsed += dt * 1000;
+      const pulse = 0.5 + 0.5 * Math.sin(clearing.elapsed * 0.018);
+
+      for (const r of clearing.rows) {
+        for (let c = 0; c < W; c += 1) {
+          const mesh = lockedMeshes[r][c];
+          if (mesh) {
+            mesh.material.emissive.setHex(0xffffff);
+            mesh.material.emissiveIntensity = 0.25 + pulse * 1.3;
+          }
+        }
+      }
+
+      if (clearing.elapsed >= 650) finishClear();
+      return;
+    }
+
+    if (!current) return;
+
+    dropAcc += dt * 1000;
+    const interval = fastDrop ? 65 : Math.max(120, 650 - (level - 1) * 55);
+
+    if (dropAcc >= interval) {
+      dropAcc = 0;
+      if (!tryMove(0, -1)) lockPiece();
+    }
+  }
+
+  const previewScene = new THREE.Scene();
+  previewScene.add(new THREE.HemisphereLight(0xbfe6ff, 0x07101b, 0.9));
+
+  const previewKey = new THREE.DirectionalLight(0xffffff, 1.4);
+  previewKey.position.set(5, 6, 8);
+  previewScene.add(previewKey);
+
+  const previewRim = new THREE.PointLight(0xb44cff, 0.8, 20);
+  previewRim.position.set(-4, 3, 6);
+  previewScene.add(previewRim);
+
+  const previewCamera = new THREE.PerspectiveCamera(45, 1, 0.1, 100);
+  previewCamera.position.set(0, 0, 9);
+  previewCamera.lookAt(0, 0, 0);
+
+  const previewGroup = new THREE.Group();
+  previewScene.add(previewGroup);
+
+  const previewGeo = new THREE.BoxGeometry(0.58, 0.58, 0.58);
+  const previewRenderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+  previewRenderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+  previewRenderer.setClearColor(0x000000, 0);
+  nextWrap.appendChild(previewRenderer.domElement);
+
+  function resize() {
+    const w = stage.clientWidth;
+    const h = stage.clientHeight;
+    if (!w || !h) return;
+    renderer.setSize(w, h, false);
+    camera.aspect = w / h;
+    camera.updateProjectionMatrix();
+  }
+
+  function resizePreview() {
+    const w = nextWrap.clientWidth;
+    const h = nextWrap.clientHeight;
+    if (!w || !h) return;
+    previewRenderer.setSize(w, h, false);
+    previewCamera.aspect = w / h;
+    previewCamera.updateProjectionMatrix();
+  }
+
+  window.addEventListener("resize", () => {
+    resize();
+    resizePreview();
+  });
+
+  window.addEventListener("keydown", (event) => {
+    const code = event.code;
+
+    if (code === "Space") {
+      event.preventDefault();
+      if (!event.repeat) togglePause();
+      return;
+    }
+
+    if (code === "ArrowLeft" || code === "ArrowRight" || code === "ArrowUp" || code === "ArrowDown") {
+      event.preventDefault();
+      if (mode !== "playing" || clearing || !current) return;
+
+      if (code === "ArrowLeft") {
+        tryMove(-1, 0);
+      } else if (code === "ArrowRight") {
+        tryMove(1, 0);
+      } else if (code === "ArrowUp") {
+        rotateCurrent();
+      } else if (code === "ArrowDown") {
+        fastDrop = true;
+        if (!tryMove(0, -1)) lockPiece();
+      }
+    }
+  });
+
+  window.addEventListener("keyup", (event) => {
+    if (event.code === "ArrowDown") fastDrop = false;
+  });
+
+  const clock = new THREE.Clock();
+  renderer.setAnimationLoop(() => {
+    const dt = Math.min(clock.getDelta(), 0.05);
+    updateGame(dt);
+    renderer.render(scene, camera);
+    previewRenderer.render(previewScene, previewCamera);
+  });
+
+  resize();
+  resizePreview();
+  rebuildLocked();
+  updateUI();
+
+  next = makePiece(drawType());
+  updatePreview(next);
+})();
+</script>
+</body>
+</html>

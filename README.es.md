@@ -78,6 +78,12 @@ Todo es opcional y se activa por variable de entorno; los valores de producción
 - Parámetros para los clientes (el muestreo es del cliente, no del servidor):
   [`docs/DS_WORMHOLE_CLIENTES.md`](docs/DS_WORMHOLE_CLIENTES.md).
 
+## Local frente a la nube
+
+El mismo prompt de un Tetris enviado a esta máquina y a la API de DeepSeek, con capturas y puntuación:
+[`docs/DS_WORMHOLE_TETRIS.es.md`](docs/DS_WORMHOLE_TETRIS.es.md). Los dos juegos funcionan y cumplen el prompt; el local
+queda por debajo en gráficos (7/10 frente a 9/10) y tardó 55 minutos frente a 10.
+
 ## Requisitos y compilación
 
 - Linux (probado en Ubuntu 26.04, kernel 7.0), ROCm 7.2.4, CMake + Ninja.

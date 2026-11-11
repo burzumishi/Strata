@@ -79,6 +79,12 @@ Everything is opt-in through environment variables; the production values are in
 - Client parameters (sampling belongs to the client, not the server):
   [`docs/DS_WORMHOLE_CLIENTES.md`](docs/DS_WORMHOLE_CLIENTES.md) (in Spanish).
 
+## Local against the cloud
+
+The same Tetris prompt sent to this machine and to DeepSeek's API, with screenshots and scores:
+[`docs/DS_WORMHOLE_TETRIS.md`](docs/DS_WORMHOLE_TETRIS.md). Both games work and meet the prompt; the local one is weaker
+in graphics (7/10 against 9/10) and took 55 minutes against 10.
+
 ## Requirements and build
 
 - Linux (tested on Ubuntu 26.04, kernel 7.0), ROCm 7.2.4, CMake and Ninja.
