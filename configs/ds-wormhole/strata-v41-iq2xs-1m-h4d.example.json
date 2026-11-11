@@ -72,5 +72,5 @@
  "tools": "all",
  "reasoning_loop_recovery": "recover",
  "fit_max_tokens": true,
- "_comment": "ds-wormhole production profile H4d (2026-11-10), IQ2_XS, 1M context, AMD Strix Halo gfx1151 64 GB. Replace <STRATA>, <MODELS> and <DATA>. Engine keys are explained in README.md; client sampling in docs/DS_WORMHOLE_CLIENTES.md."
+ "_comment": "ds-wormhole previous production profile H4d (2026-11-08 to 2026-11-10; replaced by strata-v41-iq2xs-1m-p075a.example.json), IQ2_XS, 1M context, AMD Strix Halo gfx1151 64 GB. Replace <STRATA>, <MODELS> and <DATA>. Engine keys are explained in README.md; client sampling in docs/DS_WORMHOLE_CLIENTES.md."
 }

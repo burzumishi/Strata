@@ -6,7 +6,7 @@ build, the toolchain and the opt-in switches are on [STRIX_HALO.md](STRIX_HALO.m
 [DEEPSEEK41.md](DEEPSEEK41.md).
 
 > **64 GB and Linux (ds-wormhole fork).** The DeepSeek numbers on this page come from upstream's 128 GB Strix Halo on Windows.
-> A 64 GB Strix Halo runs DeepSeek V4.1-Flash 2.25 bpw on **Linux** at 22-25 tokens/s with a 1M-token context in this fork:
+> A 64 GB Strix Halo runs DeepSeek V4.1-Flash 2.25 bpw on **Linux** at 24-27 tokens/s with a 1M-token context in this fork:
 > the settings and measurements are in
 > [STRIX_HALO.md](STRIX_HALO.md#deepseek-v41-flash-on-linux-with-64-gb-ds-wormhole-fork).
 

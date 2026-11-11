@@ -68,4 +68,4 @@ sobre todo pensar.
 ## Lo que no es del cliente
 
 Las claves del motor (`spec`, `dspark_conf`, la penalización de fallos, `SPEC_COST`, el rechequeo de empates, el trie…)
-van en el perfil del servidor (`strata-v41-iq2xs-1m-h4d.json`). Se deciden con baterías y no dependen del cliente.
+van en el perfil del servidor (`strata-v41-iq2xs-1m-p075a.json`; antes `-h4d.json`). Se deciden con baterías y no dependen del cliente.

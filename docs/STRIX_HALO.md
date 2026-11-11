@@ -105,12 +105,12 @@ that box (Ubuntu 26.04, kernel 7.0, ROCm 7.2.4):
 
 | | |
 |---|---|
-| Decode, real agent sessions | 25.1 tok/s mean over 96 requests (median 24.8, range 16.7-37.5); 22.1 tok/s token-weighted over two days of use |
-| Decode, task batteries (base x2 + hard, 42 answers) | 23.5-25.0 tok/s, 41-42 of 42 valid |
+| Decode, real agent sessions | 27.0 tok/s token-weighted over a 95K-token web session with tools (P075a profile, 2026-11-11); 22.1-25.1 tok/s with the earlier H4d profile |
+| Decode, task batteries (base x2 + hard, 42 answers) | 24.2 tok/s, 41 of 42 valid, 0 typos (P075a); 23.5-25.0 tok/s with H4d |
 | Long context | above 20 tok/s past 500K tokens (a 703K session: 24.9 tok/s, 872 tool calls, 0 errors) |
 | Prompt reading | 257 tok/s on average in long sessions; 340-470 tok/s in short conversations |
 | Experts in memory | about 3,100 of 15,744 (20 %); they serve 99.6 % of the picks, the CPU lane 0.1-0.4 % |
-| Quality | perplexity against the same set's exact route (no substitution): +8 % with the speed profile below; +2 % with a softer miss penalty (0.5 / 20-39=1), being validated for speed |
+| Quality | perplexity against the same set's exact route (no substitution): +6.2 % with the production profile (P075a; prose +16 %), against +9.2 % (prose +32 %) with the earlier H4d; +3.6 % at 0.5 / 2 for 6 % less speed |
 
 How it fits in 64 GB:
 
@@ -121,20 +121,25 @@ How it fits in 64 GB:
   the kernel driver cannot evict queues and resets the GPU. Transparent huge pages with `defrag=never` (synchronous compaction
   under the GPU's mapped pages stalls it).
 - **Engine switches** (all opt-in; the full profile is
-  [`configs/ds-wormhole/strata-v41-iq2xs-1m-h4d.example.json`](../configs/ds-wormhole/strata-v41-iq2xs-1m-h4d.example.json)):
+  [`configs/ds-wormhole/strata-v41-iq2xs-1m-p075a.example.json`](../configs/ds-wormhole/strata-v41-iq2xs-1m-p075a.example.json)):
   the expert store in pinned host memory that the GPU reads in place (`DS4_STORE_GPU`, `DS4_STORE_PINNED`), the store lending
   its slots to the prompt read (`DS4_STORE_LEND`, `DS4_CHUNK_LEND`), expert slots in host memory (`DS4_SLOTS_HOST`), the
   embedding table read from the model's mapping (`DS4_EMBED_MAP`), and a **miss penalty** in the router
   (`DS4_ROUTE_MISS_PENALTY`, `DS4_ROUTE_PEN_LAYERS`): an expert that is not in memory is replaced by a resident one unless it
-  matters enough, instead of being read from the SSD for every word. Near ties are computed again with the exact route
-  (`DS4_TIE_RECHECK`, `DS4_TIE_MID`).
+  matters enough, instead of being read from the SSD for every word. Production uses 0.75 on the encoder layers (0-19) and
+  2 on the decoder layers (20-39): the encoder carries the prose quality, the decoder takes the penalty with little loss.
+  The first 65,536 tokens read after a start take no read penalty (`DS4_FLOW_PEN_WARM`), and near ties are computed again
+  with the exact route (`DS4_TIE_RECHECK`, and `DS4_TIE_MID` 0.7 for ties inside a word, line breaks included).
 - `--experts 5 --prefill-chunk 8192 --reserve-mib 21800 --ssd-cache 10` and an expert profile from real use
   (`--expert-profile`, `--profile-readonly`). With the server up about 3-4 GB stay free: do not build or load another model
   beside it.
 
-Known issues: the substitution can still produce a rare misspelt word inside a word (7 in 7,400 words of Spanish prose in two days of
-sessions; none in 57,000 words of code edits), mostly right after an engine start while the store is cold. Work on
-it is in progress (`DS4_FLOW_PEN_WARM`, `DS4_MISS_RECHECK`). Stop the server with SIGTERM so it keeps the conversation.
+Known issues: with the earlier H4d profile the substitution produced a rare misspelt word inside a word (7 in 7,400 words of
+Spanish prose in two days of sessions; none in 57,000 words of code edits), mostly right after an engine start while the
+store was cold. Every case traced so far was a near tie (a logit gap of 0.6 or less) the recheck did not cover; the
+P075a profile covers them (0 typos in the battery; one in a 95K-token session before the line-break class was added).
+`DS4_TIE_TRACE` writes every near tie with its position to find the next one. Stop the server with SIGTERM so it keeps
+the conversation.
 
 ## What the engine does differently
 
