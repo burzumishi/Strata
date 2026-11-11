@@ -3550,7 +3550,8 @@ class WebApp(unittest.TestCase):
                 props = json.loads(body)
                 self.assertEqual(props["default_generation_settings"]["n_ctx"], 262144)
                 self.assertEqual(props["default_generation_settings"]["params"],
-                                 {"temperature": 0.7, "repeat_penalty": 1.1, "n_predict": 4096})
+                                 {"temperature": 0.7, "repeat_penalty": 1.1, "n_predict": 4096,
+                                  "max_tokens": 4096})   # (ds-wormhole 2026-11-09: the web UI syncs max_tokens)
                 self.assertEqual(props["chat_template"], (ROOT / "serve/chat_template.jinja").read_text(encoding="utf-8"))
                 for key in ("supports_tools", "supports_tool_calls", "supports_system_role",
                             "supports_parallel_tool_calls", "supports_preserve_reasoning"):
@@ -3561,6 +3562,7 @@ class WebApp(unittest.TestCase):
             svc.shared = {}
             props = json.loads(self.get("/props")[2])
             self.assertEqual(props["default_generation_settings"]["params"]["n_predict"], -1)
+            self.assertEqual(props["default_generation_settings"]["params"]["max_tokens"], -1)
             self.assertEqual(self.get("/props?model=not-loaded&autoload=true")[0], 404)
         finally:
             svc.engine.max_context, svc.vision, svc.sampling_defaults, svc.shared = previous
