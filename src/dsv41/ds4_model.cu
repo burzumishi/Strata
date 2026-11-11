@@ -1125,8 +1125,15 @@ struct Model::Impl {
         auto alnum = [](unsigned char ch) { return std::isalnum(ch) || ch == '_' || ch >= 0x80; };
         const std::string* pt = prev >= 0 && (size_t) prev < c.txt.size() ? &c.txt[(size_t) prev] : nullptr;
         const bool in_word = pt != nullptr && !pt->empty() && alnum((unsigned char) pt->back());
-        const bool mid = in_word && !ra.empty() && !rb.empty() && !std::isspace((unsigned char) ra[0]) &&
-                         !std::isspace((unsigned char) rb[0]) && (alnum((unsigned char) ra[0]) || alnum((unsigned char) rb[0]));
+        // (2026-11-11: also a line break against a candidate that goes on with the word: "V" then "\n\n" over "oy" left a
+        // lone "V" before the paragraph (gap 0.586, class 0, never rechecked). Only a break with a newline: " me" over "oy"
+        // is a whole-word choice and stays out (it would recheck most wording ties). ~0.05 % of the tie rows.)
+        auto breaks = [](const std::string& s) { return !s.empty() && std::isspace((unsigned char) s[0]) && s.find('\n') != std::string::npos; };
+        auto goes_on = [&](const std::string& s) { return !s.empty() && alnum((unsigned char) s[0]); };
+        const bool mid = in_word && !ra.empty() && !rb.empty() &&
+                         ((!std::isspace((unsigned char) ra[0]) && !std::isspace((unsigned char) rb[0]) &&
+                           (alnum((unsigned char) ra[0]) || alnum((unsigned char) rb[0]))) ||
+                          (breaks(ra) && goes_on(rb)) || (breaks(rb) && goes_on(ra)));
         const std::string x = norm(ra), y = norm(rb);
         auto letter = [](const std::string& s) {
             for (char ch : s) if (std::isalpha((unsigned char) ch)) return true;
