@@ -4,7 +4,6 @@
 #4738 lost wake-ups of the control-line queue, #5044 a byte that is not UTF-8 on the engine's stdout.
 The fake engine and helpers are those of test_stream_ownership.py.
 """
-import sys
 import tempfile
 import threading
 import unittest
@@ -12,7 +11,7 @@ from pathlib import Path
 from unittest import mock
 
 from serve.server import StrataEngine
-from serve.test_stream_ownership import FakeEngines, canary_script, collect, expected_reply, prompt_ids
+
 
 
 class ConvCachePoll(unittest.TestCase):
@@ -63,6 +62,45 @@ class ConvCachePoll(unittest.TestCase):
                 second.join(5)
             self.assertEqual(errors, [])
             self.assertEqual(c.poll(str(log), 0)["parks"], 4, "every parked line counted once")
+
+
+class FailedStart(unittest.TestCase):
+    """#4792 (upstream 0d922698f, adapted: this tree has no drafter retry arguments): a start that ends before READY must
+    not crash when another thread closed the process (set self.proc to None) while the failed start cleaned up."""
+
+    def test_close_from_another_thread_during_a_failed_start(self):
+        import serve.server as server
+        holder = {}
+
+        class Pipe:
+            def close(self):
+                pass
+
+            def __iter__(self):
+                return iter(())                      # the engine's output ends: no READY
+
+        class Proc:
+            returncode = 1
+            stdin, stdout = Pipe(), Pipe()
+            pid = 0
+
+            def wait(self, timeout=None):
+                holder["engine"].proc = None         # restart()'s close() on another thread
+                return 1
+
+            def poll(self):
+                return 1
+
+            def kill(self):
+                pass
+
+        engine = StrataEngine.__new__(StrataEngine)
+        holder["engine"] = engine
+        with mock.patch.object(server, "popen", lambda *a, **k: Proc()), \
+                mock.patch.object(server, "end_leftover_engines", lambda exe: None), \
+                mock.patch.object(server, "transient_start_failure", lambda *a, **k: False):
+            with self.assertRaises(server.EngineDied):
+                engine.__init__("strata", [])
 
 
 if __name__ == "__main__":
