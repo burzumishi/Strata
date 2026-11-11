@@ -1071,6 +1071,7 @@ struct Model::Impl {
     struct TieCfg {
         float log_gap = 0.0f, fix_gap = 0.0f, mid_gap = 0.0f;   // mid_gap: DS4_TIE_MID, the mid-word class's own gap
         bool ortho_only = false;
+        bool space_break = false;   // DS4_TIE_SPACE=1: a space break against a candidate that goes on with the word is mid-word too
         std::vector<std::string> txt;   // the token texts (DS4_TIE_VOCAB: bench/v41/tie_vocab.py)
         std::FILE* trace = nullptr;     // DS4_TIE_TRACE=file: position, row, gap, kind, token, rival
     };
@@ -1080,6 +1081,7 @@ struct Model::Impl {
             if (const char* e = std::getenv("DS4_TIE_LOG")) t.log_gap = std::strtof(e, nullptr);
             if (const char* e = std::getenv("DS4_TIE_RECHECK")) t.fix_gap = std::strtof(e, nullptr);
             if (const char* e = std::getenv("DS4_TIE_MID")) t.mid_gap = std::strtof(e, nullptr);
+            if (const char* e = std::getenv("DS4_TIE_SPACE")) t.space_break = std::atoi(e) != 0;
             if (t.mid_gap > t.log_gap) t.log_gap = t.mid_gap;
             if (t.fix_gap > t.log_gap) t.log_gap = t.fix_gap;
             if (const char* e = std::getenv("DS4_TIE_VOCAB")) {
@@ -1128,7 +1130,13 @@ struct Model::Impl {
         // (2026-11-11: also a line break against a candidate that goes on with the word: "V" then "\n\n" over "oy" left a
         // lone "V" before the paragraph (gap 0.586, class 0, never rechecked). Only a break with a newline: " me" over "oy"
         // is a whole-word choice and stays out (it would recheck most wording ties). ~0.05 % of the tie rows.)
-        auto breaks = [](const std::string& s) { return !s.empty() && std::isspace((unsigned char) s[0]) && s.find('\n') != std::string::npos; };
+        // (2026-11-11 later, DS4_TIE_SPACE=1: a space break too. "In" then " In" over "cl" ("In·cl·uye") wrote "In Incluye" at the
+        // start of the Tetris's last paragraph (real-p075a.ties pos 211206, gap 0.605, kind 0). The trace of the day has ~370 such
+        // rows with gap < 0.7 among 42K tie rows (an upper bound: the trace has no previous token), against 936 rechecks in 148K
+        // rows; the recheck changes the token only when the trunk without substitutes prefers the other.)
+        auto breaks = [&c](const std::string& s) {
+            return !s.empty() && std::isspace((unsigned char) s[0]) && (c.space_break || s.find('\n') != std::string::npos);
+        };
         auto goes_on = [&](const std::string& s) { return !s.empty() && alnum((unsigned char) s[0]); };
         const bool mid = in_word && !ra.empty() && !rb.empty() &&
                          ((!std::isspace((unsigned char) ra[0]) && !std::isspace((unsigned char) rb[0]) &&
