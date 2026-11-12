@@ -7812,14 +7812,21 @@ struct Model::Impl {
         store_watch();
     }
     // the store gives RAM back when the PC runs short (the owner opened something): below 4 GB free, a 0.7 GB chunk at a time
-    // until 5 GB are free again (checked every 16 windows); it grows again by itself once 8 GB beside its chunk are free
+    // until 5 GB are free again (checked every 16 windows); it grows again by itself once 8 GB beside its chunk are free.
+    // DS4_STORE_WATCH_GB=x (2026-11-11, U7 of the ds-wormhole board): give back below x GB instead of 4, until x+1 are free
+    // (a 64 GB Strix Halo serving 1M context sat at 3-4 GB MemAvailable, where KFD's restore storms stall the GPU)
     void store_watch() {
         if (!store) return;
         static int tick = 0;
         if (++tick % 16 != 0) return;
+        static const uint64_t low = [] {
+            const char* e = std::getenv("DS4_STORE_WATCH_GB");
+            const double gb = e != nullptr ? std::atof(e) : 4.0;
+            return (uint64_t) ((gb >= 1.0 && gb <= 6.0 ? gb : 4.0) * (double) (1ull << 30));   // (<= 6: the store grows back at 8 + a chunk)
+        }();
         const uint64_t avail = ram_avail();
-        if (avail == ~uint64_t{0} || avail >= (4ull << 30)) return;
-        const size_t chunks = 1 + (size_t) (((5ull << 30) - avail) / (700ull << 20));
+        if (avail == ~uint64_t{0} || avail >= low) return;
+        const size_t chunks = 1 + (size_t) ((low + (1ull << 30) - avail) / (700ull << 20));
         const size_t n = store->shrink_chunks(chunks);
         if (n > 0) std::fprintf(stderr, "ds4: RAM store: %.1f GB free: gave back %zu chunks (%zu slots left)\n", avail / 1e9, n, store->slots_allocated());
     }

@@ -722,6 +722,247 @@ __global__ void __launch_bounds__(kThreads) down_kernel(const Args a, int groups
     }
 }
 
+// ---------------------------------------------------------------- DS4_IQ_PIPE=1: the same token kernels, pipelined
+// (2026-11-11, ds-wormhole A1/D1; Documentos/revision-lapiz-2026-11-11/A1_DISENO_EXPERTOS_IQ2_HIP.md).  t86's trace: the time
+// a distinct expert takes is flat from 2 to 6 rows, at 132-181 GB/s against 184-219 with one: latency, not instructions.  The
+// ISA shows every block's weights asked for only when the previous one is done, and each entry's activations behind its own
+// `if (i < ne)`, a round trip each.  Here (1) a lane's next block's raw bytes are loaded while it works on the current one,
+// (2) the pass runs a body made for its real entry count (the launch's NE is only an upper bound: most groups hold 1-2), so
+// the activation loads carry no branch and can be issued together.  Same integer codes, the same sub_dot, the same fmaf
+// chain over the same blocks in the same order a lane, the same lanes_sum: the same bits (the bench's --cmp checks it).
+// Only the four types the IQ2_XS pack uses (IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS) and NE <= 8; the rest keep the kernels above.
+template <int T>
+constexpr bool kPipeType = T == kIQ2_XXS || T == kIQ2_XS || T == kIQ2_S || T == kIQ3_XXS;
+struct Raw {   // a lane's sub-block of a block, as decode_b reads it (w: the type's words; d16: the block's scale bits)
+    uint32_t w0, w1, w2, w3;
+    uint32_t d16;
+};
+template <int T>
+__device__ __forceinline__ void load_raw(const uint8_t* __restrict__ b, int ib, Raw& r) {
+    r.d16 = *(const uint16_t*) b;
+    if constexpr (T == kIQ2_XXS || T == kIQ2_XS) {
+        const uint8_t* q = b + 2 + 8 * ib;
+        r.w0 = ld2(q);
+        r.w1 = ld2(q + 4);
+        if constexpr (T == kIQ2_XS) r.w2 = b[66 + ib];
+        else r.w2 = 0u;
+        r.w3 = 0u;
+    } else if constexpr (T == kIQ2_S) {
+        const uint8_t* qs = b + 2;
+        r.w0 = ld2(qs + 4 * ib);
+        r.w1 = ld2(qs + 32 + 4 * ib);
+        r.w2 = b[66 + ib];
+        r.w3 = b[74 + ib];
+    } else {   // kIQ3_XXS
+        const uint8_t* qs = b + 2;
+        r.w0 = ld2(qs + 8 * ib);
+        r.w1 = ld2(qs + 8 * ib + 4);
+        r.w2 = ld2(qs + 64 + 4 * ib);
+        r.w3 = 0u;
+    }
+}
+// decode_b's arithmetic on the loaded words (keep in step with decode_b above)
+template <int T>
+__device__ __forceinline__ void decode_raw(const Raw& r, const uint32_t* tab, Sub& s) {
+    const float dh = __half2float(__ushort_as_half((uint16_t) r.d16));
+    if constexpr (T == kIQ2_XXS) {
+        const uint32_t a0 = r.w0, a1 = r.w1;
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const uint2 g = ((const uint2*) tab)[(a0 >> (8 * l)) & 255u];
+            const uint32_t sg = ksigns8(a1 >> (7 * l));
+            s.q[2 * l] = sgn4(g.x, sg);
+            s.q[2 * l + 1] = sgn4(g.y, sg >> 4);
+        }
+        s.s0 = s.s1 = 2 * (int) (a1 >> 28) + 1;
+        s.d = dh * 0.125f;
+    } else if constexpr (T == kIQ2_XS) {
+        const uint32_t a0 = r.w0, a1 = r.w1;
+        const uint32_t v[4] = {a0 & 0xffffu, a0 >> 16, a1 & 0xffffu, a1 >> 16};
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const uint2 g = ((const uint2*) tab)[v[l] & 511u];
+            const uint32_t sg = ksigns8(v[l] >> 9);
+            s.q[2 * l] = sgn4(g.x, sg);
+            s.q[2 * l + 1] = sgn4(g.y, sg >> 4);
+        }
+        const uint32_t sc = r.w2;
+        s.s0 = 2 * (int) (sc & 15) + 1;
+        s.s1 = 2 * (int) (sc >> 4) + 1;
+        s.d = dh * 0.125f;
+    } else if constexpr (T == kIQ2_S) {
+        const uint32_t i4 = r.w0, sg4 = r.w1, h = r.w2, sc = r.w3;
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const uint2 g = ((const uint2*) tab)[((i4 >> (8 * l)) & 255u) | ((h << (8 - 2 * l)) & 0x300u)];
+            const uint32_t sg = sg4 >> (8 * l);
+            s.q[2 * l] = sgn4(g.x, sg);
+            s.q[2 * l + 1] = sgn4(g.y, sg >> 4);
+        }
+        s.s0 = 2 * (int) (sc & 15) + 1;
+        s.s1 = 2 * (int) (sc >> 4) + 1;
+        s.d = dh * 0.125f;
+    } else {   // kIQ3_XXS
+        const uint32_t w0 = r.w0, w1 = r.w1, aux = r.w2;
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const uint32_t w = l < 2 ? w0 : w1, sh = 16 * (l & 1);
+            const uint32_t sg = ksigns8(aux >> (7 * l));
+            s.q[2 * l] = sgn4(tab[(w >> sh) & 255u], sg);
+            s.q[2 * l + 1] = sgn4(tab[(w >> (sh + 8)) & 255u], sg >> 4);
+        }
+        s.s0 = s.s1 = 2 * (int) (aux >> 28) + 1;
+        s.d = dh * 0.25f;
+    }
+}
+// one pass of the gate / up rows for exactly NB entries (es / xr in shared memory)
+template <int T, int NB, int RW>
+__device__ __forceinline__ void gu_pipe_body(const Args& a, const uint8_t* g, const uint8_t* u, const uint32_t* tab, const int* es,
+                                             const int* xr, int row, int lane, int ib0, int blk0, int nblk, int nsb) {
+    constexpr int LPR = 32 / RW, kBPS = 8, kStep = LPR / kBPS;
+    float ag[NB], au[NB];
+#pragma unroll
+    for (int i = 0; i < NB; ++i) ag[i] = au[i] = 0.0f;
+    Raw rg, ru;
+    if (blk0 < nblk) {
+        load_raw<T>(g + (size_t) blk0 * Ty<T>::B, ib0, rg);
+        load_raw<T>(u + (size_t) blk0 * Ty<T>::B, ib0, ru);
+    }
+    for (int blk = blk0; blk < nblk; blk += kStep) {
+        const int kb = blk * kBPS + ib0;
+        Raw ng = rg, nu = ru;
+        if (blk + kStep < nblk) {   // the next block's bytes in flight while this one is worked on
+            load_raw<T>(g + (size_t) (blk + kStep) * Ty<T>::B, ib0, ng);
+            load_raw<T>(u + (size_t) (blk + kStep) * Ty<T>::B, ib0, nu);
+        }
+        int4 xa[NB], xb[NB];
+        float dx[NB];
+#pragma unroll
+        for (int i = 0; i < NB; ++i) {   // every entry's activations together (no branch: NB is the real count)
+            const int4* xp = (const int4*) (a.xq + (size_t) xr[i] * a.n_embd + (size_t) kb * 32);
+            xa[i] = xp[0];
+            xb[i] = xp[1];
+            dx[i] = a.xd[(size_t) xr[i] * nsb + kb];
+        }
+        Sub sg, su;
+        decode_raw<T>(rg, tab, sg);
+        decode_raw<T>(ru, tab, su);
+#pragma unroll
+        for (int i = 0; i < NB; ++i) {
+            ag[i] = fmaf(dx[i], sub_dot<T>(sg, xa[i], xb[i]), ag[i]);
+            au[i] = fmaf(dx[i], sub_dot<T>(su, xa[i], xb[i]), au[i]);
+        }
+        rg = ng;
+        ru = nu;
+    }
+#pragma unroll
+    for (int i = 0; i < NB; ++i) {
+        const float gv = lanes_sum<RW>(ag[i]), uv = lanes_sum<RW>(au[i]);
+        if (lane == 0) a.h[(size_t) es[i] * a.n_ff + row] = swiglu(gv, uv, a.limit);
+    }
+}
+template <int T, int NB, int RW>
+__device__ __forceinline__ void dn_pipe_body(const Args& a, const uint8_t* d, const uint32_t* tab, const int* es, int row, int lane,
+                                             int ib0, int blk0, int nblk, int nsb) {
+    constexpr int LPR = 32 / RW, kBPS = 8, kStep = LPR / kBPS;
+    float ad[NB];
+#pragma unroll
+    for (int i = 0; i < NB; ++i) ad[i] = 0.0f;
+    Raw rd;
+    if (blk0 < nblk) load_raw<T>(d + (size_t) blk0 * Ty<T>::B, ib0, rd);
+    for (int blk = blk0; blk < nblk; blk += kStep) {
+        const int kb = blk * kBPS + ib0;
+        Raw nd = rd;
+        if (blk + kStep < nblk) load_raw<T>(d + (size_t) (blk + kStep) * Ty<T>::B, ib0, nd);
+        int4 ha[NB], hb[NB];
+        float hd[NB];
+#pragma unroll
+        for (int i = 0; i < NB; ++i) {
+            const int4* hp = (const int4*) (a.hq + (size_t) es[i] * a.n_ff + (size_t) kb * 32);
+            ha[i] = hp[0];
+            hb[i] = hp[1];
+            hd[i] = a.hd[(size_t) es[i] * nsb + kb];
+        }
+        Sub sd;
+        decode_raw<T>(rd, tab, sd);
+#pragma unroll
+        for (int i = 0; i < NB; ++i) ad[i] = fmaf(hd[i], sub_dot<T>(sd, ha[i], hb[i]), ad[i]);
+        rd = nd;
+    }
+#pragma unroll
+    for (int i = 0; i < NB; ++i) {
+        const float v = lanes_sum<RW>(ad[i]);
+        if (lane == 0) a.part[(size_t) es[i] * a.n_embd + row] = v;
+    }
+}
+// grid (n_ff / (8 RW), groups), as gate_up_kernel on HIP (one tile a block); NE: the most entries a pass
+template <int T, int NE, int RW = kGuRW>
+__global__ void __launch_bounds__(kThreads) gate_up_pipe_kernel(const Args a, int groups) {
+    static_assert(kPipeType<T> && NE >= 1 && NE <= 8, "the pipelined kernel's types and pass sizes");
+    constexpr int LPR = 32 / RW, kBPS = 8;
+    __shared__ __align__(16) uint32_t tab[kTabWords<T, false>];
+    __shared__ int es[NE], xr[NE];
+    (void) groups;
+    const int lane32 = threadIdx.x & 31;
+    const size_t rb = row_bytes_t<T>(a.n_embd);
+    const int nsb = a.n_embd / 32, nblk = nsb / kBPS;
+    const int grp = blockIdx.y, tile = blockIdx.x;
+    const uint8_t* blob;
+    int m0, m1;
+    if (!group(a, grp, blob, m0, m1)) return;   // (uniform)
+    load_tab<T>(tab);
+    const int row = (tile * kWarps + (threadIdx.x >> 5)) * RW + lane32 / LPR, lane = lane32 % LPR;
+    const int ib0 = lane & 7, blk0 = lane >> 3;
+    const uint8_t* g = blob + a.tr[0] + (size_t) row * rb;
+    const uint8_t* u = blob + a.tr[1] + (size_t) row * rb;
+    for (int mm = m0; mm < m1; mm += NE) {
+        const int ne = min(NE, m1 - mm);
+        __syncthreads();
+        if ((int) threadIdx.x < ne) {
+            const int e = a.grp_ptr != nullptr ? a.grp_ent[mm + threadIdx.x] : mm + threadIdx.x;
+            es[threadIdx.x] = e;
+            xr[threadIdx.x] = a.grp_ptr != nullptr ? e >> 3 : 0;
+        }
+        __syncthreads();
+        switch (ne) {   // (uniform in the block)
+#define GUB_(N) case N: if constexpr (N <= NE) gu_pipe_body<T, N, RW>(a, g, u, tab, es, xr, row, lane, ib0, blk0, nblk, nsb); break;
+            GUB_(1) GUB_(2) GUB_(3) GUB_(4) GUB_(5) GUB_(6) GUB_(7) GUB_(8)
+#undef GUB_
+            default: break;
+        }
+    }
+}
+template <int T, int NE, int RW = kDnRW>
+__global__ void __launch_bounds__(kThreads) down_pipe_kernel(const Args a, int groups) {
+    static_assert(kPipeType<T> && NE >= 1 && NE <= 8, "the pipelined kernel's types and pass sizes");
+    constexpr int LPR = 32 / RW, kBPS = 8;
+    __shared__ __align__(16) uint32_t tab[kTabWords<T, false>];
+    __shared__ int es[NE];
+    (void) groups;
+    const int lane32 = threadIdx.x & 31;
+    const int nsb = a.n_ff / 32, nblk = nsb / kBPS;
+    const int grp = blockIdx.y, tile = blockIdx.x;
+    const uint8_t* blob;
+    int m0, m1;
+    if (!group(a, grp, blob, m0, m1)) return;
+    load_tab<T>(tab);
+    const int row = (tile * kWarps + (threadIdx.x >> 5)) * RW + lane32 / LPR, lane = lane32 % LPR;
+    const int ib0 = lane & 7, blk0 = lane >> 3;
+    const uint8_t* d = blob + a.tr[2] + (size_t) row * row_bytes_t<T>(a.n_ff);
+    for (int mm = m0; mm < m1; mm += NE) {
+        const int ne = min(NE, m1 - mm);
+        __syncthreads();
+        if ((int) threadIdx.x < ne) es[threadIdx.x] = a.grp_ptr != nullptr ? a.grp_ent[mm + threadIdx.x] : mm + threadIdx.x;
+        __syncthreads();
+        switch (ne) {
+#define DNB_(N) case N: if constexpr (N <= NE) dn_pipe_body<T, N, RW>(a, d, tab, es, row, lane, ib0, blk0, nblk, nsb); break;
+            DNB_(1) DNB_(2) DNB_(3) DNB_(4) DNB_(5) DNB_(6) DNB_(7) DNB_(8)
+#undef DNB_
+            default: break;
+        }
+    }
+}
+
 // ---------------------------------------------------------------- the prompt path's sets
 constexpr int BM = 64, BN = 64, TM = 4, TN = 4;
 static_assert((BM / TM) * (BN / TN) == kThreads, "one output tile a thread");
@@ -1227,8 +1468,49 @@ void launch_dn(const Args& a, int groups, cudaStream_t s) {
     else
         strata_ds4_launch(down_kernel<T, NE>, dim3((unsigned) tiles, (unsigned) groups), kThreads, 0, s, a, groups);
 }
+// DS4_IQ_PIPE=1 (off by default): the pipelined token kernels above for their four types, while the pass holds at most
+// DS4_IQ_PIPE_MAX entries (8; 4 keeps them to the windows of up to 4 rows if the larger ones' registers cost occupancy)
+inline int iq_pipe_max() {
+    static const int v = [] {
+        const char* e = std::getenv("DS4_IQ_PIPE");
+        if (e == nullptr || std::atoi(e) == 0) return 0;
+        const char* m = std::getenv("DS4_IQ_PIPE_MAX");
+        const int x = m != nullptr ? std::atoi(m) : 8;
+        return x >= 1 && x <= 8 ? x : 8;
+    }();
+    return v;
+}
+template <int T>
+bool pipe_gu(const Args& a, int groups, int ne, cudaStream_t s) {
+    if constexpr (kPipeType<T>) {
+        if (iq_pipe_max() == 0 || ne > iq_pipe_max()) return false;
+        const dim3 grid((unsigned) (a.n_ff / (kWarps * kGuRW)), (unsigned) groups);
+        if (ne <= 1) strata_ds4_launch(gate_up_pipe_kernel<T, 1>, grid, kThreads, 0, s, a, groups);
+        else if (ne <= 4) strata_ds4_launch(gate_up_pipe_kernel<T, 4>, grid, kThreads, 0, s, a, groups);
+        else strata_ds4_launch(gate_up_pipe_kernel<T, 8>, grid, kThreads, 0, s, a, groups);
+        return true;
+    } else {
+        (void) a, (void) groups, (void) ne, (void) s;
+        return false;
+    }
+}
+template <int T>
+bool pipe_dn(const Args& a, int groups, int ne, cudaStream_t s) {
+    if constexpr (kPipeType<T>) {
+        if (iq_pipe_max() == 0 || ne > iq_pipe_max()) return false;
+        const dim3 grid((unsigned) (a.n_embd / (kWarps * kDnRW)), (unsigned) groups);
+        if (ne <= 1) strata_ds4_launch(down_pipe_kernel<T, 1>, grid, kThreads, 0, s, a, groups);
+        else if (ne <= 4) strata_ds4_launch(down_pipe_kernel<T, 4>, grid, kThreads, 0, s, a, groups);
+        else strata_ds4_launch(down_pipe_kernel<T, 8>, grid, kThreads, 0, s, a, groups);
+        return true;
+    } else {
+        (void) a, (void) groups, (void) ne, (void) s;
+        return false;
+    }
+}
 template <int T>
 void gu_ne(const Args& a, int groups, int ne, cudaStream_t s) {
+    if (pipe_gu<T>(a, groups, ne, s)) return;
     if (ne <= 1) launch_gu<T, 1>(a, groups, s);
     else if (ne <= 4) launch_gu<T, 4>(a, groups, s);
     else if (ne <= 8) launch_gu<T, 8>(a, groups, s);
@@ -1236,6 +1518,7 @@ void gu_ne(const Args& a, int groups, int ne, cudaStream_t s) {
 }
 template <int T>
 void dn_ne(const Args& a, int groups, int ne, cudaStream_t s) {
+    if (pipe_dn<T>(a, groups, ne, s)) return;
     if (ne <= 1) launch_dn<T, 1>(a, groups, s);
     else if (ne <= 4) launch_dn<T, 4>(a, groups, s);
     else if (ne <= 8) launch_dn<T, 8>(a, groups, s);
